@@ -1,0 +1,449 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Реестр источников материалов",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "revision",
+    "sources"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "enabled",
+        "type",
+        "name",
+        "endpoint",
+        "external_chat_id",
+        "channel_ids",
+        "language_hint",
+        "trust",
+        "access_ref",
+        "interval_seconds",
+        "lookback_hours",
+        "max_items_per_run",
+        "full_text",
+        "extraction_profile",
+        "rights"
+      ],
+      "properties": {
+        "purpose": {
+          "enum": [
+            "ideas",
+            "news",
+            "videos",
+            "mixed"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "type": {
+          "enum": [
+            "rss",
+            "html",
+            "telegram_bot",
+            "max_bot",
+            "telegram_mtproto",
+            "other_messenger",
+            "json_api"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "endpoint": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https?://"
+            }
+          ]
+        },
+        "external_chat_id": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^-?[0-9]+$"
+            }
+          ]
+        },
+        "channel_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+          }
+        },
+        "language_hint": {
+          "type": "string",
+          "pattern": "^(auto|[a-z]{2,3}(-[A-Za-z0-9]+)*)$"
+        },
+        "trust": {
+          "enum": [
+            "primary",
+            "secondary",
+            "unverified"
+          ]
+        },
+        "access_ref": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^[A-Z][A-Z0-9_]*$"
+            }
+          ]
+        },
+        "interval_seconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 604800
+        },
+        "lookback_hours": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8760
+        },
+        "max_items_per_run": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "full_text": {
+          "type": "boolean"
+        },
+        "extraction_profile": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+            }
+          ]
+        },
+        "rights": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "basis",
+            "evidence_ref",
+            "verified",
+            "attribution_required",
+            "allow_storage",
+            "allow_derivative",
+            "allow_full_repost",
+            "allow_media"
+          ],
+          "properties": {
+            "basis": {
+              "type": "string",
+              "minLength": 1
+            },
+            "evidence_ref": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "attribution_required": {
+              "type": "boolean"
+            },
+            "allow_storage": {
+              "type": "boolean"
+            },
+            "allow_derivative": {
+              "type": "boolean"
+            },
+            "allow_full_repost": {
+              "type": "boolean"
+            },
+            "allow_media": {
+              "type": "boolean"
+            }
+          }
+        },
+        "api": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "items_path",
+            "fields"
+          ],
+          "properties": {
+            "items_path": {
+              "type": "string"
+            },
+            "fields": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "text",
+                "url"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "title": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "text": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "url": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "published_at": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "next_path": {
+              "type": "string"
+            },
+            "cursor_param": {
+              "type": "string"
+            },
+            "max_pages": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20
+            },
+            "auth_header": {
+              "enum": [
+                "Authorization",
+                "X-API-Key"
+              ]
+            },
+            "auth_prefix": {
+              "type": "string",
+              "maxLength": 32
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "rss",
+                  "html"
+                ]
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "endpoint": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https?://"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "html"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "extraction_profile": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          },
+          "then": {
+            "properties": {
+              "rights": {
+                "properties": {
+                  "verified": {
+                    "const": true
+                  },
+                  "allow_storage": {
+                    "const": true
+                  },
+                  "evidence_ref": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "enum": [
+                        "telegram_bot",
+                        "max_bot",
+                        "telegram_mtproto"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "external_chat_id": {
+                      "type": "string",
+                      "pattern": "^-?[0-9]+$"
+                    },
+                    "access_ref": {
+                      "type": "string",
+                      "pattern": "^[A-Z][A-Z0-9_]*$"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "json_api"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "api"
+            ],
+            "properties": {
+              "endpoint": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https?://"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "json_api"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "api"
+            ],
+            "properties": {
+              "endpoint": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https?://"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "json_api"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "api"
+            ],
+            "properties": {
+              "endpoint": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https?://"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,322 @@
+{
+  "version": 2,
+  "target_channel": "test",
+  "top_n": 10,
+  "min_views": 10000,
+  "min_likes": 100,
+  "min_local_relevance": 0.6,
+  "min_width": 512,
+  "min_height": 512,
+  "max_downloads_per_scan": 20,
+  "license": {
+    "name": "Pixabay Content License",
+    "url": "https://pixabay.com/service/license-summary/"
+  },
+  "sources": [
+    {
+      "id": "pixabay_ai_illustrations",
+      "type": "pixabay_api",
+      "enabled": true,
+      "api_key_env": "PIXABAY_API_KEY",
+      "endpoint": "https://pixabay.com/api/",
+      "queries": [
+        "ai generated",
+        "digital art",
+        "fantasy art",
+        "science fiction"
+      ],
+      "per_query": 20,
+      "rights_evidence": "https://pixabay.com/service/license-summary/"
+    },
+    {
+      "id": "openverse_wikimedia",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "wikimedia",
+      "site_url": "https://commons.wikimedia.org",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_animaldiversity",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "animaldiversity",
+      "site_url": "https://animaldiversity.org",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_bio_diversity",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "bio_diversity",
+      "site_url": "https://www.biodiversitylibrary.org/",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_brooklynmuseum",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "brooklynmuseum",
+      "site_url": "https://www.brooklynmuseum.org",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_clevelandmuseum",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "clevelandmuseum",
+      "site_url": "https://www.clevelandart.org",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_spacex",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "spacex",
+      "site_url": "https://spacex.com",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_digitaltmuseum",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "digitaltmuseum",
+      "site_url": "https://digitaltmuseum.no",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_geographorguk",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "geographorguk",
+      "site_url": "https://www.geograph.org.uk",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_met",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "met",
+      "site_url": "https://www.metmuseum.org",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_museumsvictoria",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "museumsvictoria",
+      "site_url": "https://museumsvictoria.com.au",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_nasa",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "nasa",
+      "site_url": "https://www.nasa.gov/",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_rawpixel",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "rawpixel",
+      "site_url": "https://www.rawpixel.com",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_rijksmuseum",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "rijksmuseum",
+      "site_url": "https://www.rijksmuseum.nl/en",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_woc_tech",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "woc_tech",
+      "site_url": "https://www.wocintechchat.com/",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_finnish_heritage_agency",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "finnish_heritage_agency",
+      "site_url": "https://www.museovirasto.fi/en/",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_stocksnap",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "stocksnap",
+      "site_url": "https://stocksnap.io",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_wordpress",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "wordpress",
+      "site_url": "https://wordpress.org/photos",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_smk",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "smk",
+      "site_url": "https://open.smk.dk/",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_finnish_satakunnan_museum",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "finnish_satakunnan_museum",
+      "site_url": "https://satakunnanmuseo.pori.fi/en/",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_justtakeitfree",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "justtakeitfree",
+      "site_url": "https://justtakeitfree.com/",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_national_museum_of_finland",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "national_museum_of_finland",
+      "site_url": "https://www.kansallismuseo.fi/en/kansallismuseo",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_europeana",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "europeana",
+      "site_url": "https://www.europeana.eu/en",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_inaturalist",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "inaturalist",
+      "site_url": "https://inaturalist.org",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_nappy",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "nappy",
+      "site_url": "https://nappy.co",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_wellcome_collection",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "wellcome_collection",
+      "site_url": "https://wellcomecollection.org/",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_bib_gulbenkian",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "bib_gulbenkian",
+      "site_url": "https://gulbenkian.pt/biblioteca-arte/",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_flickr",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "flickr",
+      "site_url": "https://www.flickr.com",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_sciencemuseum",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "sciencemuseum",
+      "site_url": "https://www.sciencemuseum.org.uk",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    },
+    {
+      "id": "openverse_nypl",
+      "type": "openverse_source",
+      "enabled": true,
+      "source_name": "nypl",
+      "site_url": "https://digitalcollections.nypl.org/",
+      "query": "digital art",
+      "per_query": 10,
+      "rights_evidence": "https://api.openverse.org/v1/"
+    }
+  ]
+}

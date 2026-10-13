@@ -1,0 +1,4 @@
+# Run only after verifying compiled-manifest.json.base_image_id matches this local tag.
+FROM max-postiz-browser:source-0.4.0
+COPY . /adapter/
+RUN node /adapter/repair-compiled.cjs

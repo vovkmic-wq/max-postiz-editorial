@@ -1,0 +1,91 @@
+{
+  "schema_version": "1.0",
+  "profile": "development",
+  "topic_path": "TOPIC.md",
+  "sources_path": "config/sources.json",
+  "state_dir": "data/state",
+  "media_dir": "data/media",
+  "logs_dir": "data/logs",
+  "database_url_env": "DATABASE_URL",
+  "api": {
+    "bind_host": "127.0.0.1",
+    "port": 8080,
+    "public_base_url_env": "PUBLIC_BASE_URL",
+    "auth_secret_env": "APP_AUTH_SECRET"
+  },
+  "opencode": {
+    "adapter_mode": "fake",
+    "required_version": "2.0.17",
+    "base_url_env": "OPENCODE_BASE_URL",
+    "auth_secret_env": "OPENCODE_AUTH_SECRET",
+    "isolated_state_dir": "data/opencode",
+    "model_id_env": "OPENCODE_MODEL_ID",
+    "task_timeout_seconds": 180,
+    "max_format_repairs": 2,
+    "max_concurrent_tasks": 1,
+    "generate_transport": "session",
+    "runtime_dir": "data/opencode-runtime",
+    "local_zero_cost": false
+  },
+  "max": {
+    "adapter_mode": "fake",
+    "api_base_url": "https://platform-api2.max.ru",
+    "token_env": "MAX_BOT_TOKEN",
+    "webhook_secret_env": "MAX_WEBHOOK_SECRET",
+    "webhook_enabled": false,
+    "request_timeout_seconds": 30,
+    "max_messages_per_second_per_channel": 1,
+    "browser": {
+      "profile_dir": "data/max-browser",
+      "channel": "chrome",
+      "headless": true,
+      "operation_timeout_seconds": 120,
+      "channels": {}
+    }
+  },
+  "jobs": {
+    "lease_seconds": 240,
+    "heartbeat_seconds": 30,
+    "max_read_attempts": 3,
+    "catch_up_max_jobs_per_source": 1
+  },
+  "collection": {
+    "default_interval_seconds": 1800,
+    "max_response_bytes": 5242880,
+    "max_image_bytes": 10485760,
+    "max_redirects": 3,
+    "deny_private_networks": true
+  },
+  "deduplication": {
+    "semantic_window_days": 180,
+    "embeddings_enabled": false
+  },
+  "retention": {
+    "raw_days": 30,
+    "published_evidence_days": 365,
+    "temporary_media_days": 7
+  },
+  "notifications": {
+    "enabled": false,
+    "destination_ref": null,
+    "meaningful_changes_only": true
+  },
+  "video": {
+    "backend": "comfyui",
+    "max_duration_seconds": 60,
+    "max_bytes": 104857600,
+    "base_url_env": "COMFYUI_BASE_URL",
+    "workflow_path": "config/comfy/workflow.json",
+    "workflow_sha256": null,
+    "allowed_node_classes": [],
+    "bindings": [],
+    "local_zero_cost": false,
+    "max_project_cost_rub": 0,
+    "daily_generation_limit_rub": 0,
+    "width": 720,
+    "height": 1280,
+    "generation_fps": 16,
+    "task_timeout_seconds": 1800,
+    "require_audio": false
+  }
+}

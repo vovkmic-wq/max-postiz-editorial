@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "channels": {
+    "test": {
+      "queries": [
+        "ai generated",
+        "digital art",
+        "fantasy art",
+        "science fiction"
+      ],
+      "local_prompts": [
+        "high quality imaginative AI generated digital artwork, vivid composition",
+        "unrelated ordinary snapshot, text screenshot or low quality image"
+      ],
+      "caption_title": "Иллюстрация из открытой коллекции",
+      "image_type": "illustration",
+      "interval_hours": 4
+    }
+  }
+}

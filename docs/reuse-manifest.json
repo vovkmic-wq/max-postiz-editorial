@@ -1,0 +1,427 @@
+[
+  {
+    "source": "src/max_channel_agent/adapters.py",
+    "target": "src/max_postiz_agent/adapters.py",
+    "source_sha256": "0600cf97a1eff8280b8e0970d12d0a83f9cbb68a8d9fa5f5343ce7d2759be128"
+  },
+  {
+    "source": "src/max_channel_agent/api.py",
+    "target": "src/max_postiz_agent/api.py",
+    "source_sha256": "0f4282f7261a689d077fcd64776bf109d90a97d2c3457d7188ec6f193deaafed"
+  },
+  {
+    "source": "src/max_channel_agent/backup.py",
+    "target": "src/max_postiz_agent/backup.py",
+    "source_sha256": "11f86ad7d594fb6a6290aecf5a101dcd31e9c743e2d3aadab1df1dba4b938f09"
+  },
+  {
+    "source": "src/max_channel_agent/browser_channels.py",
+    "target": "src/max_postiz_agent/browser_channels.py",
+    "source_sha256": "e6e4027840f7e45adde0654baa7e3d122e0394b6e4fb7a93e56e6b34f683af14"
+  },
+  {
+    "source": "src/max_channel_agent/browser_corrections.py",
+    "target": "src/max_postiz_agent/browser_corrections.py",
+    "source_sha256": "20bdfdc1bd685b3183ee09b6e267dc97610074de519d1931e67f8abda25ed76d"
+  },
+  {
+    "source": "src/max_channel_agent/browser_login.py",
+    "target": "src/max_postiz_agent/browser_login.py",
+    "source_sha256": "0ef957631bd71a2da60e30df36085c00e23a31c38bd8013fb1e272ce8f4a959e"
+  },
+  {
+    "source": "src/max_channel_agent/browser_publisher.py",
+    "target": "src/max_postiz_agent/browser_publisher.py",
+    "source_sha256": "dbd79a14d41c8a426577231518f16b5416760ead8c83575dedeaea3bb6af5f12"
+  },
+  {
+    "source": "src/max_channel_agent/browser_runtime.py",
+    "target": "src/max_postiz_agent/browser_runtime.py",
+    "source_sha256": "c9cf5037a6d11fbed2305e5d6145584131dff520509274d052aee97bc5ff20bf"
+  },
+  {
+    "source": "src/max_channel_agent/browser_worker.py",
+    "target": "src/max_postiz_agent/browser_worker.py",
+    "source_sha256": "7e63ee5b56cb19e562d752968aa1f0f9b63d501be37d5621cfd27952709be9b7"
+  },
+  {
+    "source": "src/max_channel_agent/calendar_schedule.py",
+    "target": "src/max_postiz_agent/calendar_schedule.py",
+    "source_sha256": "a2c022f21166740626b9aebcc707d4643d0b520e4b669fea40b3a363b6cc8f5b"
+  },
+  {
+    "source": "src/max_channel_agent/channel_management.py",
+    "target": "src/max_postiz_agent/channel_management.py",
+    "source_sha256": "59370014dc3c7abad3ca16657e11003f1ab9dcba7b54c62f54545dc9ae005701"
+  },
+  {
+    "source": "src/max_channel_agent/channel_profiles.py",
+    "target": "src/max_postiz_agent/channel_profiles.py",
+    "source_sha256": "11e269a618bad58d944e237268cec6b1a261b6d3d4b21e3b2409e12cc1a928fa"
+  },
+  {
+    "source": "src/max_channel_agent/cli.py",
+    "target": "src/max_postiz_agent/cli.py",
+    "source_sha256": "7f92ef3617238fc4bd25c222e8f881dd663cf6f3c179fb4af14a5f65c7589461"
+  },
+  {
+    "source": "src/max_channel_agent/collectors.py",
+    "target": "src/max_postiz_agent/collectors.py",
+    "source_sha256": "216413bb7410b3d8cdf1898e0ad2763099d22c8fe027e446d6c9476854ac0279"
+  },
+  {
+    "source": "src/max_channel_agent/comfy.py",
+    "target": "src/max_postiz_agent/comfy.py",
+    "source_sha256": "3c26c6c1e4ba248746ab52ca6d9b7ff9d9ae3994af5e52d2e0c974bbd791abec"
+  },
+  {
+    "source": "src/max_channel_agent/config.py",
+    "target": "src/max_postiz_agent/config.py",
+    "source_sha256": "53ab4fc6949b3660e3a32dec153c46591625014b3a432ed3ebd0a40782b139a7"
+  },
+  {
+    "source": "src/max_channel_agent/db.py",
+    "target": "src/max_postiz_agent/db.py",
+    "source_sha256": "32bfb6b18ec3a83d1d2bd6b4b0dfac176135ef09e0ce6af0af2f855e4686a80c"
+  },
+  {
+    "source": "src/max_channel_agent/editorial.py",
+    "target": "src/max_postiz_agent/editorial.py",
+    "source_sha256": "493578e8bec3ce74722efda4a6e4f7324dc277f18a6ae15bf231c33be300e078"
+  },
+  {
+    "source": "src/max_channel_agent/file_dialog.py",
+    "target": "src/max_postiz_agent/file_dialog.py",
+    "source_sha256": "ceb5219d1a41e2a446bdb99572365bf1ea12972259d42ea40be09cb8df3d68e1"
+  },
+  {
+    "source": "src/max_channel_agent/holidays.py",
+    "target": "src/max_postiz_agent/holidays.py",
+    "source_sha256": "aa6adf79b26ccdd812adb849801bfc1b33661b22755a22e6c4755a211bb8d6ef"
+  },
+  {
+    "source": "src/max_channel_agent/hybrid.py",
+    "target": "src/max_postiz_agent/hybrid.py",
+    "source_sha256": "ddd13e3f1c6e8799303e9f1fc05a79e0877110e8485fc981e7b3771327f4c64b"
+  },
+  {
+    "source": "src/max_channel_agent/image_commands.py",
+    "target": "src/max_postiz_agent/image_commands.py",
+    "source_sha256": "07b2749c2d1911f5663efa0e5574581c366b655a1494e2a08577b9a3c25efad7"
+  },
+  {
+    "source": "src/max_channel_agent/image_pipeline.py",
+    "target": "src/max_postiz_agent/image_pipeline.py",
+    "source_sha256": "f07fe005632117fc567f65ca4b4ba3da0e8b054cd5eceb97c3f70e71a1e22ed2"
+  },
+  {
+    "source": "src/max_channel_agent/image_schedule.py",
+    "target": "src/max_postiz_agent/image_schedule.py",
+    "source_sha256": "46b80670d2935d66f1f617a8520e69da206f10cad89da8c0cf824a2b8c534914"
+  },
+  {
+    "source": "src/max_channel_agent/media.py",
+    "target": "src/max_postiz_agent/media.py",
+    "source_sha256": "9aafb18f7698a497526f21189a2375afbf1e1b624e0497d8fb14e8222df5d967"
+  },
+  {
+    "source": "src/max_channel_agent/network.py",
+    "target": "src/max_postiz_agent/network.py",
+    "source_sha256": "b567ead1f5b0fd304c8279f9979f9362d5defa28875c6cdaa463db261f78ceb1"
+  },
+  {
+    "source": "src/max_channel_agent/openverse_source.py",
+    "target": "src/max_postiz_agent/openverse_source.py",
+    "source_sha256": "f04f01ba647a71f9f95832f48dc43667d3eeaf6be7c6bffca3abf455de7d0970"
+  },
+  {
+    "source": "src/max_channel_agent/panel_auth.py",
+    "target": "src/max_postiz_agent/panel_auth.py",
+    "source_sha256": "9e4b15df02d690bec93009f82736bf4749a03f688366636f257a84e37a2354d8"
+  },
+  {
+    "source": "src/max_channel_agent/panel_calendar.py",
+    "target": "src/max_postiz_agent/panel_calendar.py",
+    "source_sha256": "4c16ea2fce47b7bf1b61f3e2213acebe057e9b52a546d04d3fe1d7cfef120c09"
+  },
+  {
+    "source": "src/max_channel_agent/panel_files.py",
+    "target": "src/max_postiz_agent/panel_files.py",
+    "source_sha256": "bcd3e584c6dad441b914a28ff445d460e6ceff6fd9a86a18c0401931d590cf56"
+  },
+  {
+    "source": "src/max_channel_agent/panel_settings.py",
+    "target": "src/max_postiz_agent/panel_settings.py",
+    "source_sha256": "d2f1de929fd51caa8c9f5aee2e6dc0edf9274e658cb894c68c7c6d76326cd001"
+  },
+  {
+    "source": "src/max_channel_agent/portability.py",
+    "target": "src/max_postiz_agent/portability.py",
+    "source_sha256": "55387c3700f17a142bd6f701f89585521d3c6c7f0cf03babf480d75148e2e46c"
+  },
+  {
+    "source": "src/max_channel_agent/service.py",
+    "target": "src/max_postiz_agent/service.py",
+    "source_sha256": "8a02b94ae482e88fb2cf1b0dd9cfc4205da2a49f46eb61dfcde09303b313e2e8"
+  },
+  {
+    "source": "src/max_channel_agent/video_tools.py",
+    "target": "src/max_postiz_agent/video_tools.py",
+    "source_sha256": "6b0a4d69514bcdd0a65073b01c65f03f49acfd9448c0ace47cf557f9d87e30c3"
+  },
+  {
+    "source": "src/max_channel_agent/__init__.py",
+    "target": "src/max_postiz_agent/__init__.py",
+    "source_sha256": "a47ee2f98a2c36260a2c8c2efee43d83df35ce55741eb128195d1196d064ac97"
+  },
+  {
+    "source": "src/max_channel_agent.egg-info/dependency_links.txt",
+    "target": "src/max_postiz_agent.egg-info/dependency_links.txt",
+    "source_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+  },
+  {
+    "source": "src/max_channel_agent.egg-info/entry_points.txt",
+    "target": "src/max_postiz_agent.egg-info/entry_points.txt",
+    "source_sha256": "51fb46645ffb99a2bea96126abde34ab4405ef4ddcff4e27aae83c49065c52cd"
+  },
+  {
+    "source": "src/max_channel_agent.egg-info/PKG-INFO",
+    "target": "src/max_postiz_agent.egg-info/PKG-INFO",
+    "source_sha256": "38c2346fdf9265549d37fdb4517c9cd57d2f50435984188bc4bceb902a34413d"
+  },
+  {
+    "source": "src/max_channel_agent.egg-info/requires.txt",
+    "target": "src/max_postiz_agent.egg-info/requires.txt",
+    "source_sha256": "f4b2a3d491a486d2ed9caad16a97da7892cb93e7b81f5111716fac0fd7eb14ca"
+  },
+  {
+    "source": "src/max_channel_agent.egg-info/SOURCES.txt",
+    "target": "src/max_postiz_agent.egg-info/SOURCES.txt",
+    "source_sha256": "48338db8325dd75e54e1696116e998dc364e6dc6dd7a871b0cae8b24c9c9d8a5"
+  },
+  {
+    "source": "src/max_channel_agent.egg-info/top_level.txt",
+    "target": "src/max_postiz_agent.egg-info/top_level.txt",
+    "source_sha256": "e224e773b733123a467cd05e4c33eb2a24ed9d5dda2e8180e5c3cc8e1fdc1e90"
+  },
+  {
+    "source": "src/max_channel_agent/static/dashboard.js",
+    "target": "src/max_postiz_agent/static/dashboard.js",
+    "source_sha256": "9d268109484d62e66b2afbb7e619d7811f88bbf6f5d35e064b23cc547ff84dfb"
+  },
+  {
+    "source": "src/max_channel_agent/static/index.html",
+    "target": "src/max_postiz_agent/static/index.html",
+    "source_sha256": "a68fe5a965f6394a0c47fa1f9d0ce405f9345fa48724ddc00d029b8d00d0bc51"
+  },
+  {
+    "source": "src/max_channel_agent/static/style.css",
+    "target": "src/max_postiz_agent/static/style.css",
+    "source_sha256": "16ed80640166262e2859ce2505b594bf76c1443dbc42f338f005a541678b2ca3"
+  },
+  {
+    "source": "tests/conftest.py",
+    "target": "tests/conftest.py",
+    "source_sha256": "e80d2a7f47bdb2db15ba582e1f85bf8dbbb751a404ce9a40e8c8c4bb5f0d62b6"
+  },
+  {
+    "source": "tests/test_api_adapters_backup.py",
+    "target": "tests/test_api_adapters_backup.py",
+    "source_sha256": "a48b862e27912fe4828f871d5325540f36a0fea2e22f3a5e3cc45f988c95ae25"
+  },
+  {
+    "source": "tests/test_browser_channels.py",
+    "target": "tests/test_browser_channels.py",
+    "source_sha256": "da03f68358e1d54b3b83826f843a8b4bd8d2e5e28107544b5249c1d05c38f681"
+  },
+  {
+    "source": "tests/test_browser_corrections.py",
+    "target": "tests/test_browser_corrections.py",
+    "source_sha256": "146f5a672014600d609f2840a6d1ed4e3b8074ecd9210ff6f5980e8edd52e3e6"
+  },
+  {
+    "source": "tests/test_browser_publishing.py",
+    "target": "tests/test_browser_publishing.py",
+    "source_sha256": "a06af85b0338950d46eb73526a697b5854277475d29a0fa29db0a5f174643e77"
+  },
+  {
+    "source": "tests/test_cli.py",
+    "target": "tests/test_cli.py",
+    "source_sha256": "48fbf7f2e2041e44fc73e59dff37887eb657259b0a8a08723d02142784180bdf"
+  },
+  {
+    "source": "tests/test_commercial_corrections.py",
+    "target": "tests/test_commercial_corrections.py",
+    "source_sha256": "fa90f8436cdc67cafbebb01daa64a53b6df941075aa258f4ab9f95bd36950cde"
+  },
+  {
+    "source": "tests/test_configuration.py",
+    "target": "tests/test_configuration.py",
+    "source_sha256": "f8b382e0f9d8b2db30c879890d9cefe1b8a01c20932566c363e6e18ab6354e86"
+  },
+  {
+    "source": "tests/test_hybrid.py",
+    "target": "tests/test_hybrid.py",
+    "source_sha256": "d8ccfd33fb14cf4401c30014d906f7825094b2a3fe9cce9cc3e93e94e5dfda5e"
+  },
+  {
+    "source": "tests/test_image_pipeline.py",
+    "target": "tests/test_image_pipeline.py",
+    "source_sha256": "f17d7b073e6eca812bccbbfdf5ce45f1e52793f2afa75256e346a76f796ee46a"
+  },
+  {
+    "source": "tests/test_image_schedule.py",
+    "target": "tests/test_image_schedule.py",
+    "source_sha256": "451defc57cc504c0143225c400018ef4174421a60ab4f5833d997d88bb896084"
+  },
+  {
+    "source": "tests/test_multichannel_portability.py",
+    "target": "tests/test_multichannel_portability.py",
+    "source_sha256": "1c4261885e7cba2a86f2d29013fd65617b133863294627ffa0699a1886e885fd"
+  },
+  {
+    "source": "tests/test_network_collectors.py",
+    "target": "tests/test_network_collectors.py",
+    "source_sha256": "889a5c1e0f09cdebb9aff04012f02b85a18db02ed707546802f0440593111381"
+  },
+  {
+    "source": "tests/test_panel_buttons.py",
+    "target": "tests/test_panel_buttons.py",
+    "source_sha256": "dc0968106b8e04c99eb31633ed378127882be528dc7025718342f062b2aadb48"
+  },
+  {
+    "source": "tests/test_panel_calendar_settings.py",
+    "target": "tests/test_panel_calendar_settings.py",
+    "source_sha256": "d6951703278f8a5e00df4ead4a5fc8d833b5c79de50193b36fbf594c5e6e520c"
+  },
+  {
+    "source": "tests/test_panel_files.py",
+    "target": "tests/test_panel_files.py",
+    "source_sha256": "c6aa1578778d393e0c5154c6028939f2f5331754433adcec06019ca2ddcde45d"
+  },
+  {
+    "source": "tests/test_reliability.py",
+    "target": "tests/test_reliability.py",
+    "source_sha256": "725b1c4930eceb84127d3208b985f49ebaea6f45d0040bd6f24b7694650b03ab"
+  },
+  {
+    "source": "tests/test_short_video_qa.py",
+    "target": "tests/test_short_video_qa.py",
+    "source_sha256": "e2b15762ac183d29674852c40d029658ba48afcc0a5545fba318a390fb839226"
+  },
+  {
+    "source": "tests/test_video_and_end_to_end.py",
+    "target": "tests/test_video_and_end_to_end.py",
+    "source_sha256": "18d3045d4a5043aaf97604b087e88e2747bba97b71a43a1f1c4ffb8479431bb8"
+  },
+  {
+    "source": "tests/test_vm109_video_bridge.py",
+    "target": "tests/test_vm109_video_bridge.py",
+    "source_sha256": "49c7c154dd21fa72f41c5215bfe9c4bee6917c33487c8162f471c11d00b7edbd"
+  },
+  {
+    "source": "tests/test_workflow.py",
+    "target": "tests/test_workflow.py",
+    "source_sha256": "8e5e3c09a50db05613f494d052e843f55e6d80fd9efe3f118e16a424125135a5"
+  },
+  {
+    "source": "schemas/holidays.schema.json",
+    "target": "schemas/holidays.schema.json",
+    "source_sha256": "1ccd958545a5895fd4eb7255cce10556cf65442657874d4962c642f19240cb98"
+  },
+  {
+    "source": "schemas/image_channels.schema.json",
+    "target": "schemas/image_channels.schema.json",
+    "source_sha256": "d04f9b0253344ae59ad723896aef47f03a74e1ef75521d5d5f9e3e3c26fc1e8d"
+  },
+  {
+    "source": "schemas/sources.schema.json",
+    "target": "schemas/sources.schema.json",
+    "source_sha256": "990f9426d6bb03d34de451835fa82bb9212b5384d7cce9b0448ba9759c84c154"
+  },
+  {
+    "source": "schemas/topic.schema.json",
+    "target": "schemas/topic.schema.json",
+    "source_sha256": "5ac5ae001020076a6f71b0e7a44ede51f40de470d38532448b6706788044f118"
+  },
+  {
+    "source": "prompts/EDITOR_AGENT_PROMPT.md",
+    "target": "prompts/EDITOR_AGENT_PROMPT.md",
+    "source_sha256": "eeaf411275384f65c015911d0ad1958f3861176ac1b10790d584b52bd81e1075"
+  },
+  {
+    "source": "prompts/IMPLEMENTATION_PROMPT.md",
+    "target": "prompts/IMPLEMENTATION_PROMPT.md",
+    "source_sha256": "88a94aa8a9d4c478bbe927cbb5aaec571824c6913dd353f0a30d1036427c153f"
+  },
+  {
+    "source": "scripts/configure_comfy.py",
+    "target": "scripts/configure_comfy.py",
+    "source_sha256": "3de5fcf8f9f74088173687a70a41e2511b9e83a04b216a72d6810ac67760b336"
+  },
+  {
+    "source": "scripts/demo.py",
+    "target": "scripts/demo.py",
+    "source_sha256": "99aade7ef7eaa57d8be3a14616f424485f2a4895b17b4f1cbb37d9968137aca9"
+  },
+  {
+    "source": "scripts/hybrid_demo.py",
+    "target": "scripts/hybrid_demo.py",
+    "source_sha256": "ad69912d7b89cbc4cdb01e37717b21502f13a398174bb7af073ccedd2079089c"
+  },
+  {
+    "source": "scripts/install.ps1",
+    "target": "scripts/install.ps1",
+    "source_sha256": "0a3592ea61abe490d8fea3998a350b4b8990579eb31c6dd38fdb64877248d644"
+  },
+  {
+    "source": "scripts/install.sh",
+    "target": "scripts/install.sh",
+    "source_sha256": "3edca2e58afaffcd02ffce39842acb61f20074726820ab5d33611bc8e3078616"
+  },
+  {
+    "source": "scripts/install_image_model.py",
+    "target": "scripts/install_image_model.py",
+    "source_sha256": "e85d8788f82ad7b053046ccf09bf9fcb601c1c837457df0edb331ed49b4751cf"
+  },
+  {
+    "source": "scripts/probe_comfy.py",
+    "target": "scripts/probe_comfy.py",
+    "source_sha256": "675c0267cae7de2592e5965a0f9534f438ddb0c0df90f18a6e54a3a15ed4dbc6"
+  },
+  {
+    "source": "scripts/serve_opencode.py",
+    "target": "scripts/serve_opencode.py",
+    "source_sha256": "d158c553f0a4353ec249e2126f221cf79cf9db87ab9c4f228f1d558bd64d1eba"
+  },
+  {
+    "source": "scripts/start.ps1",
+    "target": "scripts/start.ps1",
+    "source_sha256": "5739421b69ddb9b4a962d0073e92514d43b7f262d5d1ed4f92efde7a73352076"
+  },
+  {
+    "source": "scripts/start.sh",
+    "target": "scripts/start.sh",
+    "source_sha256": "9a68cbb1c37d44c8f597ccd54f2cbda48cd960ba713725345df2bc61b0d5b56c"
+  },
+  {
+    "source": "scripts/test.ps1",
+    "target": "scripts/test.ps1",
+    "source_sha256": "7a23c8711943fa6bff5a7d052680c27058c220baf9967f029212202e4ef77b19"
+  },
+  {
+    "source": "migrations/env.py",
+    "target": "migrations/env.py",
+    "source_sha256": "5f8bad074bec5c7db8b9bdf5cc41ca7781e9a301f5a7e3c705ea0f053ce1bcd1"
+  },
+  {
+    "source": "migrations/versions/0001_initial.py",
+    "target": "migrations/versions/0001_initial.py",
+    "source_sha256": "2f06f0f6c8cbc235771b806e07736708d207cfbeaa3b952ee933a5f4d6d0f656"
+  },
+  {
+    "source": "migrations/versions/0002_hybrid.py",
+    "target": "migrations/versions/0002_hybrid.py",
+    "source_sha256": "f0920da2f698dee50266db1ef5639f1bf56edcb093eae8369e2a1686c96f85d0"
+  }
+]

@@ -1,0 +1,25 @@
+{
+  "repository": "gitroomhq/postiz-docker-compose",
+  "commit": "dd4969e5e694cd009619a0d53cff14c21104580b",
+  "sha256": {
+    "docker-compose.yaml": "6716c1d47054699ee0d6760f30986304659ff3167ea461493568dd21eedbc4fa",
+    "dynamicconfig/development-cass.yaml": "93974403e6c69537da3bcc35d31e507e4617df6bff71fc72bdb2e98cc177625f",
+    "dynamicconfig/development-sql.yaml": "7bf93f05a292f3fd12605fe0f7df2956ccd88ffedabc134109a75c154a173788"
+  },
+  "mutations": [
+    "loopback_ports",
+    "required_secrets",
+    "explicit_postiz_image",
+    "no_spotlight",
+    "replace_existing_host_binding",
+    "local_http_auth",
+    "project_scoped_networks",
+    "temporal_ip_healthcheck",
+    "temporal_ui_port_8088",
+    "registration_disabled",
+    "images_digest_lock"
+  ],
+  "runtime_verified": true,
+  "runtime_version": "2.25.1",
+  "verified_date": "2026-10-12"
+}

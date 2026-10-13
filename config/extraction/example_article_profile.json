@@ -1,0 +1,5 @@
+{
+  "title_selector": "h1",
+  "body_selector": "article",
+  "date_selector": "time[datetime]"
+}

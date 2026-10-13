@@ -1,0 +1,50 @@
+{
+  "version": "0.4.1",
+  "verified_date": "2026-10-13",
+  "strategy": "Custom max-browser provider; Postiz editor/calendar, agent approval, existing MAX browser delivery",
+  "target_postiz_version": "2.25.1",
+  "target_id": "max_test",
+  "chat_id": "-79860712657053",
+  "requires_bot": false,
+  "connection_verified": true,
+  "editor_and_live_edit_verified": true,
+  "live_pending_bridge_verified": true,
+  "publishing_verified": true,
+  "new_external_posts": 1,
+  "delivery_paused": true,
+  "source_manifest": "source-manifest.json",
+  "compiled_repair_manifest": "compiled-manifest.json",
+  "fresh_current_source_rebuild_verified": false,
+  "historical_bot_reference": {
+    "target_postiz_version": "2.25.1",
+    "source_repository": "FedrBodr/vezdepost",
+    "source_commit": "ff4dbe31bfd5209935d32303de2be1def56ba9ad",
+    "max_provider_path": "libraries/nestjs-libraries/src/integrations/social/max.provider.ts",
+    "max_provider_sha256": "65014fca068ed2fd6ed9cc185324dad13a2322686ea3d7981b09eae8a37f4d5c",
+    "chat_id": "-79860712657053",
+    "token_env": "MAX_TOKEN",
+    "required_permissions": [
+      "read_all_messages",
+      "write"
+    ],
+    "requires_bot_admin": true,
+    "installed_postiz_has_max_provider": false,
+    "bot_token_configured": false,
+    "connection_verified": false,
+    "publishing_verified": false,
+    "bot_created": false,
+    "bot_state_evidence": "owner reported bot not created",
+    "source_compare_with_installed": {
+      "status": "unverified",
+      "reason": "Vezdepost is a standalone GitHub repository; prior OWNER:main comparison did not target it"
+    },
+    "implementation_strategy": "Backport and test MAX provider for installed Postiz; verify compatibility before replacing the existing deployment"
+  },
+  "postiz_overlay_version": "0.4.0",
+  "verified_publication_time_moscow": "2026-10-13T15:21:00+03:00",
+  "postiz_publish_status": "PUBLISHED",
+  "temporal_workflow_status": "COMPLETED",
+  "native_max_message_id_verified": false,
+  "individual_permalink_verified": false,
+  "read_only_reopen_verified": true
+}

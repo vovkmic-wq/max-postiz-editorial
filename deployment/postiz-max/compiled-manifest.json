@@ -1,0 +1,11 @@
+{
+  "base_image_id": "sha256:3ef097b847324f3e9e0835018e0268cd9a7bc0966fc8d349f2fb12d594ba8800",
+  "files": {
+    "apps/backend/dist/libraries/nestjs-libraries/src/integrations/integration.manager.js": "eee724a83ff4fc6a8de698784aab04f789c132b647b1e14b5ddf6d9d983e43f1",
+    "apps/orchestrator/dist/libraries/nestjs-libraries/src/integrations/integration.manager.js": "eee724a83ff4fc6a8de698784aab04f789c132b647b1e14b5ddf6d9d983e43f1",
+    "apps/backend/dist/apps/backend/src/app.module.js": "540f873cb4e082dee1b57940cdf0ba23b21c198b600b82422b0c1643d969f1ef",
+    "apps/backend/dist/apps/backend/src/public-api/routes/v1/public.integrations.controller.js": "308299241506158b50c08c6bad47a1bd15aed36a536ac45fc585d79e6a05904f",
+    "apps/backend/dist/libraries/nestjs-libraries/src/temporal/temporal.module.js": "e4cf3876ba932e92c68dde06c11df54496d38f5d9f69ea94b1d8763adb8a13e3",
+    "apps/orchestrator/dist/libraries/nestjs-libraries/src/temporal/temporal.module.js": "e4cf3876ba932e92c68dde06c11df54496d38f5d9f69ea94b1d8763adb8a13e3"
+  }
+}

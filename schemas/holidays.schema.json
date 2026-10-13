@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "version",
+    "enabled",
+    "calendar_year",
+    "holidays"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "calendar_year": {
+      "type": "integer",
+      "minimum": 1900,
+      "maximum": 2200
+    },
+    "holidays": {
+      "type": "array",
+      "maxItems": 2000,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "date",
+          "source_url",
+          "tags"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "date": {
+            "type": "string",
+            "format": "date"
+          },
+          "source_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "tags": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            }
+          },
+          "category": {
+            "type": "string",
+            "maxLength": 80
+          },
+          "rule": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "month",
+                  "day"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "fixed"
+                  },
+                  "month": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 12
+                  },
+                  "day": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 31
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "month",
+                  "weekday",
+                  "nth"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "nth_weekday"
+                  },
+                  "month": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 12
+                  },
+                  "weekday": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 6
+                  },
+                  "nth": {
+                    "enum": [
+                      -1,
+                      1,
+                      2,
+                      3,
+                      4,
+                      5
+                    ]
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "offset"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "easter_relative"
+                  },
+                  "offset": {
+                    "type": "integer",
+                    "minimum": -60,
+                    "maximum": 60
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

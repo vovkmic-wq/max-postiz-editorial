@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Редакция MAX</title><link rel="stylesheet" href="/static/style.css">
+  <script src="/static/dashboard.js" defer></script>
+</head>
+<body>
+<header><span>MAX · локальная редакция</span><h1>Редакция ваших каналов</h1><p>Публикации, календарь и настройки в одном месте.</p></header>
+<main>
+  <!-- Вход сохраняется в HttpOnly-сессии; ключ не записывается в хранилище JavaScript. -->
+  <section class="login"><label>Ключ доступа к панели <input id="token" type="password" autocomplete="off" placeholder="Введите ключ владельца, редактора или наблюдателя"></label>
+    <button id="login">Подключиться</button><button id="logout" class="secondary" disabled>Выйти</button>
+    <p id="status" role="status">Подключитесь к панели, чтобы управлять каналами.</p>
+  </section>
+  <!-- Обратная связь остаётся видимой при прокрутке к любой кнопке. -->
+  <div id="feedback" role="status" aria-live="polite" data-state="idle">Готово к подключению.</div>
+  <nav id="tabs" aria-label="Разделы">
+    <button data-tab="channels">Каналы</button><button id="calendar-tab" data-view="calendar">Календарь</button>
+    <button data-tab="sources">Источники</button><button data-tab="source-media">Видео источников</button>
+    <button data-tab="videos">Видеопроекты</button><button data-tab="assets">Просмотр видео</button>
+    <button data-tab="drafts">Черновики</button><button data-tab="publications">Публикации</button>
+    <button data-tab="jobs">Задания</button><button data-tab="campaigns">Продвижение</button>
+    <button data-tab="audit">Журнал</button><button id="settings-tab" data-view="settings" data-role="owner">Настройки</button>
+  </nav>
+  <div id="workspace-panel">
+    <section><div class="section-heading"><h2 id="heading">Каналы</h2><button id="refresh">Обновить</button></div>
+      <!-- Пояснение истории отправок видно только на вкладке публикаций. -->
+      <div id="publications-help" class="section-help" hidden><h3>История отправок в MAX</h3>
+        <p>Каждая карточка — отдельная попытка отправки. «Опубликовано» означает, что проект подтвердил появление поста в канале. «Отправка отклонена» означает, что эта попытка не завершилась публикацией.</p>
+        <p>Свежие записи находятся сверху. Если результат неизвестен, используйте «Сверить результат»: проект проверит существующую отправку. Будущие публикации находятся во вкладке «Календарь».</p>
+        <p id="publications-count" class="hint"></p>
+      </div><div id="content"></div></section>
+    <!-- Один выбранный профиль задаёт адресат для подключения, видео и браузера. -->
+    <section><h2>Управление каналом</h2><div class="form-row">
+      <label>Канал <select id="channel"></select></label><label>Адрес канала MAX (chat_id) <input id="chat" placeholder="-123456789"></label>
+    </div><div class="button-row"><button id="connect" data-role="owner">Проверить и подключить</button><button id="pause" data-role="owner">Пауза</button><button id="resume" data-role="owner">Возобновить</button><button id="report">Отчёт</button><button id="bootstrap" data-role="owner">Оформление</button><button id="growth" data-role="owner">План продвижения</button></div>
+      <p id="channel-context" class="hint"></p>
+      <h3>Браузер MAX</h3><p>Вход откроет отдельное окно браузера проекта. Проверка сверит выбранный канал и право публикации.</p>
+      <button id="browser-login" data-role="owner">Войти в MAX</button><button id="browser-check" data-role="owner">Проверить браузер</button>
+    </section>
+    <section><h2>Автоматические изображения</h2><p>Разрешённые бесплатные источники, локальная оценка и отдельное расписание каждого канала.</p>
+      <label>Канал изображений <select id="image-channel"></select></label>
+      <div class="button-row"><button id="images-status">Состояние и топ‑10</button><button id="images-scan" data-role="owner">Собрать все источники без отправки</button><button id="images-pause" data-role="owner">Остановить расписание</button><button id="images-resume" data-role="owner">Включить расписание</button><button id="images-tick" data-role="owner">Проверить текущий интервал</button></div>
+      <p class="hint">Дни и часы отправки меняются в разделе «Календарь».</p>
+      <details><summary>Данные последней проверки изображений (JSON)</summary><p class="hint">Служебный ответ: schedule — расписание, top — выбранные изображения, state — результат операции. Только для просмотра.</p><pre id="images-result" aria-label="Данные проверки изображений, JSON, только для просмотра"></pre></details>
+    </section>
+    <section><h2>Собственный ролик</h2><label>Идея <input id="video-idea" placeholder="Путешествие бумажного кораблика"></label><button id="generate-plan" data-role="owner">Создать сценарий через OpenCode</button>
+      <label>Сценарий ролика — редактируемый JSON <textarea id="video-plan" aria-describedby="video-plan-help">{"title":"Нейровидео","caption":"Короткая визуальная история для нашего канала.","rights_basis":"Собственные сценарий и материалы с правом публикации","scenes":[{"prompt":"A paper boat floating through a cinematic miniature ocean","negative_prompt":"artifacts, flicker","duration_seconds":5}]}</textarea></label>
+      <p id="video-plan-help" class="hint">title — название, caption — подпись поста, rights_basis — основание прав, scenes — сцены. В сцене prompt описывает кадр, negative_prompt — что исключить, duration_seconds — длительность в секундах. Пояснения находятся рядом: внутри редактируемого JSON комментарии не допускаются.</p>
+      <button id="create-plan" data-role="owner">Сохранить сценарий</button>
+    </section>
+  </div>
+  <!-- Неделя всегда начинается с понедельника; каждая карточка содержит время и состояние. -->
+  <section id="calendar-panel" hidden>
+    <div class="section-heading"><h2>Календарь публикаций</h2><label>Канал <select id="calendar-channel"></select></label></div>
+    <div class="calendar-toolbar"><button id="calendar-prev">← Предыдущая неделя</button><button id="calendar-today">Сегодня</button><button id="calendar-next">Следующая неделя →</button><label>Дата <input id="calendar-date" type="date"></label><button id="calendar-refresh">Обновить календарь</button></div>
+    <p id="calendar-range"></p><p id="holiday-info" class="hint"></p><label class="checkbox"><input id="holiday-enabled" type="checkbox"> Искать праздничные изображения в первом запуске дня</label><button id="holidays-toggle" data-role="owner">Сохранить праздничный поиск</button><button id="holidays-update" data-role="owner">Обновить каталог праздников</button><div class="legend">● Опубликовано &nbsp; ● Одобренный черновик &nbsp; ● Автоматическая отправка &nbsp; ○ На паузе</div>
+    <div id="calendar-grid" class="calendar-grid"></div><div id="calendar-detail" class="event-detail" hidden></div>
+    <div class="schedule-form"><h3>Настройка расписания</h3>
+      <div class="form-row"><label>Режим <select id="schedule-kind"><option value="interval">Каждые несколько часов</option><option value="weekly">Выбранные дни и часы</option></select></label>
+        <label>Интервал, часов <select id="schedule-interval"><option>1</option><option>2</option><option>3</option><option selected>4</option><option>6</option><option>8</option><option>12</option><option>24</option></select></label>
+        <label>Часовой пояс <input id="schedule-timezone" value="Europe/Moscow"></label></div>
+      <fieldset id="schedule-days"><legend>Дни недели</legend></fieldset>
+      <label>Время внутри дня, через запятую <input id="schedule-times" placeholder="09:00, 13:30, 18:00"></label>
+      <div class="form-row"><label>Минимальный промежуток, минут <input id="schedule-gap" type="number" min="1" value="120"></label><label>Лимит постов в день <input id="schedule-limit" type="number" min="1" max="48" value="16"></label></div>
+      <label class="checkbox"><input id="schedule-enabled" type="checkbox"> Включить автоматическую публикацию после сохранения</label>
+      <button id="schedule-save" data-role="owner">Сохранить расписание</button>
+      <p class="hint">После изменения расписания запуск начинается со следующего выбранного времени. Пропущенные отправки не публикуются пачкой.</p>
+    </div>
+  </section>
+  <!-- Основные поля доступны формой, полная конфигурация — в проверяемом JSON-редакторе. -->
+  <section id="settings-panel" hidden>
+    <h2>Все настройки проекта</h2>
+    <h3>Направление канала</h3><label>Канал <select id="profile-channel"></select></label><button id="channel-profiles" data-role="owner">Загрузить профиль канала</button>
+    <div class="form-row"><label>Название <input id="profile-name"></label><label>Тематика <input id="profile-theme"></label></div>
+    <label>Аудитория <input id="profile-audience"></label><label>Поисковые запросы, через запятую <input id="profile-queries"></label>
+    <label>Подходящие изображения — описание для локальной модели <input id="profile-positive"></label><label>Неподходящие изображения <input id="profile-negative"></label>
+    <label>Заголовок подписи <input id="profile-caption"></label>
+    <details><summary>Полный профиль: рубрики, исключения, фильтры, источники и бюджеты</summary><textarea id="channel-profile-json" placeholder="Объект с channel и images"></textarea></details>
+    <button id="channel-apply" data-role="owner">Применить профиль и поставить канал на паузу</button>
+    <h3>Сервисы, источники, модели и ограничения</h3><button id="settings-load" data-role="owner">Загрузить все настройки</button>
+    <label>Раздел <select id="settings-section"><option value="app">Приложение, MAX, OpenCode и видео</option><option value="topic">Все каналы и редакционные правила</option><option value="sources">Источники редакционных материалов</option><option value="image_sources">Каталог изображений и фильтры</option><option value="image_channels">Локальная модель и отбор каждого канала</option><option value="workflow">Workflow генерации видео</option><option value="holidays">Праздники России, даты и поисковые теги</option></select></label>
+    <p id="settings-help" class="hint"></p><textarea id="settings-json" spellcheck="false" aria-label="Настройки выбранного раздела"></textarea>
+    <!-- Пути из выбранного раздела доступны отдельными полями с выбором файла или папки. -->
+    <div id="settings-paths" hidden></div>
+    <div class="button-row"><button id="settings-format" data-role="owner">Форматировать JSON</button><button id="settings-validate" data-role="owner">Проверить изменения</button><button id="settings-save" data-role="owner">Сохранить все изменения</button><button id="validate" data-role="owner">Проверить действующие настройки</button><button id="activate" data-role="owner">Применить действующие настройки</button></div>
+    <p class="hint">Сохранение полной конфигурации ставит каналы и расписания на паузу. Проверьте подключение, затем включите нужные расписания в календаре. Смена хранилища требует перезапуска проекта.</p>
+    <h3>Ключи и переменные окружения</h3><p>Текущие значения не раскрываются. Введите только значения для замены; пустое поле оставляет прежнее значение.</p>
+    <div id="credentials-fields"></div><button id="credentials-save" data-role="owner">Сохранить новые ключи</button>
+  </section>
+  <!-- Ответ помогает диагностике; это не поле редактирования поста или настроек. -->
+  <details id="response-details"><summary>Последний ответ сервера (JSON, только для просмотра)</summary><p id="response-help" class="hint">Здесь показан служебный результат последней кнопки. state — состояние, section — раздел, records — число записей. Этот блок не меняет публикации и настройки.</p><pre id="result" aria-label="Последний ответ сервера, JSON, только для просмотра" aria-describedby="response-help"></pre></details>
+</main>
+<!-- Выбор внутри проекта доступен даже на виртуальной машине без графического рабочего стола. -->
+<dialog id="file-picker" aria-labelledby="file-picker-title">
+  <h2 id="file-picker-title">Выбор файла в проекте</h2><p id="file-picker-context" class="hint"></p>
+  <p id="file-picker-path"></p><div class="button-row"><button id="file-picker-root" data-role="owner">Корень проекта</button><button id="file-picker-up" data-role="owner">На папку выше</button><button id="file-picker-folder" data-role="owner" hidden>Выбрать эту папку</button><button id="file-picker-close">Отмена</button></div>
+  <p id="file-picker-feedback" role="status" aria-live="polite"></p><div id="file-picker-list"></div>
+  <p class="hint">Нажмите папку для перехода, файл — для выбора. Выбор подставляет путь в поле; применение настроек и публикация выполняются отдельными кнопками.</p>
+</dialog>
+</body></html>

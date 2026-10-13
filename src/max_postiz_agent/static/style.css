@@ -1,0 +1,60 @@
+/* Основа страницы и карточек: единый контрастный интерфейс для всех разделов. */
+:root {font-family:system-ui,sans-serif;color:#e7edf8;background:#0e1421;color-scheme:dark}
+body {margin:0} header,main {max-width:1320px;margin:auto;padding:24px}
+header span {color:#8ab8ff;letter-spacing:.05em} h1 {font-size:34px;margin-bottom:8px}
+h2 {font-size:22px} h3 {margin-top:28px} p {line-height:1.55}
+section {background:#192335;border:1px solid #334155;border-radius:16px;padding:24px;margin-bottom:22px}
+nav {display:flex;gap:6px;flex-wrap:wrap;margin:18px 0 24px}
+label {display:flex;flex-direction:column;gap:7px;margin:12px 0;min-width:160px}
+input,button,textarea,select {font:inherit;border-radius:8px;border:1px solid #526580;padding:10px;background:#101a2b;color:inherit;box-sizing:border-box}
+button {cursor:pointer;background:#2956a3;margin:4px;padding:10px 16px}
+button:hover:not(:disabled) {background:#386fc4} button:disabled {opacity:.45;cursor:not-allowed}
+button.secondary {background:#243347} nav button.active {background:#527cbd;box-shadow:0 0 0 2px #8bb6f3}
+textarea {width:100%;min-height:170px;line-height:1.5;font-family:ui-monospace,monospace}
+pre {white-space:pre-wrap;overflow-wrap:anywhere;background:#0e1726;padding:16px;border-radius:9px;max-height:430px;overflow:auto}
+.card {border:1px solid #3b4c64;border-radius:12px;margin:12px 0;padding:18px}
+.card pre {max-height:260px}.hint {color:#b4c1d4;font-size:14px} .empty {color:#b4c1d4;padding:18px;border:1px dashed #485975;border-radius:10px}
+.form-row,.button-row,.section-heading,.calendar-toolbar {display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.form-row label {flex:1}.section-heading {justify-content:space-between}.login {display:flex;gap:12px;flex-wrap:wrap;align-items:center}.login label {flex:1;min-width:260px}.login p {width:100%;margin:0}
+.checkbox {display:flex;flex-direction:row;align-items:center;min-width:0}.checkbox input {width:18px;height:18px}
+fieldset {border:1px solid #485975;border-radius:10px;display:flex;flex-wrap:wrap;gap:12px;margin:16px 0}.badge {color:#9fc5ff}
+details {margin:14px 0} summary {cursor:pointer;color:#bcd4fb} [hidden] {display:none!important}
+/* Результат любой кнопки виден даже в нижней части страницы. */
+#feedback {position:sticky;top:10px;z-index:20;border:1px solid #415777;border-radius:10px;padding:14px 18px;background:#1b2d48;box-shadow:0 4px 20px #0005}
+#feedback[data-state="error"] {background:#48212a;border-color:#bd586b} #feedback[data-state="success"] {background:#173c32;border-color:#4c9279}
+#feedback[data-state="working"] {background:#263d5d} #feedback[data-state="working"]::before {content:"◌ ";display:inline-block;margin-right:6px}
+#status {color:#a8c7ff}
+/* Семь дней календаря; события внутри дня упорядочены по времени. */
+.calendar-grid {display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px;margin:18px 0}.calendar-day {border:1px solid #3c4e69;border-radius:10px;min-height:200px;padding:10px;background:#121e31}
+.calendar-day.today {border-color:#80b5ff;background:#1b2c46}.calendar-day h3 {margin:4px 0;font-size:14px}.calendar-date {color:#a8c7ff;font-size:20px;margin-bottom:16px}
+.calendar-event {width:100%;text-align:left;margin:5px 0;padding:9px;background:#28415d;border-left:3px solid #8ab5fb;font-size:13px}.calendar-event[data-state="published"] {background:#1d4238;border-left-color:#65bd9c}
+.calendar-event[data-state="paused"] {background:#293345;border-left-color:#748399;color:#b1bfd0}
+.calendar-event time {display:block;font-weight:bold;margin-bottom:5px}.legend {color:#b8c7dc;font-size:13px}.event-detail {border:1px solid #506886;border-radius:10px;padding:20px}.event-detail img {max-width:100%;max-height:340px;border-radius:9px}
+.schedule-form {border-top:1px solid #405572;padding-top:10px} #credentials-fields {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 18px}
+@media(max-width:1100px) {.calendar-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:650px) {header,main{padding:14px}section{padding:16px}.calendar-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#credentials-fields{grid-template-columns:1fr}.form-row{display:block}h1{font-size:28px}}
+
+/* Праздничные теги отделены от фактических публикаций и видны в соответствующем дне. */
+.holiday-tag {font-size:11px;color:#ffdb94;background:#43351f;padding:6px;border-radius:6px;margin:5px 0}.calendar-event small{display:block;font-size:10px;color:#e5d3a3;margin-top:5px}
+
+/* Историю отправок читают как карточки постов; код с пояснениями раскрывают при необходимости. */
+.section-help {border-left:3px solid #8ab5fb;padding:1px 16px;margin:12px 0 22px;background:#13223a;border-radius:8px}
+.section-help h3,.publication-card h3 {margin:10px 0 14px}
+.publication-card {border-left:4px solid #8ab5fb}.publication-card[data-state="confirmed"] {border-left-color:#65bd9c}
+.publication-card[data-state="rejected"] {border-left-color:#e58e99}.publication-card[data-state="unknown"],.publication-card[data-state="sending"] {border-left-color:#e9bf72}
+.publication-state {display:inline-block;border:1px solid #557599;border-radius:20px;padding:5px 12px;background:#233c5c}
+.publication-card[data-state="confirmed"] .publication-state {color:#a7e5cc;background:#1d4238;border-color:#4c9279}
+.publication-card[data-state="rejected"] .publication-state {color:#ffc4cd;background:#48212a;border-color:#bd586b}
+.publication-facts {display:grid;grid-template-columns:140px minmax(0,1fr);gap:8px 16px;margin:18px 0}
+.publication-facts dt {color:#b4c1d4}.publication-facts dd {margin:0;overflow-wrap:anywhere}
+.publication-body {white-space:pre-wrap;overflow-wrap:anywhere}.publication-card img {display:block;max-width:100%;max-height:280px;border-radius:10px;margin:14px 0}
+.publication-card a {display:inline-block;color:#a8c7ff;margin:10px 0}
+@media(max-width:650px) {.publication-facts{grid-template-columns:1fr;gap:4px}.publication-facts dd{margin-bottom:10px}}
+
+/* Кнопки путей и встроенный выбор файлов работают и на узком экране панели. */
+.file-controls {display:flex;gap:6px;flex-wrap:wrap;margin:-5px 0 18px}.file-controls button {font-size:13px;background:#243347;padding:8px 12px}
+.file-link {margin:12px 0;overflow-wrap:anywhere;color:#b4c1d4}.path-link {font-size:13px;background:transparent;border:0;color:#a8c7ff;text-decoration:underline;padding:4px;text-align:left;overflow-wrap:anywhere}
+dialog {color:#e7edf8;background:#192335;border:1px solid #526580;border-radius:16px;width:min(760px,calc(100vw - 56px));max-height:80vh;overflow:auto;padding:22px}
+dialog::backdrop {background:#050b17cc}dialog h2 {margin-top:0}#file-picker-path {overflow-wrap:anywhere;color:#a8c7ff}
+#file-picker-list {display:grid;gap:6px;margin:16px 0}.file-entry {text-align:left;overflow-wrap:anywhere;margin:0;background:#243347}
+#file-picker-feedback {color:#ffc4cd}#settings-paths {border:1px solid #3b4c64;border-radius:10px;padding:18px;margin:18px 0}

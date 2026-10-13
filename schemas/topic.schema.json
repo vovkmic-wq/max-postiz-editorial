@@ -1,0 +1,293 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Настройки темы каналов",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "revision",
+    "channels"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "channels": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/channel"
+      }
+    }
+  },
+  "$defs": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "texts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/text"
+      }
+    },
+    "channel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "enabled",
+        "name",
+        "theme",
+        "audience",
+        "include_topics",
+        "exclude_topics",
+        "geography",
+        "input_languages",
+        "output_language",
+        "tone",
+        "content_pillars",
+        "freshness_hours",
+        "publication",
+        "quality",
+        "budget",
+        "growth",
+        "monetization"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "name": {
+          "$ref": "#/$defs/text"
+        },
+        "theme": {
+          "$ref": "#/$defs/text"
+        },
+        "audience": {
+          "$ref": "#/$defs/text"
+        },
+        "include_topics": {
+          "$ref": "#/$defs/texts"
+        },
+        "exclude_topics": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
+        "geography": {
+          "$ref": "#/$defs/texts"
+        },
+        "input_languages": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z]{2,3}(-[A-Za-z0-9]+)*$"
+          }
+        },
+        "output_language": {
+          "const": "ru"
+        },
+        "tone": {
+          "$ref": "#/$defs/text"
+        },
+        "content_pillars": {
+          "$ref": "#/$defs/texts"
+        },
+        "freshness_hours": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8760
+        },
+        "publication": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "timezone",
+            "slots",
+            "max_posts_per_day",
+            "min_gap_minutes",
+            "max_chars"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "dry_run",
+                "review",
+                "autopublish"
+              ]
+            },
+            "timezone": {
+              "type": "string",
+              "minLength": 1
+            },
+            "slots": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+              }
+            },
+            "max_posts_per_day": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 48
+            },
+            "min_gap_minutes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1440
+            },
+            "max_chars": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 40000
+            },
+            "weekdays": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 7,
+              "uniqueItems": true,
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 6
+              }
+            }
+          }
+        },
+        "quality": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "min_relevance",
+            "require_source_links",
+            "allow_full_reposts",
+            "review_disputed_facts"
+          ],
+          "properties": {
+            "min_relevance": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "require_source_links": {
+              "const": true
+            },
+            "allow_full_reposts": {
+              "type": "boolean"
+            },
+            "review_disputed_facts": {
+              "const": true
+            }
+          }
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "currency",
+            "daily_llm_limit",
+            "monthly_growth_limit"
+          ],
+          "properties": {
+            "currency": {
+              "const": "RUB"
+            },
+            "daily_llm_limit": {
+              "type": "number",
+              "minimum": 0
+            },
+            "monthly_growth_limit": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "growth": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "allowed_destination_ids",
+            "experiments_per_week"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "plan_only",
+                "execute_authorized"
+              ]
+            },
+            "allowed_destination_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "experiments_per_week": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 20
+            }
+          }
+        },
+        "monetization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "models",
+            "max_ad_share",
+            "require_editor_approval"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "models": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "sponsorship",
+                  "affiliate",
+                  "own_product",
+                  "paid_access"
+                ]
+              }
+            },
+            "max_ad_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "require_editor_approval": {
+              "const": true
+            }
+          }
+        }
+      }
+    }
+  }
+}

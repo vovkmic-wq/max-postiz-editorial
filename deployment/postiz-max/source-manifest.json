@@ -1,0 +1,17 @@
+{
+  "upstream_version": "2.25.1",
+  "base_image": "ghcr.io/gitroomhq/postiz-app@sha256:d2b37802e96757729fdea2d3d71287f841c2b619faa1cb4c21dac07df657fde1",
+  "sha256": {
+    "libraries/nestjs-libraries/src/integrations/integration.manager.ts": "8e625ac88e7287fb73014625c9ade84f978922fc0194a9a2caac715bf106f44d",
+    "libraries/nestjs-libraries/src/dtos/posts/providers-settings/all.providers.settings.ts": "d4498db64284c88a7d13d44eea01b24271e3651b1931877280f403e7df347262",
+    "libraries/nestjs-libraries/src/database/prisma/posts/posts.repository.ts": "6aa075d44ea8680b1bdf0ebb1445997ec08042e3d1602ee4767d296ec8b434a7",
+    "apps/backend/src/app.module.ts": "aadd80f258f903b5eb9a6adad7ec6090f181fed9f6166edc2f392efe4521a821",
+    "apps/frontend/src/components/new-launch/providers/show.all.providers.tsx": "3fc253cdce299f1a1b2f3b0468ef21936719b3268071c6cfbc0fcf00b11b96c2",
+    "apps/frontend/src/app/(app)/layout.tsx": "9ed97e74e8ae54e0fdd58ca0a629e5c68633e4ad31a96331d7207180e877971a",
+    "apps/frontend/src/app/(provider)/layout.tsx": "c0bd56221d1b405a6afc94e7439cc078110269e579b6bfd1af6f7d8d27378831",
+    "apps/frontend/src/app/(extension)/layout.tsx": "f7c55eeb284af52b9214ed50e9452067d2f77ca5e7edeb2f8a76801865e5edf0",
+    "apps/frontend/src/components/new-layout/layout.component.tsx": "89828548f4b843a254fd5b26f2e46350663ad7ee93a8691b51d6976aed01085d",
+    "apps/backend/src/public-api/routes/v1/public.integrations.controller.ts": "f4c384ab892e811af1fc23b693f8fbcba441d63d88803b202a6949e6ad3d1dd3",
+    "libraries/nestjs-libraries/src/temporal/temporal.module.ts": "4dc10cc8fce99dede90cbb4c1ee883ee1c0f85d99f7257d7a86facd93e9360d5"
+  }
+}

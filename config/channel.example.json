@@ -1,0 +1,84 @@
+{
+  "channel": {
+    "id": "nature",
+    "enabled": true,
+    "name": "Природа",
+    "theme": "Живая природа и пейзажи",
+    "audience": "Любители природы",
+    "include_topics": [
+      "природа",
+      "животные"
+    ],
+    "exclude_topics": [
+      "Полнометражные фильмы",
+      "Новости искусственного интеллекта без связи с видеогенерацией"
+    ],
+    "geography": [
+      "весь мир"
+    ],
+    "input_languages": [
+      "ru",
+      "en"
+    ],
+    "output_language": "ru",
+    "tone": "Понятный русский язык, точные формулировки, спокойный тон",
+    "content_pillars": [
+      "Животные",
+      "Пейзажи"
+    ],
+    "freshness_hours": 72,
+    "publication": {
+      "mode": "review",
+      "timezone": "Europe/Moscow",
+      "slots": [
+        "09:00",
+        "14:00",
+        "19:00"
+      ],
+      "max_posts_per_day": 16,
+      "min_gap_minutes": 120,
+      "max_chars": 3500
+    },
+    "quality": {
+      "min_relevance": 0.8,
+      "require_source_links": true,
+      "allow_full_reposts": false,
+      "review_disputed_facts": true
+    },
+    "budget": {
+      "currency": "RUB",
+      "daily_llm_limit": 0,
+      "monthly_growth_limit": 0
+    },
+    "growth": {
+      "mode": "plan_only",
+      "allowed_destination_ids": [],
+      "experiments_per_week": 1
+    },
+    "monetization": {
+      "enabled": false,
+      "models": [],
+      "max_ad_share": 0.2,
+      "require_editor_approval": true
+    }
+  },
+  "images": {
+    "queries": [
+      "nature",
+      "wildlife",
+      "landscape"
+    ],
+    "local_prompts": [
+      "Beautiful nature landscapes and wildlife photography",
+      "Text, screenshot, advertising or poor quality image"
+    ],
+    "caption_title": "Природа в объективе",
+    "image_type": "photo",
+    "interval_hours": 4,
+    "filters": {
+      "min_views": 10000,
+      "min_likes": 100,
+      "min_local_relevance": 0.6
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "proxmox/qwen35-9b",
+  "providers": {
+    "proxmox": {
+      "name": "Local editorial models",
+      "package": "@opencode-ai/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://10.20.30.95:8083/v1"
+      },
+      "models": {
+        "qwen35-9b": {
+          "name": "Qwen 3.5 9B",
+          "capabilities": {
+            "tools": false,
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 16384,
+            "output": 4096
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        },
+        "qwen25-coder-7b": {
+          "name": "Ministral 3 8B (compatible slot)",
+          "capabilities": {
+            "tools": false,
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 16384,
+            "output": 4096
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        }
+      }
+    }
+  },
+  "permissions": [
+    {
+      "action": "*",
+      "resource": "*",
+      "effect": "deny"
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "implementation_status": "specification_only",
+  "enabled": false,
+  "owner_instruction_date": "2026-10-14",
+  "target_id": "max_test",
+  "proposed_channel_name": "Reddit по-русски",
+  "timezone": "Europe/Moscow",
+  "batch_interval_seconds": 14400,
+  "batch_slots": ["00:00", "04:00", "08:00", "12:00", "16:00", "20:00"],
+  "posts_per_batch": 10,
+  "max_posts_per_day": 60,
+  "proposed_spacing_seconds": 120,
+  "insufficient_candidates": "publish_fewer_without_repeats",
+  "missed_slots": "skip",
+  "topics": ["interesting_stories", "science", "humor"],
+  "exclude": ["politics", "nsfw", "advertising", "deleted_content"],
+  "reddit": {
+    "access_approved": false,
+    "translation_and_redistribution_approved": false,
+    "listing": "https://oauth.reddit.com/r/popular/top",
+    "window": "day",
+    "max_candidates": 500,
+    "required_language": "en",
+    "ranking": ["score_desc", "num_comments_desc"],
+    "required_scopes": ["read"],
+    "client_id_env": "REDDIT_CLIENT_ID",
+    "client_secret_env": "REDDIT_CLIENT_SECRET",
+    "refresh_token_env": "REDDIT_REFRESH_TOKEN",
+    "user_agent_env": "REDDIT_USER_AGENT"
+  },
+  "quality": {
+    "translation_model": "proxmox/qwen35-9b",
+    "review_model": "proxmox/qwen25-coder-7b",
+    "spelling_checker": "local_languagetool",
+    "max_revision_attempts": 2,
+    "on_failure": "skip_material"
+  },
+  "deduplication": ["reddit_id", "crosspost_parent", "canonical_url", "original_text", "russian_text", "same_event"],
+  "delivery": {
+    "approval_mode": "automatic_policy_after_quality_checks",
+    "unknown_action": "stop_and_reconcile",
+    "source_deletion_handling_required": true,
+    "source_deletion_handling_implemented": false
+  }
+}

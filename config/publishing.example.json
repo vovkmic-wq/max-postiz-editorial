@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.0",
+  "postiz": {
+    "base_url_env": "POSTIZ_BASE_URL",
+    "api_key_env": "POSTIZ_API_KEY",
+    "approval_guard_verified": false,
+    "max_video_verified": false
+  },
+  "targets": [
+    {
+      "id": "max",
+      "profile_id": "test",
+      "platform": "max",
+      "route": "max_browser",
+      "destination": "",
+      "enabled": false,
+      "options": {
+        "max_chars": 3500
+      }
+    },
+    {
+      "id": "pikabu",
+      "profile_id": "test",
+      "platform": "pikabu",
+      "route": "manual",
+      "destination": "",
+      "enabled": false,
+      "options": {
+        "max_chars": 15000
+      }
+    },
+    {
+      "id": "telegram",
+      "profile_id": "test",
+      "platform": "telegram",
+      "route": "disabled",
+      "destination": "",
+      "enabled": false,
+      "options": {
+        "max_chars": 3500
+      }
+    },
+    {
+      "id": "vk",
+      "profile_id": "test",
+      "platform": "vk",
+      "route": "disabled",
+      "destination": "",
+      "enabled": false,
+      "options": {
+        "max_chars": 3500
+      }
+    }
+  ],
+  "tasks": []
+}

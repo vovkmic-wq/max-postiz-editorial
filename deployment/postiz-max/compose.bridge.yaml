@@ -1,0 +1,7 @@
+services:
+  postiz:
+    image: max-postiz-browser:0.4.0
+    environment:
+      MAX_BRIDGE_URL: http://host.docker.internal:8090/api/max-bridge
+      MAX_POSTIZ_BRIDGE_KEY: ${MAX_POSTIZ_BRIDGE_KEY:?Required local bridge credential}
+      MAX_BRIDGE_TARGET_ID: max_test
