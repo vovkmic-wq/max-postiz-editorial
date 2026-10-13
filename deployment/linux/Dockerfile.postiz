@@ -1,0 +1,8 @@
+FROM max-postiz-browser:0.4.0
+ARG PUBLIC_ORIGIN
+ENV MAIN_URL=$PUBLIC_ORIGIN FRONTEND_URL=$PUBLIC_ORIGIN NEXT_PUBLIC_BACKEND_URL=$PUBLIC_ORIGIN/api
+ENV NEXT_PUBLIC_UPLOAD_DIRECTORY=/uploads NEXT_PUBLIC_UPLOAD_STATIC_DIRECTORY=/uploads STORAGE_PROVIDER=local IS_GENERAL=true NOT_SECURED=true
+ENV NODE_OPTIONS=--max-old-space-size=6144 NEXT_TELEMETRY_DISABLED=1
+COPY prepare-frontend.cjs /linux/prepare-frontend.cjs
+RUN node /linux/prepare-frontend.cjs
+RUN pnpm --filter ./apps/frontend exec next build --webpack

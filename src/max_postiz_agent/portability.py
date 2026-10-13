@@ -24,7 +24,7 @@ def package_project(root, destination):
     paths.extend(root.glob("config/**/*.example.json"))
     paths.extend(root.glob("config/extraction/*.json"))
     # Последовательно обрабатываем элементы: ('README.md', 'TOPIC.md', 'pyproject.toml', 'package.json', 'package-lock.json', '.gitignore').
-    for name in ("README.md", "AGENTS.md", "CHANGELOG.md", "TOPIC.md", "pyproject.toml", "package.json", "package-lock.json", ".gitignore", "alembic.ini", ".env.example", "MANIFEST.in"):
+    for name in ("README.md", "AGENTS.md", "CHANGELOG.md", "TOPIC.md", "pyproject.toml", "package.json", "package-lock.json", ".gitignore", ".dockerignore", ".gitattributes", "alembic.ini", ".env.example", "MANIFEST.in"):
         # Обрабатываем ветвь при условии: inside(root, name).exists().
         if inside(root, name).exists():
             paths.append(inside(root, name))

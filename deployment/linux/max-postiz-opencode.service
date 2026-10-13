@@ -1,0 +1,17 @@
+[Unit]
+Description=Editorial OpenCode local models
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=editorial
+WorkingDirectory=/opt/max-postiz
+ExecStart=/opt/max-postiz/.venv/bin/python scripts/serve_opencode.py --root /opt/max-postiz --binary /opt/max-postiz/node_modules/.bin/opencode --port 4108
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

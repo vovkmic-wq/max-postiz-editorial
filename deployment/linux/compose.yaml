@@ -1,0 +1,31 @@
+# Applied after postiz/compose.yaml, its image lock, and compose.bridge.yaml.
+services:
+  postiz:
+    image: max-postiz-linux:0.5.0
+    environment:
+      MAIN_URL: ${POSTIZ_PUBLIC_ORIGIN:?Set the real LAN origin}
+      FRONTEND_URL: ${POSTIZ_PUBLIC_ORIGIN}
+      NEXT_PUBLIC_BACKEND_URL: ${POSTIZ_PUBLIC_ORIGIN}/api
+      MAX_BRIDGE_URL: http://host.docker.internal:8091/api/max-bridge
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports: !override
+      - 127.0.0.1:14007:5000
+  hub-postgres:
+    image: postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    restart: always
+    environment:
+      POSTGRES_USER: hub_admin
+      POSTGRES_PASSWORD: ${HUB_DB_PASSWORD:?Required}
+      POSTGRES_DB: editorial_hub
+    ports:
+      - 127.0.0.1:55438:5432
+    volumes:
+      - hub-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U hub_admin -d editorial_hub]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+volumes:
+  hub-postgres-data:

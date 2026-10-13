@@ -1,0 +1,13 @@
+[Unit]
+Description=Loopback-only owner display transport
+After=max-postiz-display.service
+Requires=max-postiz-display.service
+
+[Service]
+User=editorial
+ExecStart=/usr/bin/x11vnc -display :99 -localhost -rfbport 5900 -forever -shared -nopw
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

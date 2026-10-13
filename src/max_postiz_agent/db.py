@@ -316,10 +316,10 @@ class Database:
 
     # Создаём отсутствующие настройки или структуру хранения.
     def initialize(self):
+        from . import hub_models  # noqa: F401 -- register hub tables before either backend
         if self.engine.dialect.name == "postgresql":
             from alembic import command
             from alembic.config import Config
-            from . import hub_models  # noqa: F401
             root = self.root if (self.root / "migrations").exists() else Path(__file__).resolve().parents[2]
             cfg = Config(str(root / "alembic.ini"))
             cfg.set_main_option("script_location", str(root / "migrations"))

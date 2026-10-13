@@ -1,0 +1,17 @@
+[Unit]
+Description=MAX Postiz editorial hub
+After=network-online.target docker.service max-postiz-opencode.service
+Wants=network-online.target max-postiz-opencode.service
+
+[Service]
+Type=simple
+User=editorial
+WorkingDirectory=/opt/max-postiz
+ExecStart=/opt/max-postiz/.venv/bin/python -m max_postiz_agent.hub_cli serve --host 0.0.0.0 --port 8091
+Restart=always
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

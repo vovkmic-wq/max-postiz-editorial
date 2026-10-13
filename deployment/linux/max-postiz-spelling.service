@@ -1,0 +1,15 @@
+[Unit]
+Description=Private local Russian spelling and grammar checker
+After=network.target
+
+[Service]
+User=editorial
+WorkingDirectory=/opt/languagetool/current
+ExecStart=/usr/bin/java -Xmx768m -cp languagetool-server.jar org.languagetool.server.HTTPServer --port 8010
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
