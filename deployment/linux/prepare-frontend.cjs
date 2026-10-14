@@ -28,5 +28,7 @@ for (const name of ['src/app/(app)/layout.tsx', 'src/app/(provider)/layout.tsx',
 const config = root + '/next.config.js';
 const before = fs.readFileSync(config, 'utf8');
 if (!before.includes('  experimental: {')) throw new Error('Next configuration anchor missing');
-fs.writeFileSync(config, before.replace('  experimental: {', '  experimental: {\n    cpus: 2,'));
+fs.writeFileSync(config, before.replace('const nextConfig = {',
+  "const nextConfig = {\n  serverExternalPackages: ['isomorphic-dompurify', 'jsdom'],")
+  .replace('  experimental: {', '  experimental: {\n    cpus: 2,'));
 console.log('Offline fonts and bounded Next build workers configured');

@@ -13,6 +13,15 @@ from test_hub import approve, hub as hub_fixture, variants
 hub = hub_fixture
 
 
+def test_owner_display_authorization_is_owner_only(hub):
+    client = TestClient(hub_app(hub))
+    path = '/api/hub/owner-browser-authorize'
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers={'Authorization': 'Bearer hub-test-viewer'}).status_code == 403
+    response = client.get(path, headers={'Authorization': 'Bearer hub-test-owner'})
+    assert response.status_code == 204 and response.content == b''
+
+
 def test_api_rejects_incomplete_and_non_boolean_inputs(hub):
     client = TestClient(hub_app(hub))
     headers = {"Authorization": "Bearer hub-test-owner"}

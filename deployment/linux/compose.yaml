@@ -7,6 +7,7 @@ services:
       FRONTEND_URL: ${POSTIZ_PUBLIC_ORIGIN}
       NEXT_PUBLIC_BACKEND_URL: ${POSTIZ_PUBLIC_ORIGIN}/api
       MAX_BRIDGE_URL: http://host.docker.internal:8091/api/max-bridge
+      NODE_OPTIONS: --max-old-space-size=2048
     extra_hosts:
       - host.docker.internal:host-gateway
     ports: !override

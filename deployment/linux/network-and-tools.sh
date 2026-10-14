@@ -34,6 +34,9 @@ server {
 NGINX
 ln -sf /etc/nginx/sites-available/editorial /etc/nginx/sites-enabled/editorial
 nginx -t
+install -d /etc/systemd/system/nginx.service.d
+install -m 0644 /opt/max-postiz/deployment/linux/nginx-network.conf /etc/systemd/system/nginx.service.d/network.conf
+systemctl daemon-reload
 systemctl reload nginx
 ufw default deny incoming
 ufw default allow outgoing

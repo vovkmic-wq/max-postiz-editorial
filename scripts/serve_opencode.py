@@ -70,7 +70,8 @@ def main():
             # Обрабатываем ветвь при условии: line.startswith('server password ').
             if line.startswith("server password "):
                 access = runtime / "access.json"
-                access.write_text(
+                temporary = runtime / 'access.next.json'
+                temporary.write_text(
                     json.dumps(
                         {
                             "base_url": f"http://127.0.0.1:{args.port}",
@@ -81,7 +82,8 @@ def main():
                 )
                 # Обрабатываем ветвь при условии: os.name != 'nt'.
                 if os.name != "nt":
-                    access.chmod(0o600)
+                    temporary.chmod(0o600)
+                temporary.replace(access)
                 print("OpenCode ready; local access saved privately.", flush=True)
             # All other output is suppressed: backend errors can contain sensitive headers.
         return child.wait()

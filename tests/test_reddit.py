@@ -112,3 +112,20 @@ def test_spelling_failure_cannot_be_approved_by_model():
         quality.prepare(post())
     assert translator.calls==reviewer.calls==3
     quality.close()
+
+
+def test_invalid_json_is_repaired_within_the_shared_attempt_budget():
+    class RepairingModel(Model):
+        def generate_text(self, prompt):
+            if self.calls == 0:
+                self.calls += 1
+                return 'Not JSON', {}
+            return super().generate_text(prompt)
+
+    translator=RepairingModel({'title':'Необычный сад', 'body':'Садовник рассказал интересную историю о своём прекрасном саде и цветах.'})
+    reviewer=Model({'approved':True,'topic':'stories','issues':[]})
+    quality=RedditQuality(translator,reviewer,
+        transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'matches':[]})))
+    assert quality.prepare(post())['topic']=='stories'
+    assert translator.calls==2 and reviewer.calls==1
+    quality.close()

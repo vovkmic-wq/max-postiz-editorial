@@ -3,7 +3,7 @@ from pathlib import Path
 
 from fastapi import Depends, File, Header, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
@@ -94,6 +94,11 @@ def hub_app(service, run_worker=False):
         if role != "owner":
             raise AgentError("ROLE_FORBIDDEN", 403)
         return role
+
+    @app.get('/api/hub/owner-browser-authorize', status_code=204)
+    def owner_browser_authorize(role=Depends(owner)):
+        """Nginx auth_request gate for the private Linux owner display."""
+        return Response(status_code=204)
 
     def bridge_auth(x_max_bridge_key: str | None = Header(default=None)):
         service.bridge.authorize_request(x_max_bridge_key)

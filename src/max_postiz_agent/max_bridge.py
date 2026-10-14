@@ -112,10 +112,15 @@ class MaxBridge:
     def _media(self, images, target):
         result = []
         base = urlsplit(self.core.postiz.base)
+        allowed = {(base.scheme, base.netloc)}
+        public_origin = getattr(self.core.postiz, 'public_origin', '')
+        if public_origin:
+            public = urlsplit(public_origin)
+            allowed.add((public.scheme, public.netloc))
         for item in images:
             value = item.get("path", "")
             parsed = urlsplit(value)
-            if parsed.scheme and (parsed.scheme, parsed.netloc) != (base.scheme, base.netloc):
+            if (parsed.scheme or parsed.netloc) and (parsed.scheme, parsed.netloc) not in allowed:
                 raise AgentError("BRIDGE_MEDIA_ORIGIN_DENIED")
             decoded = unquote(parsed.path)
             if not decoded.startswith("/uploads/") or ".." in Path(decoded).parts or parsed.query or parsed.fragment:

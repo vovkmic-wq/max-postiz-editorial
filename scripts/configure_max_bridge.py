@@ -40,12 +40,16 @@ def connect(root):
                 r = client.post("/api/auth/login", json={"email": access["email"], "password": access["password"], "provider": "LOCAL"})
                 if r.status_code != 200 or not r.headers.get("auth"):
                     raise AgentError("POSTIZ_LOGIN_FAILED")
-                client.cookies.set("auth", r.headers["auth"], domain="localhost.local", path="/")
+                expected_origin = urlsplit(access['base_url'])
+                if expected_origin.scheme not in {'http', 'https'} or not expected_origin.hostname or expected_origin.username or expected_origin.password:
+                    raise AgentError('MAX_BRIDGE_CONNECT_ORIGIN_INVALID')
+                cookie_domain = 'localhost.local' if expected_origin.hostname == 'localhost' else expected_origin.hostname
+                client.cookies.set("auth", r.headers["auth"], domain=cookie_domain, path="/")
                 r = client.get("/api/integrations/social/max-browser")
                 if r.status_code != 200 or not r.json().get("url"):
                     raise AgentError("MAX_BRIDGE_CONNECT_URL_FAILED")
                 parsed = urlsplit(r.json()["url"])
-                if (parsed.scheme, parsed.netloc) != ("http", "localhost:4007"):
+                if (parsed.scheme, parsed.netloc) != (expected_origin.scheme, expected_origin.netloc):
                     raise AgentError("MAX_BRIDGE_CONNECT_ORIGIN_INVALID")
                 query = parse_qs(parsed.query)
                 r = client.post("/api/integrations/social-connect/max-browser",

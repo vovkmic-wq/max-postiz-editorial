@@ -1,0 +1,14 @@
+[Unit]
+Description=Manual MAX owner login in the isolated Linux browser
+After=max-postiz-display.service
+Requires=max-postiz-display.service
+
+[Service]
+Type=simple
+User=editorial
+WorkingDirectory=/opt/max-postiz
+Environment=DISPLAY=:99
+ExecStart=/opt/max-postiz/.venv/bin/python deployment/linux/login-browser.py
+UMask=0077
+NoNewPrivileges=true
+# Interactive sign-in is started explicitly and is never enabled on boot.

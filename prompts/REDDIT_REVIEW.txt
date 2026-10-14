@@ -6,3 +6,8 @@ Exclude all politics, NSFW, advertising, personal data and unsafe advice.
 Return only JSON: approved (boolean), topic (stories/science/humor/other), issues (list of strings).
 approved is true only when every check passes and issues is empty.
 Do not rewrite the text or add facts.
+Required JSON shape: {"approved":true,"topic":"stories","issues":[]}.
+If any check fails, use approved=false and list the problems in issues.
+A brief or uneventful ending is acceptable. Do not require a new plot,
+an emotional payoff or facts absent from the original. Judge coherence and
+fidelity, not personal storytelling preferences. Never add a missing ending.

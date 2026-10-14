@@ -142,14 +142,28 @@ class RedditQuality:
         original = post['title'] + '\n\n' + post['selftext']
         context = {'original': original, 'instruction': self.translation_prompt}
         for _ in range(3):
-            translated = extract_object(self.translator.generate_text(json.dumps(context, ensure_ascii=False))[0])
+            try:
+                translated = extract_object(self.translator.generate_text(json.dumps(context, ensure_ascii=False))[0])
+            except AgentError as exc:
+                if exc.code != 'INVALID_EDITOR_RESULT':
+                    raise
+                context['format_error'] = 'Return a single valid JSON object with title and body string fields. No other text.'
+                continue
             if set(translated) != {'title', 'body'} or not all(isinstance(v, str) and v.strip() for v in translated.values()):
                 raise AgentError('REDDIT_TRANSLATION_INVALID')
             text = translated['title'] + '\n\n' + translated['body']
             translation_gate(original, text)
             check_prompt = {'original_untrusted': original, 'translation_untrusted': text,
                 'instruction': self.review_prompt}
-            reviewed = extract_object(self.reviewer.generate_text(json.dumps(check_prompt, ensure_ascii=False))[0])
+            if context.get('review_format_error'):
+                check_prompt['format_hint'] = context['review_format_error']
+            try:
+                reviewed = extract_object(self.reviewer.generate_text(json.dumps(check_prompt, ensure_ascii=False))[0])
+            except AgentError as exc:
+                if exc.code != 'INVALID_EDITOR_RESULT':
+                    raise
+                context['review_format_error'] = 'Independent review was not valid JSON; do not treat this as approval.'
+                continue
             if (set(reviewed) != {'approved', 'topic', 'issues'} or type(reviewed['approved']) is not bool
                     or not isinstance(reviewed['issues'], list)
                     or any(not isinstance(x, str) for x in reviewed['issues'])):

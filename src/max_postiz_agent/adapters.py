@@ -37,26 +37,30 @@ class OpenCode:
         self.base_url = os.getenv(self.options["base_url_env"], "").rstrip("/")
         self.model = os.getenv(self.options["model_id_env"], self.options.get("model_id", ""))
         self.secret = os.getenv(self.options["auth_secret_env"], "")
+        self.explicit_secret = bool(self.secret)
         access_path = self.options.get("local_access_path")
-        # Обрабатываем ветвь при условии: access_path.
-        if access_path:
-            path = inside(self.root, access_path)
-            # Обрабатываем ветвь при условии: path.exists().
-            if path.exists():
-                access = parse_json(path.read_text(encoding="utf-8"))
-                self.base_url = self.base_url or access["base_url"]
-                self.secret = self.secret or access["password"]
-        self.auth = httpx.BasicAuth("opencode", self.secret) if self.secret else None
+        self.access_path = inside(self.root, access_path) if access_path else None
+        self.refresh_local_access()
         self.client = httpx.Client(
             timeout=self.options["task_timeout_seconds"], trust_env=False, transport=transport
         )
         self.path = self.options.get("generate_path", "/api/experimental/generate")
+
+    def refresh_local_access(self):
+        """The managed server rotates credentials on restart; keep explicit env overrides."""
+        if self.access_path and self.access_path.exists():
+            access = parse_json(self.access_path.read_text(encoding='utf-8'))
+            self.base_url = self.base_url or access['base_url']
+            if not self.explicit_secret:
+                self.secret = access['password']
+        self.auth = httpx.BasicAuth('opencode', self.secret) if self.secret else None
 
     # Операция probe: адаптеры внешних сервисов и безопасная обработка результатов отправки.
     def probe(self):
         # Обрабатываем ветвь при условии: self.mode == 'fake'.
         if self.mode == "fake":
             return {"state": "offline", "runtime": "fake", "live_verified": False}
+        self.refresh_local_access()
         # Обрабатываем ветвь при условии: not self.base_url.
         if not self.base_url:
             return {"state": "needs_configuration", "live_verified": False}
@@ -77,6 +81,8 @@ class OpenCode:
 
     # Запрашиваем текст по заданным редакционным ограничениям.
     def generate_text(self, prompt):
+        if self.mode == 'live':
+            self.refresh_local_access()
         # Обрабатываем ветвь при условии: self.mode != 'live' or not self.base_url.
         if self.mode != "live" or not self.base_url:
             raise AgentError("OPENCODE_NOT_CONFIGURED")

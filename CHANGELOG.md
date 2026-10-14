@@ -3,6 +3,86 @@
 Даты указаны по Europe/Moscow. Новые записи добавляются сверху при каждом
 законченном изменении проекта; секреты и содержимое публикаций сюда не попадают.
 
+## 0.5.0 — 2026-10-14: подтверждение перевода и перезапуска OpenCode
+
+- Реальный restart OpenCode сменил credential; уже созданный client
+  перечитал его и успешно выполнил inference без пересоздания объекта.
+  Значения паролей в отчёт не выводились.
+- На собственной синтетической английской истории прошла вся цепочка
+  Qwen → Ministral → локальный LanguageTool, результат 352 символа.
+  Это реальный вызов моделей через OpenCode, но не живой Reddit:
+  reddit_requests=0, external_posts=0. Ранее записанная неудача относится
+  к предыдущему запуску до исправлений.
+- Общий набор завершился: 302 passed; после последних исправлений
+  отдельно прошли 17 credential/Reddit tests и Ruff. pip check прошёл.
+- Ручной вход Linux MAX использует существующий проверенный login transport,
+  ограничен четырьмя часами и запускается с NoNewPrivileges=yes.
+  Автозапуск GUI при boot не включён. Nginx ожидает network-online;
+  provision script согласован с фиксированным минимумом RAM 10 GiB.
+- Прежние записи истории сохранены. Reddit application/refresh token,
+  новое имя публичного канала и production автопубликация не подтверждены;
+  запросы на ручной вход и отправку официальной заявки переданы владельцу.
+
+## 0.5.0 — 2026-10-14: работающий Linux экземпляр и проверки переноса
+
+- Успешно собран max-postiz-linux:0.5.0, image SHA
+  7940324a4e3d4f7193826b90679dfba192689b335fb9d8c53071277d01fb82e9.
+  Новый frontend использует LAN origin. Проверены LOCAL login, календарь,
+  reload, отсутствие page errors и запросов к прежнему localhost:4007.
+  Повторная UI-проверка под systemd NoNewPrivileges=yes прошла.
+- Восстановлены обе БД. В Hub 21 story/draft, два variants и один старый
+  dispatch; в Postiz одна PUBLISHED-запись и DRAFT. Проверены нулевые active
+  dispatches/mutation leases и пауза всех адресатов. Девять контейнеров Linux
+  запущены, включая отдельную PostgreSQL Hub; служебная история Temporal новая.
+- MAX provider вызван на существующем DRAFT: bridge/status/pending прошли,
+  target paused, approval=false, external_posts=0. Живой доставки из Linux нет.
+- Установлен штатный Google Chrome с sandbox и штатным AppArmor-профилем;
+  глобальное разрешение user namespaces не ослаблялось. Подготовлен ручной
+  owner login через noVNC: loopback backend, VPN/LAN ACL, owner session и
+  Origin gate. Проверены anonymous redirect, viewer 403, owner 200,
+  foreign Origin 403. Браузер требует ручной авторизации владельца.
+- У публичного и внутреннего Postiz разные origins: добавлено явное
+  POSTIZ_PUBLIC_ORIGIN. Разрешённый upload URL переписывается на внутренний
+  endpoint; посторонние и scheme-relative origins не принимаются.
+  Reconnect helper больше не привязан к localhost и его cookie domain.
+- Старый Windows worker остановлен. Compose остановлен без удаления volumes;
+  после обнаруженного повторного запуска restart policy восьми прежних
+  контейнеров изменена на unless-stopped, затем они остановлены повторно.
+- Доизменённый GitHub snapshot дополнен двумя исходными корневыми metadata
+  файлами без переписывания первого тега: branch pre-linux-vm-backup,
+  tag v0.4.1-complete-pre-linux-vm-20261014, commit 54c9c39, 205 файлов.
+- Полный набор: 302 passed за 257.82 s, Ruff и pip check прошли.
+  Позднейшие проверки смены credentials/Reddit: 17 passed.
+- OpenCode client перечитывает managed credentials перед запросами,
+  сохраняя приоритет явного env secret; wrapper заменяет access.json атомарно.
+  Для JSON-ответов Reddit введены ограниченные повторные попытки без обхода
+  quality gate. Промпт review не требует придумывать новые события ради концовки.
+- Ограничения: заявка Reddit не отправлена (официальная форма с VM: 403),
+  OAuth-приложения/токенов нет. Синтетический тест сложной цепочки перевода
+  пока не прошёл целиком; это не выдаётся за живой Reddit или готовую редакцию.
+  Batch scheduler/дедупликация Reddit, автоматические согласования и удаление
+  источников/постов ещё не реализованы. Автоматическая публикация выключена.
+  Операционная инструкция: docs/LINUX_DEPLOYMENT.md.
+
+## 0.5.0 — 2026-10-14: проверки Linux и исправление сборки frontend
+
+- Обе модели дали реальный ответ через OpenCode 2.0.17 внутри Linux VM:
+  proxmox/qwen35-9b и proxmox/qwen25-coder-7b (Ministral).
+- 23 отдельных Reddit/portability tests и Ruff прошли после исправления
+  регистрации SQLite metadata. Добавлен read-only OAuth authorization helper,
+  токены сохраняются в игнорируемом .env.local, state проверяется в callback.
+- Сборка frontend webpack прошла компиляцию и TypeScript, затем обнаружила
+  потерю default-stylesheet.css при bundling jsdom. В Next config явно
+  externalized isomorphic-dompurify/jsdom; повторная сборка ещё проверяется.
+- Фактический маршрут компьютера владельца — существующий WireGuard,
+  source 10.77.0.2. Этот адрес разрешён firewall VM; дополнительная учётная
+  запись Tailscale не нужна, установленный daemon выключен, его правила убраны.
+- Попытка live migration системного диска завершилась QMP timeout:
+  root остаётся на local-zfs, контейнеры — на отдельном 160 GiB диске box.
+  Sync root zvol восстановлен в standard перед восстановлением БД.
+- sdist теперь включает Linux shell scripts/units, текстовые промпты и
+  корневые Git/Docker metadata. Заявка Reddit и внешняя доставка не выполнены.
+
 ## 0.5.0 — 2026-10-14: Linux VM и подготовка Reddit OAuth
 
 - На Proxmox создана отдельная Ubuntu 24.04 VM 112: 4 vCPU, 10 GiB RAM,

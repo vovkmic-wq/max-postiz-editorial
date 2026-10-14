@@ -22,6 +22,9 @@
         "api_key_env": {
           "type": "string"
         },
+        "public_origin_env": {
+          "type": "string"
+        },
         "timeout_seconds": {
           "type": "integer",
           "minimum": 1,

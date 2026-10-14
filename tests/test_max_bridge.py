@@ -188,6 +188,32 @@ def test_media_cannot_fetch_external_or_traverse_uploads(bridge):
             core.bridge._media([{"path": value}], t)
 
 
+def test_public_origin_uploads_are_fetched_only_over_internal_postiz(bridge, monkeypatch):
+    from PIL import Image
+    core, _, _, _, _ = bridge
+    with core.db.session() as session:
+        target = session.get(Target, 'max')
+    image = io.BytesIO()
+    Image.new('RGB', (24, 24), 'blue').save(image, format='PNG')
+    fetched = []
+
+    def handler(request):
+        fetched.append(str(request.url))
+        return httpx.Response(200, headers={'content-type':'image/png'}, content=image.getvalue())
+
+    core.postiz.base = 'http://127.0.0.1:14007/api/public/v1'
+    core.postiz.public_origin = 'http://10.20.30.45:4007'
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(core.postiz, 'client', client)
+    assert len(core.bridge._media([{'path':'http://10.20.30.45:4007/uploads/test.png'}], target)) == 1
+    assert fetched == ['http://127.0.0.1:14007/uploads/test.png']
+    for path in ['//other.example/uploads/test.png', 'http://10.20.30.46:4007/uploads/test.png']:
+        with pytest.raises(AgentError, match='BRIDGE_MEDIA_ORIGIN_DENIED'):
+            core.bridge._media([{'path':path}], target)
+    assert len(fetched) == 1
+    client.close()
+
+
 def test_delegate_cannot_approve_and_wrong_ticket_is_rejected(bridge):
     core, _, _, _, _ = bridge
     client = TestClient(hub_app(core))

@@ -14,6 +14,12 @@ class PostizClient:
         self.options = options
         self.base = os.getenv(options.get("base_url_env", "POSTIZ_BASE_URL"), "").rstrip("/")
         self.key = os.getenv(options.get("api_key_env", "POSTIZ_API_KEY"), "")
+        self.public_origin = os.getenv(options.get('public_origin_env', 'POSTIZ_PUBLIC_ORIGIN'), '').rstrip('/')
+        if self.public_origin:
+            public = urlsplit(self.public_origin)
+            if (public.scheme not in {'http', 'https'} or not public.netloc or public.path
+                    or public.username or public.password or public.query or public.fragment):
+                raise AgentError('POSTIZ_PUBLIC_ORIGIN_INVALID')
         self.client = httpx.Client(timeout=options.get("timeout_seconds", 30),
                                    trust_env=False, follow_redirects=False, transport=transport)
         self.max_video = options.get("max_video_verified", False)
