@@ -35,7 +35,7 @@ def runtime_files(root):
 def portable_name(name):
     # Восстановление имеет ограниченный набор назначений даже при корректном шифровании.
     return name in {"database.json", "TOPIC.md", "config/sources.json", "config/app.json",
-                    "config/image_sources.json", "config/image_channels.json", "config/holidays.json", "config/comfy/workflow.json", "config/publishing.json"} or name.startswith((
+                    "config/image_sources.json", "config/image_channels.json", "config/holidays.json", "config/comfy/workflow.json", "config/publishing.json", "config/reddit_intake.json"} or name.startswith((
                         "media/", "data/image-ranking/", "data/image-schedule/",
                         "data/browser-publications/", "data/browser-corrections/", "data/archive/", "data/exports/"))
 
@@ -85,7 +85,7 @@ def backup(service, destination, key):
     }
     # Последовательно обрабатываем элементы: ('config/app.json', 'config/image_sources.json', 'config/image_channels.json', 'config/comfy/workflow.json').
     for name in ("config/app.json", "config/image_sources.json", "config/image_channels.json", "config/holidays.json",
-                 "config/comfy/workflow.json", "config/publishing.json"):
+                 "config/comfy/workflow.json", "config/publishing.json", "config/reddit_intake.json"):
         path = inside(service.settings.root, name)
         # Обрабатываем ветвь при условии: path.exists().
         if path.exists():
@@ -182,6 +182,9 @@ def restore(service, archive_path, key):
     )
     if "config/publishing.json" in content:
         validate_schema(service.settings.root, "publishing.schema.json", parse_json(content["config/publishing.json"].decode("utf-8-sig")))
+    if "config/reddit_intake.json" in content:
+        validate_schema(service.settings.root, "reddit_intake.schema.json",
+                        parse_json(content["config/reddit_intake.json"].decode("utf-8-sig")))
     # Обрабатываем ветвь при условии: 'config/image_channels.json' in content.
     if "config/image_channels.json" in content:
         validate_schema(service.settings.root, "image_channels.schema.json",

@@ -2,8 +2,9 @@
 from pathlib import Path
 
 from fastapi import Depends, File, Header, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
@@ -73,12 +74,40 @@ class BridgeUnlockInput(Input):
     confirm_no_request_inflight: StrictBool
 
 
+class RedditSourceInput(Input):
+    title: str = Field(min_length=1, max_length=500)
+    original: str = Field(default="", max_length=8500)
+    url: str = Field(min_length=1, max_length=2000)
+    target_id: str = Field(min_length=1, max_length=64)
+
+
+class RedditTextInput(Input):
+    title: str = Field(min_length=1, max_length=500)
+    original: str = Field(min_length=1, max_length=8500)
+
+
+class RedditRightsInput(Input):
+    evidence: str = Field(min_length=1, max_length=1000)
+    source_hash: str = Field(min_length=64, max_length=64)
+
+
+class RedditMailInput(Input):
+    username: str = Field(min_length=1, max_length=254)
+    app_password: str = Field(default="", max_length=64)
+    enabled: StrictBool
+
+
 def hub_app(service, run_worker=False):
     app = create_app(service, run_worker=run_worker, legacy_image_worker=False)
     # The old scheduler creates a base MAX Service and would bypass target approvals.
     app.router.routes = [route for route in app.router.routes
                          if getattr(route, "path", "") != "/api/v1/images/schedule/{action}"]
     app.title = "Редакция MAX / Пикабу / Postiz"
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_input(request, error):
+        # Pydantic's default detail includes submitted values, including credentials.
+        return JSONResponse({"code": "INPUT_INVALID"}, status_code=422)
     assets = Path(__file__).parent / "hub_static"
     app.mount("/hub-assets", StaticFiles(directory=assets), name="hub-assets")
 
@@ -99,6 +128,55 @@ def hub_app(service, run_worker=False):
     def owner_browser_authorize(role=Depends(owner)):
         """Nginx auth_request gate for the private Linux owner display."""
         return Response(status_code=204)
+
+    @app.get("/api/hub/reddit")
+    def reddit_inbox(role=Depends(auth)):
+        rows = service.reddit_intake.rows()
+        for row in rows:
+            row["source_hash"] = fingerprint({k: row[k] for k in ("title", "original", "url")})
+        mail = service.reddit_mail.status()
+        if role == "owner":
+            mail["username"] = service.reddit_mail.read()["username"]
+        return {"items": rows, "mail": mail,
+                "options": service.reddit_intake.options(), "automatic_publication": False}
+
+    @app.post("/api/hub/reddit/items")
+    def reddit_submit(value: RedditSourceInput, role=Depends(editor)):
+        return service.reddit_intake.submit(**value.model_dump(), actor=role)
+
+    @app.post("/api/hub/reddit/items/{ident}/text")
+    def reddit_text(ident: str, value: RedditTextInput, role=Depends(editor)):
+        return service.reddit_intake.edit(ident, value.title, value.original, role)
+
+    @app.post("/api/hub/reddit/items/{ident}/rights")
+    def reddit_rights(ident: str, value: RedditRightsInput, role=Depends(owner)):
+        return service.reddit_intake.attest_rights(ident, value.evidence, value.source_hash, role)
+
+    @app.post("/api/hub/reddit/items/{ident}/resume")
+    def reddit_resume(ident: str, role=Depends(owner)):
+        return service.reddit_intake.resume(ident)
+
+    @app.post("/api/hub/reddit/process")
+    def reddit_process(role=Depends(owner)):
+        from .image_schedule import lock
+        with lock(service.settings.root, "run"):
+            return {"prepared": service.reddit_intake.process_one(), "external_posts": 0}
+
+    @app.post("/api/hub/reddit/mail")
+    def reddit_mail(value: RedditMailInput, role=Depends(owner)):
+        from .image_schedule import lock
+        with lock(service.settings.root, "run"):
+            return service.reddit_mail.configure(**value.model_dump())
+
+    @app.get("/api/hub/reddit/mail/template")
+    def reddit_mail_template(role=Depends(owner)):
+        return service.reddit_mail.template()
+
+    @app.post("/api/hub/reddit/mail/poll")
+    def reddit_mail_poll(role=Depends(owner)):
+        from .image_schedule import lock
+        with lock(service.settings.root, "run"):
+            return {"accepted": service.reddit_mail.poll()}
 
     def bridge_auth(x_max_bridge_key: str | None = Header(default=None)):
         service.bridge.authorize_request(x_max_bridge_key)

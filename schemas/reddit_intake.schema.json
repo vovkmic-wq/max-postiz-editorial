@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["processing_enabled", "stage_postiz", "mail_target_id"],
+  "properties": {
+    "processing_enabled": {"type": "boolean"},
+    "stage_postiz": {"type": "boolean"},
+    "mail_target_id": {"type": "string", "maxLength": 64}
+  }
+}

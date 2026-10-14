@@ -90,10 +90,23 @@ def test_real_postgres_migration_and_no_double_send(pg_hub):
         results = list(pool.map(lambda s: s.publish_due(), [hub, other]))
     assert sum(results) == 1 and len(calls) == 1
     with hub.db.engine.connect() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0005"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006"
         assert conn.execute(text("SELECT COUNT(*) FROM hub_dispatch_attempts")).scalar_one() == 1
     other.postiz.close()
     other_db.engine.dispose()
+
+
+def test_reddit_inputs_share_unique_keys_on_postgres(pg_hub):
+    hub, _ = pg_hub
+    values = dict(title='A garden story', original='A garden full of flowers and friendly neighbors.',
+                  url='https://www.reddit.com/r/stories/comments/abc123/garden/', target_id='max')
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda origin: hub.reddit_intake.submit(**values, origin=origin),
+                               ['manual', 'ifttt']))
+    assert results[0]['id'] == results[1]['id']
+    assert sum(not r['duplicate'] for r in results) == 1
+    with hub.db.engine.connect() as conn:
+        assert conn.scalar(text('SELECT count(*) FROM hub_reddit_submissions')) == 1
 
 
 def test_postgres_backup_snapshot_restores_and_search(pg_hub, project):

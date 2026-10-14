@@ -141,3 +141,25 @@ class BridgePost(Base):
     mutation_owner: Mapped[str | None] = mapped_column(String(36))
     mutation_until: Mapped[float] = mapped_column(Float, default=0)
     updated_at: Mapped[float] = mapped_column(Float, default=now)
+
+
+class RedditSubmission(Base):
+    __tablename__ = "hub_reddit_submissions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    reddit_id: Mapped[str] = mapped_column(String(32), unique=True)
+    url: Mapped[str] = mapped_column(Text)
+    title: Mapped[str] = mapped_column(Text)
+    original: Mapped[str] = mapped_column(Text, default="")
+    original_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    origin: Mapped[str] = mapped_column(String(16))
+    target_id: Mapped[str] = mapped_column(ForeignKey("hub_targets.id"))
+    state: Mapped[str] = mapped_column(String(32), default="awaiting_rights", index=True)
+    rights_ref: Mapped[str] = mapped_column(Text, default="")
+    rights_actor: Mapped[str] = mapped_column(String(64), default="")
+    variant_id: Mapped[str | None] = mapped_column(ForeignKey("hub_variants.id"))
+    translation_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    owner: Mapped[str | None] = mapped_column(String(36))
+    lease_until: Mapped[float] = mapped_column(Float, default=0)
+    error: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[float] = mapped_column(Float, default=now)
+    updated_at: Mapped[float] = mapped_column(Float, default=now)

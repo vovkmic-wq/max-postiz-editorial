@@ -4,7 +4,7 @@ async function api(path,body){const r=await fetch(path,{method:body===undefined?
 function status(value,error=false){el('status').textContent=value;el('status').className=error?'error':'';}
 function node(tag,text){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;}
 function button(parent,label,fn){const b=node('button',label);b.onclick=async()=>{b.disabled=true;try{await fn();status('Готово');await refresh();}catch(e){status(e.message,true);}finally{b.disabled=false;}};parent.append(b);return b;}
-async function refresh(){const state=await api('/api/hub/state');el('login').hidden=true;el('main').hidden=false;el('runtime').textContent=`База: ${state.database} · Модель: ${state.model} (режим ${state.model_mode}) · Postiz: ${state.postiz_configured?'настроен':'ожидает подключения'}`;
+async function refresh(){const state=await api('/api/hub/state');await refreshReddit(state);el('login').hidden=true;el('main').hidden=false;el('runtime').textContent=`База: ${state.database} · Модель: ${state.model} (режим ${state.model_mode}) · Postiz: ${state.postiz_configured?'настроен':'ожидает подключения'}`;
 el('tasks').replaceChildren();if(!state.tasks.length)el('tasks').append(node('p','Задачи задаются в настройках редакции.'));for(const task of state.tasks){const c=node('article');c.append(node('h3',task.id),node('p',`${task.enabled?'Включена':'Отключена'} · ${task.error||'без ошибок'} · попыток: ${task.attempts}`));if(task.enabled&&task.error)button(c,'Повторить после устранения причины',()=>api(`/api/hub/tasks/${task.id}/resume`,{}));el('tasks').append(c);}
 el('targets').replaceChildren();for(const t of state.targets){const c=node('div',`${t.id} · ${t.platform} · ${t.route} · ${!t.enabled?'отключён':t.paused?'на паузе':'активен'}`);if(t.enabled)button(c,t.paused?'Снять паузу':'Пауза',()=>api(`/api/hub/targets/${t.id}/pause`,{paused:!t.paused}));el('targets').append(c);}
 el('variants').replaceChildren();if(!state.variants.length)el('variants').append(node('p','Черновики появятся после сбора материалов и обработки моделью.'));for(const v of state.variants){const c=node('article');c.className='card';c.append(node('h3',`${v.target_id}: ${v.title}`),node('p',`Версия ${v.revision} · ${v.state}`));const title=node('input');title.value=v.title;title.setAttribute('aria-label','Заголовок');c.append(title);
@@ -19,4 +19,37 @@ el('dispatches').replaceChildren();for(const d of state.dispatches){const c=node
 el('signin').onclick=async()=>{try{const r=await fetch('/api/v1/session/login',{method:'POST',headers:{'Authorization':'Bearer '+el('key').value},credentials:'same-origin'});if(!r.ok)throw Error('AUTH_INVALID');el('key').value='';await refresh();status('Вход выполнен');}catch(e){status(e.message,true);}};
 el('refresh').onclick=()=>refresh().catch(e=>status(e.message,true));el('tick').onclick=async()=>{try{await api('/api/hub/tick',{});await refresh();}catch(e){status(e.message,true);}};
 el('search').onclick=async()=>{try{const rows=await api('/api/hub/archive?q='+encodeURIComponent(el('query').value));el('archive').replaceChildren();for(const row of rows){const c=node('article');c.append(node('h3',row.title),node('pre',row.text));el('archive').append(c);}}catch(e){status(e.message,true);}};
+const redditStates={awaiting_text:'Нужен исходный текст',awaiting_rights:'Нужно основание для использования текста',queued:'В очереди перевода',processing:'Перевод и проверка',ready:'Черновик готов',failed:'Ошибка обработки',rejected:'Материал отклонён',needs_attention:'Обработка прервалась — требуется проверка'};
+async function refreshReddit(state){
+const data=await api('/api/hub/reddit');
+const mailStates={not_configured:'ожидает подключения',configured:'настроена',disabled:'выключена',polling:'проверяется',ok:'подключена',mail_needs_review:'есть письма для ручной проверки'};
+el('reddit-runtime').textContent=`Перевод: ${data.options.processing_enabled?'включён':'на паузе'} · Почта IFTTT: ${mailStates[data.mail.state]||data.mail.state} · Автопубликация: выключена`;
+if(!el('reddit-mail-user').value&&data.mail.username)el('reddit-mail-user').value=data.mail.username;
+const selector=el('reddit-target'),previous=selector.value;selector.replaceChildren();
+for(const target of state.targets.filter(t=>t.enabled&&t.platform==='max')){const option=node('option',target.id);option.value=target.id;selector.append(option);}if(previous)selector.value=previous;
+el('reddit-add').hidden=state.role==='viewer';el('reddit-mail-settings').hidden=state.role!=='owner';
+el('reddit-mail-enabled').checked=data.mail.enabled;
+el('reddit-items').replaceChildren();
+if(!data.items.length)el('reddit-items').append(node('p','Пока нет материалов. Добавьте текст вручную или настройте IFTTT.'));
+for(const item of data.items){
+ const card=node('article');card.className='card';card.append(node('h3',item.title),node('p',`${item.origin==='ifttt'?'IFTTT':'Ручной отбор'} · ${redditStates[item.state]||item.state}`));
+ const link=node('a','Оригинал Reddit');link.href=item.url;link.target='_blank';link.rel='noopener noreferrer';card.append(link);
+ if(item.error)card.append(node('p',item.error));
+ if(item.state==='ready'){card.append(node('p','Перевод доступен ниже в разделе «Черновики и согласование».'));}
+ else if(!['processing','needs_attention'].includes(item.state)&&state.role!=='viewer'){
+  const title=node('input');title.value=item.title;title.setAttribute('aria-label','Заголовок исходного материала');
+  const text=node('textarea');text.value=item.original;text.maxLength=8500;text.setAttribute('aria-label','Исходный английский текст');card.append(title,text);
+  button(card,'Сохранить исходный текст',()=>api(`/api/hub/reddit/items/${item.id}/text`,{title:title.value,original:text.value}));
+  if(state.role==='owner'&&item.state!=='queued'){
+   const evidence=node('input');evidence.placeholder='Основание: разрешение автора / лицензия / собственный текст';evidence.setAttribute('aria-label','Основание для перевода и публикации');card.append(evidence);
+   button(card,'Подтвердить основание и отправить на перевод',()=>{if(title.value!==item.title||text.value!==item.original)throw Error('Сначала сохраните исходный текст');if(!item.original)throw Error('Сначала добавьте английский текст');return api(`/api/hub/reddit/items/${item.id}/rights`,{evidence:evidence.value,source_hash:item.source_hash});});
+  }
+ }
+ if(state.role==='owner'&&['failed','needs_attention'].includes(item.state))button(card,'Повторить обработку после проверки',()=>api(`/api/hub/reddit/items/${item.id}/resume`,{}));
+ el('reddit-items').append(card);
+}}
+el('reddit-add').onsubmit=async event=>{event.preventDefault();const submit=event.submitter;submit.disabled=true;try{const result=await api('/api/hub/reddit/items',{title:el('reddit-title').value,original:el('reddit-original').value,url:el('reddit-url').value,target_id:el('reddit-target').value});status(result.duplicate?'Этот материал уже есть в общей очереди':'Материал добавлен');if(!result.duplicate)event.target.reset();await refresh();}catch(error){status(error.message,true);}finally{submit.disabled=false;}};
+el('reddit-mail-form').onsubmit=async event=>{event.preventDefault();try{await api('/api/hub/reddit/mail',{username:el('reddit-mail-user').value,app_password:el('reddit-mail-password').value,enabled:el('reddit-mail-enabled').checked});el('reddit-mail-password').value='';el('reddit-mail-template').textContent='';status('Подключение сохранено');await refresh();}catch(error){el('reddit-mail-password').value='';status(error.message,true);}};
+el('reddit-template').onclick=async()=>{try{const data=await api('/api/hub/reddit/mail/template');el('reddit-mail-template').textContent=`Получатель: ${data.recipient}\nТема:\n${data.subject}\n\nТело письма:\n${data.body}`;}catch(error){status(error.message,true);}};
+el('reddit-mail-poll').onclick=async()=>{try{const data=await api('/api/hub/reddit/mail/poll',{});status(`Принято материалов: ${data.accepted}`);await refresh();}catch(error){status(error.message,true);await refresh();}};
 refresh().catch(()=>status('Введите локальный ключ доступа из .env.local'));

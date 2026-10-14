@@ -29,6 +29,9 @@ class HubService(Service):
         self.postiz = postiz or PostizClient(self.publishing["postiz"])
         from .max_bridge import MaxBridge
         self.bridge = MaxBridge(self)
+        from .reddit_intake import RedditIntake
+        from .reddit_mail import RedditMail
+        self.reddit_intake, self.reddit_mail = RedditIntake(self), RedditMail(self)
         if bootstrap_targets:
             self.sync_targets()
 
@@ -732,6 +735,12 @@ class HubService(Service):
             drafts = list(s.scalars(select(Draft.id).where(Draft.state == "review_pending")))
         for ident in drafts:
             self.make_variants(ident)
+        try:
+            self.reddit_mail.poll()
+        except AgentError as exc:
+            # Dedicated mailbox status exposes the safe error without stopping dispatches.
+            self.reddit_mail_error = exc.code
+        self.reddit_intake.process_one()
         return value
 
     def close(self):

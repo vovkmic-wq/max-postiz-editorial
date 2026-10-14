@@ -358,6 +358,7 @@ class Database:
             "video_assets",
             "material_media",
             "hub_bridge_posts",
+            "hub_reddit_submissions",
         }:
             raise AgentError("BACKUP_SCHEMA_MISMATCH")
         data = {name: data.get(name, []) for name in Base.metadata.tables}

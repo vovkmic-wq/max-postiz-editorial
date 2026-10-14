@@ -29,4 +29,5 @@ config/comfy/workflow.json
 config/image_channels.json
 
 config/holidays.json
+config/reddit_intake.json
 deployment/postiz/.env

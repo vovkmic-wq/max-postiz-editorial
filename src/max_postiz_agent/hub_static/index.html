@@ -2,6 +2,23 @@
 <body><header><h1>Редакция</h1><p>Архив → локальная LLM → согласование → публикация</p><a href="/">Источники и настройки MAX</a></header>
 <section id="login"><label>Локальный ключ доступа <input id="key" type="password" autocomplete="off"></label><button id="signin">Войти</button></section>
 <p id="status" role="status"></p><main hidden id="main"><section><h2>Подключения</h2><p id="runtime"></p><div id="targets"></div><button id="refresh">Обновить</button><button id="tick">Обработать очередь</button></section>
+<section id="reddit-intake"><h2>Reddit: IFTTT и ручной отбор</h2>
+<p>Оба входа используют общую очередь и проверку повторов. Ссылки не загружаются автоматически. Готовые переводы проходят согласование в разделе черновиков.</p>
+<p id="reddit-runtime"></p>
+<form id="reddit-add"><label>Канал MAX <select id="reddit-target" aria-label="Канал MAX" required></select></label>
+<label>Ссылка на пост Reddit <input id="reddit-url" type="url" required placeholder="https://www.reddit.com/r/.../comments/.../"></label>
+<label>Заголовок оригинала <input id="reddit-title" required maxlength="500"></label>
+<label>Английский текст <textarea id="reddit-original" maxlength="8500" placeholder="Вставьте разрешённый к использованию текст. Без текста сохранится только закладка."></textarea></label>
+<button type="submit">Добавить в общую очередь</button></form>
+<details id="reddit-mail-settings"><summary>Подключить IFTTT через Gmail</summary>
+<p>В Gmail создайте ярлык Reddit-IFTTT и фильтр писем от action@ifttt.com с темой MAX-REDDIT. Для сервера нужен отдельный пароль приложения Google, а не обычный пароль аккаунта. Читается только этот ярлык; письма не удаляются и не отмечаются прочитанными.</p>
+<form id="reddit-mail-form"><label>Gmail <input id="reddit-mail-user" type="email" autocomplete="off" required></label>
+<label>Пароль приложения <input id="reddit-mail-password" type="password" autocomplete="new-password" placeholder="Пустое поле сохраняет прежний пароль"></label>
+<label><input id="reddit-mail-enabled" type="checkbox"> Забирать письма IFTTT</label>
+<button type="submit">Сохранить подключение</button></form>
+<button id="reddit-template">Показать шаблон для IFTTT</button><button id="reddit-mail-poll">Проверить почту</button><pre id="reddit-mail-template"></pre>
+<p>В IFTTT: Reddit → New top post in subreddit → Email → Send me an email. Подключите нужный Gmail в сервисе Email. Шаблон содержит секрет маршрута: не публикуйте его. Если IFTTT не передаст полный текст, дополните карточку вручную.</p>
+</details><div id="reddit-items"></div></section>
 <section><h2>Архив</h2><input id="query" placeholder="Поиск материалов"><button id="search">Найти</button><div id="archive"></div></section>
 <section><h2>Расписание задач</h2><div id="tasks"></div></section>
 <section><h2>Черновики и согласование</h2><div id="variants"></div></section>
