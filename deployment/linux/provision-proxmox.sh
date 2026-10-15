@@ -30,7 +30,7 @@ CLOUD
 qm create "$VMID" --name max-postiz-editorial --ostype l26 --machine q35 \
   --cpu host --cores 4 --memory 10240 --balloon 10240 --agent enabled=1 \
   --net0 virtio,bridge=vmbr0 --scsihw virtio-scsi-single \
-  --serial0 socket --vga serial0 --onboot 1
+  --serial0 socket --vga serial0 --onboot 1 --startup order=20,up=30
 qm importdisk "$VMID" "$PWD/$IMAGE" "$STORAGE" --format raw
 qm set "$VMID" --scsi0 "$STORAGE:vm-$VMID-disk-0,discard=on,iothread=1,ssd=1"
 qm resize "$VMID" scsi0 120G

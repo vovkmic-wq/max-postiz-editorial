@@ -23,5 +23,5 @@ PY
 systemctl daemon-reload
 nginx -t
 systemctl reload nginx
-systemctl start max-postiz-display max-postiz-vnc max-postiz-novnc
+systemctl enable --now max-postiz-display max-postiz-vnc max-postiz-novnc
 echo 'Private display ready; sign in as Hub owner before opening /api/owner-browser/vnc.html'
