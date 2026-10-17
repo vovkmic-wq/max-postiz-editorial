@@ -4,6 +4,7 @@ This module does not fetch an article or establish permission to republish it.
 The caller must validate the source and its rights before passing its text here.
 """
 
+import copy
 import ipaddress
 import json
 import re
@@ -15,11 +16,47 @@ import httpx
 from .adapters import extract_object
 from .collectors import detect_language
 from .config import AgentError
-from .editorial import translation_gate
+from .editorial import numbers, translation_gate
 from .network import resemblances_ip
 
 SPELLING_URL = "http://127.0.0.1:8010/v2/check"
 TOPICS = {"science", "stories", "humor"}
+MAGELLANIC_EVIDENCE = "https://www.astronet.ru/db/msg/1167613/lmc.html"
+
+
+def adjudicate_scientific_spelling(original, translated, matches):
+    """Resolve one documented scientific name; retain every other LT finding."""
+    adjudicated, unresolved = [], []
+    for match in matches:
+        rule, kind = match.get("rule"), match.get("type")
+        offset, length = match.get("offset"), match.get("length")
+        evidence = None
+        if (isinstance(rule, dict) and rule.get("id") == "MORFOLOGIK_RULE_RU_RU"
+                and rule.get("issueType") == "misspelling"
+                and isinstance(kind, dict) and kind.get("typeName") == "UnknownWord"
+                and type(offset) is int and offset >= 0 and type(length) is int
+                and length == len("Магелланово")):
+            for phrase in re.finditer(r"(?<![\w-])(Большое|Малое) Магелланово облако(?![\w-])", translated):
+                english = "Large" if phrase.group(1) == "Большое" else "Small"
+                word_start = phrase.start() + len(phrase.group(1)) + 1
+                try:
+                    # LanguageTool offsets count Java UTF-16 code units.
+                    expected = len(translated[:word_start].encode("utf-16-le")) // 2
+                except UnicodeError:
+                    continue
+                if offset == expected and re.search(
+                        rf"(?<![A-Za-z]){english}\s+Magellanic\s+Cloud(?![A-Za-z])", original,
+                        flags=re.IGNORECASE):
+                    evidence = {"match": copy.deepcopy(match), "word": "Магелланово",
+                        "phrase": phrase.group(), "source_term": english + " Magellanic Cloud",
+                        "evidence_url": MAGELLANIC_EVIDENCE,
+                        "reason": "SOURCE_BOUND_VERIFIED_SCIENTIFIC_NAME"}
+                    break
+        if evidence:
+            adjudicated.append(evidence)
+        else:
+            unresolved.append(match)
+    return adjudicated, unresolved
 
 
 def canonical_article_url(value):
@@ -53,21 +90,44 @@ def canonical_article_url(value):
         raise AgentError("ARTICLE_URL_INVALID") from exc
 
 
+def _validated_source(title, original):
+    if not isinstance(title, str) or not isinstance(original, str):
+        raise AgentError("ARTICLE_INPUT_INVALID")
+    title, original = title.strip(), original.strip()
+    source = title + "\n\n" + original
+    if not 3 <= len(title) <= 500 or len(original) < 80 or len(source) > 9000:
+        raise AgentError("ARTICLE_INPUT_SIZE_INVALID")
+    if detect_language(source) != "en" or len(re.findall(r"[A-Za-z]{2,}", source)) < 12:
+        raise AgentError("ARTICLE_ENGLISH_SOURCE_REQUIRED")
+    return title, original, source
+
+
 class ArticleQuality:
     def __init__(self, translator, reviewer, spelling_url=SPELLING_URL, transport=None,
-                 prompt_dir=None):
+                 prompt_dir=None, trace=None):
         if (translator is reviewer or (
                 getattr(translator, "model", None) and getattr(reviewer, "model", None)
                 and translator.model == reviewer.model)):
             raise AgentError("ARTICLE_INDEPENDENT_REVIEW_REQUIRED")
         if spelling_url != SPELLING_URL:
             raise AgentError("LOCAL_SPELLING_REQUIRED")
+        if trace is not None and not callable(trace):
+            raise AgentError("ARTICLE_TRACE_INVALID")
         self.translator, self.reviewer = translator, reviewer
+        self.trace = trace
         prompts = Path(prompt_dir) if prompt_dir else Path(__file__).resolve().parents[2] / "prompts"
         self.translation_prompt = (prompts / "ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8")
         self.review_prompt = (prompts / "ARTICLE_REVIEW.txt").read_text(encoding="utf-8")
         self.spelling_url = spelling_url
         self.spelling = httpx.Client(timeout=60, trust_env=False, transport=transport)
+
+    def _emit(self, phase, attempt, **value):
+        if self.trace is not None:
+            try:
+                # A diagnostic observer cannot mutate the text being checked.
+                self.trace(copy.deepcopy({"phase": phase, "attempt": attempt, **value}))
+            except Exception as exc:
+                raise AgentError("ARTICLE_TRACE_FAILED", 503) from exc
 
     def _spelling_matches(self, text):
         try:
@@ -82,49 +142,71 @@ class ArticleQuality:
 
     def prepare(self, title, original, url):
         url = canonical_article_url(url)
-        if not isinstance(title, str) or not isinstance(original, str):
-            raise AgentError("ARTICLE_INPUT_INVALID")
-        title, original = title.strip(), original.strip()
-        source = title + "\n\n" + original
-        if not 3 <= len(title) <= 500 or len(original) < 80 or len(source) > 9000:
-            raise AgentError("ARTICLE_INPUT_SIZE_INVALID")
-        if detect_language(source) != "en" or len(re.findall(r"[A-Za-z]{2,}", source)) < 12:
-            raise AgentError("ARTICLE_ENGLISH_SOURCE_REQUIRED")
+        title, original, source = _validated_source(title, original)
         context = {"instruction": self.translation_prompt,
                    "source_untrusted": {"title": title, "body": original, "url": url}}
-        for _ in range(3):
+        for attempt in range(1, 4):
+            self._emit("translation_started", attempt, context=context)
+            raw_translation = None
             try:
-                translated = extract_object(self.translator.generate_text(
-                    json.dumps(context, ensure_ascii=False))[0])
+                raw_translation = self.translator.generate_text(
+                    json.dumps(context, ensure_ascii=False))[0]
+                self._emit("translation_returned", attempt, raw=raw_translation)
+                translated = extract_object(raw_translation)
             except AgentError as exc:
                 if exc.code != "INVALID_EDITOR_RESULT":
+                    if exc.code != "ARTICLE_TRACE_FAILED":
+                        self._emit("translation_failed", attempt, error=exc.code)
                     raise
                 context["repair_feedback"] = "Return only valid JSON with title and body strings."
+                self._emit("translation_invalid", attempt, error=exc.code, raw=raw_translation)
+                self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
             if (set(translated) != {"title", "body"}
                     or any(not isinstance(v, str) or not v.strip() for v in translated.values())):
                 context["repair_feedback"] = "Return exactly title and body as nonempty JSON strings."
+                self._emit("translation_invalid", attempt, error="ARTICLE_TRANSLATION_SCHEMA_INVALID",
+                           translation=translated)
+                self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
             translated = {key: value.strip() for key, value in translated.items()}
+            self._emit("translation_parsed", attempt, translation=translated)
             text = translated["title"] + "\n\n" + translated["body"]
             full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
-            context["previous_translation_untrusted"] = translated
+            context["previous_translation"] = translated
             try:
                 translation_gate(source, text)
                 if len(full) > 3500:
                     raise AgentError("ARTICLE_POST_TOO_LONG")
             except AgentError as exc:
-                context["repair_feedback"] = exc.code
+                context["repair_feedback"] = ({
+                    "code": exc.code,
+                    "original_numbers": sorted(numbers(source)),
+                    "translated_numbers": sorted(numbers(text)),
+                    "advice": "Preserve the original numeric notation and translate its qualifiers. "
+                              "Do not convert units, times or number formats; correct the changed numeric tokens.",
+                } if exc.code == "TRANSLATION_NUMBER_CHANGED" else exc.code)
+                self._emit("gate_rejected", attempt, error=exc.code, characters=len(full))
+                self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
+            self._emit("gate_passed", attempt, characters=len(full))
             review_context = {"instruction": self.review_prompt,
                               "source_untrusted": source, "translation_untrusted": text}
+            self._emit("review_started", attempt, context=review_context)
+            raw_review = None
             try:
-                reviewed = extract_object(self.reviewer.generate_text(
-                    json.dumps(review_context, ensure_ascii=False))[0])
+                raw_review = self.reviewer.generate_text(
+                    json.dumps(review_context, ensure_ascii=False))[0]
+                self._emit("review_returned", attempt, raw=raw_review)
+                reviewed = extract_object(raw_review)
             except AgentError as exc:
                 if exc.code != "INVALID_EDITOR_RESULT":
+                    if exc.code != "ARTICLE_TRACE_FAILED":
+                        self._emit("review_failed", attempt, error=exc.code)
                     raise
                 context["repair_feedback"] = "Independent review returned invalid JSON; approval was not granted."
+                self._emit("review_invalid", attempt, error=exc.code, raw=raw_review)
+                self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
             if (set(reviewed) != {"approved", "topic", "issues"}
                     or type(reviewed["approved"]) is not bool
@@ -132,16 +214,98 @@ class ArticleQuality:
                     or not isinstance(reviewed["issues"], list)
                     or any(not isinstance(issue, str) for issue in reviewed["issues"])):
                 context["repair_feedback"] = "Independent review schema invalid; approval was not granted."
+                self._emit("review_invalid", attempt, error="ARTICLE_REVIEW_SCHEMA_INVALID", review=reviewed)
+                self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
-            matches = self._spelling_matches(text)
+            self._emit("review_parsed", attempt, review=reviewed)
+            self._emit("spelling_started", attempt)
+            try:
+                matches = self._spelling_matches(text)
+            except AgentError as exc:
+                self._emit("spelling_failed", attempt, error=exc.code)
+                raise
+            self._emit("spelling_returned", attempt, matches=matches)
+            adjudicated, unresolved = adjudicate_scientific_spelling(source, text, matches)
+            self._emit("spelling_adjudicated", attempt, adjudicated=adjudicated, unresolved=unresolved)
             if (reviewed["approved"] and not reviewed["issues"]
-                    and reviewed["topic"] in TOPICS and not matches):
-                return {"title": translated["title"], "body": full, "translation": text,
-                        "original": source, "url": url, "topic": reviewed["topic"]}
+                    and reviewed["topic"] in TOPICS and not unresolved):
+                prepared = {"title": translated["title"], "body": full, "translation": text,
+                            "original": source, "url": url, "topic": reviewed["topic"]}
+                self._emit("accepted", attempt, result=prepared)
+                return prepared
             context["repair_feedback"] = {"review_approved": reviewed["approved"],
                 "topic": reviewed["topic"], "review_issues": reviewed["issues"],
-                "spelling_matches": matches[:20]}
+                "spelling_matches": unresolved[:20]}
+            self._emit("retry", attempt, feedback=context["repair_feedback"])
+        self._emit("rejected", 3, error="ARTICLE_QUALITY_REJECTED",
+                   feedback=context.get("repair_feedback"))
         raise AgentError("ARTICLE_QUALITY_REJECTED")
+
+    def check_candidate(self, title, body, original_title, original, url):
+        """Check an exact editorial correction without translating or publishing it."""
+        url = canonical_article_url(url)
+        original_title, original, source = _validated_source(original_title, original)
+        if (not isinstance(title, str) or not title.strip()
+                or not isinstance(body, str) or not body.strip()):
+            raise AgentError("ARTICLE_TRANSLATION_INVALID")
+        title, body = title.strip(), body.strip()
+        text = title + "\n\n" + body
+        full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
+        self._emit("candidate_started", 1, mode="candidate", candidate={"title": title, "body": body},
+                   source_untrusted={"title": original_title, "body": original, "url": url})
+        try:
+            translation_gate(source, text)
+            if len(full) > 3500:
+                raise AgentError("ARTICLE_POST_TOO_LONG")
+        except AgentError as exc:
+            self._emit("gate_rejected", 1, error=exc.code, characters=len(full))
+            self._emit("rejected", 1, mode="candidate", error=exc.code)
+            raise
+        self._emit("gate_passed", 1, characters=len(full))
+        review_context = {"instruction": self.review_prompt,
+                          "source_untrusted": source, "translation_untrusted": text}
+        self._emit("review_started", 1, context=review_context)
+        raw_review = None
+        try:
+            raw_review = self.reviewer.generate_text(json.dumps(review_context, ensure_ascii=False))[0]
+            self._emit("review_returned", 1, raw=raw_review)
+            reviewed = extract_object(raw_review)
+        except AgentError as exc:
+            if exc.code != "INVALID_EDITOR_RESULT":
+                if exc.code != "ARTICLE_TRACE_FAILED":
+                    self._emit("review_failed", 1, error=exc.code)
+                raise
+            self._emit("review_invalid", 1, error=exc.code, raw=raw_review)
+            self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED")
+            raise AgentError("ARTICLE_QUALITY_REJECTED") from exc
+        if (set(reviewed) != {"approved", "topic", "issues"}
+                or type(reviewed["approved"]) is not bool
+                or not isinstance(reviewed["topic"], str)
+                or not isinstance(reviewed["issues"], list)
+                or any(not isinstance(issue, str) for issue in reviewed["issues"])):
+            self._emit("review_invalid", 1, error="ARTICLE_REVIEW_SCHEMA_INVALID", review=reviewed)
+            self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED")
+            raise AgentError("ARTICLE_QUALITY_REJECTED")
+        self._emit("review_parsed", 1, review=reviewed)
+        self._emit("spelling_started", 1)
+        try:
+            matches = self._spelling_matches(text)
+        except AgentError as exc:
+            self._emit("spelling_failed", 1, error=exc.code)
+            raise
+        self._emit("spelling_returned", 1, matches=matches)
+        adjudicated, unresolved = adjudicate_scientific_spelling(source, text, matches)
+        self._emit("spelling_adjudicated", 1, adjudicated=adjudicated, unresolved=unresolved)
+        if not (reviewed["approved"] and not reviewed["issues"]
+                and reviewed["topic"] in TOPICS and not unresolved):
+            feedback = {"review_approved": reviewed["approved"], "topic": reviewed["topic"],
+                        "review_issues": reviewed["issues"], "spelling_matches": unresolved[:20]}
+            self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED", feedback=feedback)
+            raise AgentError("ARTICLE_QUALITY_REJECTED")
+        prepared = {"title": title, "body": full, "translation": text,
+                    "original": source, "url": url, "topic": reviewed["topic"]}
+        self._emit("accepted", 1, mode="candidate", result=prepared)
+        return prepared
 
     def close(self):
         self.spelling.close()

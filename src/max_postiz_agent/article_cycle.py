@@ -3,6 +3,7 @@ import copy
 import json
 import math
 import os
+import re
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -14,7 +15,7 @@ from .browser_runtime import profile_lock
 from .config import AgentError, fingerprint, inside
 from .db import Draft, DraftRevision, Material, Story, now, uid
 from .hub import ACTIVE
-from .hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Variant
+from .hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Target, TargetApproval, Variant
 from .reddit import text_hash
 
 
@@ -143,13 +144,57 @@ class HourlyArticleCycle:
             raise AgentError("ARTICLE_DAILY_LIMIT", 409)
         return earliest
 
-    def _quality(self):
+    def _trace_writer(self, record_id):
+        if not isinstance(record_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", record_id):
+            raise AgentError("ARTICLE_RECORD_ID_INVALID")
+        path = inside(self.core.settings.root, f"data/hourly-articles/quality-{record_id}.local.jsonl")
+
+        def write_event(event):
+            if not isinstance(event, dict):
+                raise AgentError("ARTICLE_TRACE_INVALID")
+            encoded = json.dumps({**event, "at": now(), "record_id": record_id}, ensure_ascii=False) + "\n"
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                path.chmod(0o600)
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        return write_event
+
+    def _quality(self, record_id=None):
         if self.quality_factory:
             return self.quality_factory()
         from .article_quality import ArticleQuality
         translator, reviewer = OpenCode(self.core.settings), OpenCode(self.core.settings)
         translator.model, reviewer.model = "proxmox/qwen35-9b", "proxmox/qwen25-coder-7b"
-        return ArticleQuality(translator, reviewer, prompt_dir=self.core.settings.root / "prompts")
+        return ArticleQuality(translator, reviewer, prompt_dir=self.core.settings.root / "prompts",
+                              trace=self._trace_writer(record_id) if record_id else None)
+
+    def _assert_pre_draft(self, record):
+        if any(record.get(key) for key in ("variant_id", "postiz_id", "dispatch_id", "due_at", "prepared_hash")):
+            raise AgentError("ARTICLE_PREPARATION_HAS_EXTERNAL_STATE", 409)
+        with self.core.db.session() as session:
+            if (session.scalar(select(Story).where(Story.text_hash == fingerprint({"hourly_article": record["id"]})))
+                    or any(v.metadata_json.get("record_id") == record["id"]
+                           for v in session.scalars(select(Variant)))):
+                raise AgentError("ARTICLE_PREPARATION_HAS_EXTERNAL_STATE", 409)
+
+    def _unpublished_variant(self, session, record):
+        variant = self.core._variant(session, record["variant_id"], True)
+        target = session.scalar(select(Target).where(Target.id == variant.target_id).with_for_update())
+        if (variant.target_id != record["target_id"]
+                or variant.metadata_json.get("origin") != "hourly_article_test"
+                or variant.metadata_json.get("record_id") != record["id"]
+                or session.get(RemoteDraft, variant.id)
+                or session.scalar(select(BridgePost).where(BridgePost.variant_id == variant.id))
+                or session.scalar(select(Dispatch).where(Dispatch.variant_id == variant.id))
+                or session.scalar(select(TargetApproval).where(TargetApproval.variant_id == variant.id,
+                                                              TargetApproval.revoked.is_(False)))
+                or session.scalar(select(BridgePost).where(BridgePost.target_id == target.id,
+                                                          BridgePost.mutation_owner.is_not(None)))):
+            raise AgentError("ARTICLE_PREPARED_HAS_EXTERNAL_STATE", 409)
+        return variant, target
 
     def _record(self, ledger, ident):
         record = next((item for item in ledger["records"] if item["id"] == ident), None)
@@ -167,7 +212,34 @@ class HourlyArticleCycle:
                               content_hash=fingerprint(self.core.snapshot(variant, target)))
         return result
 
-    def prepare(self, article):
+    def _snapshot(self, record):
+        with self.core.db.session() as session:
+            variant = self.core._variant(session, record["variant_id"])
+            target = self.core._target(session, variant.target_id)
+            return copy.deepcopy(self.core.snapshot(variant, target))
+
+    @staticmethod
+    def _reviewed_fields(snapshot):
+        value = copy.deepcopy(snapshot)
+        value.pop("revision")
+        for key in ("postiz_post_id", "postiz_hash", "postiz_due_at", "postiz_state"):
+            value["metadata"].pop(key, None)
+        return value
+
+    @staticmethod
+    def _validate_correction(correction):
+        if (not isinstance(correction, dict) or set(correction) != {"title", "body"}
+                or any(not isinstance(v, str) or not v.strip() for v in correction.values())
+                or len(correction["title"]) > 500 or len(correction["body"]) > 3500
+                or "Источник:" in correction["body"]
+                or "Перевод и редактура с помощью нейросетей." in correction["body"]):
+            raise AgentError("ARTICLE_CORRECTION_INVALID")
+
+    def prepare(self, article, retry_record=None, candidate=None):
+        if candidate is not None:
+            if not retry_record:
+                raise AgentError("ARTICLE_CANDIDATE_RETRY_REQUIRED", 409)
+            self._validate_correction(candidate)
         with profile_lock(self.directory / "cycle.lock"):
             policy = self._policy()
             source, target = self._source_target(policy)
@@ -175,27 +247,70 @@ class HourlyArticleCycle:
             self._clear_outstanding(target.id)
             self._cadence(policy, now(), check_gap=False)
             ledger, slot = self._load(), int(now() // 3600)
-            if any(item["slot"] == slot for item in ledger["records"]):
-                raise AgentError("ARTICLE_SLOT_ALREADY_CLAIMED", 409)
-            if any(item["state"] not in {"published", "failed", "cancelled", "rejected"} for item in ledger["records"]):
-                raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
             original_hash = text_hash(article["original"])
             material_hash = fingerprint(" ".join(article["original"].casefold().split()))
-            if any(item.get("url") == article["url"] or item.get("original_hash") == original_hash for item in ledger["records"]):
+            if retry_record:
+                record = self._record(ledger, retry_record)
+                if (record["state"] not in {"needs_attention", "rejected", "failed"}
+                        or any(record.get(key) for key in ("variant_id", "postiz_id", "dispatch_id", "due_at", "prepared_hash"))):
+                    raise AgentError("ARTICLE_RETRY_NOT_SAFE", 409)
+                if record["slot"] != slot:
+                    raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
+                if (record["url"] != article["url"] or record["original_hash"] != original_hash
+                        or record["policy_hash"] != fingerprint(policy)
+                        or record["target_id"] != target.id or record["source_id"] != source["id"]
+                        or record["source_published_at"] != article["published_at"]
+                        or (record.get("input_hash") and record["input_hash"] != fingerprint(article))):
+                    raise AgentError("ARTICLE_RETRY_INPUT_MISMATCH", 409)
+                try:
+                    self._assert_pre_draft(record)
+                except AgentError as exc:
+                    raise AgentError("ARTICLE_RETRY_NOT_SAFE", 409) from exc
+            else:
+                record = None
+                if any(item["slot"] == slot for item in ledger["records"]):
+                    raise AgentError("ARTICLE_SLOT_ALREADY_CLAIMED", 409)
+            other_records = [item for item in ledger["records"] if item is not record]
+            if any(item["state"] not in {"published", "failed", "cancelled", "rejected"} for item in other_records):
+                raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
+            if any(item.get("url") == article["url"] or item.get("original_hash") == original_hash for item in other_records):
                 raise AgentError("ARTICLE_DUPLICATE_SOURCE", 409)
             with self.core.db.session() as session:
                 if session.scalar(select(Material).where(or_(Material.url == article["url"],
                         Material.text_hash.in_({original_hash, material_hash})))):
                     raise AgentError("ARTICLE_DUPLICATE_SOURCE", 409)
-            record = {"id": uid(), "slot": slot, "state": "preparing", "claimed_at": now(),
-                      "url": article["url"], "original_hash": original_hash, "policy_hash": fingerprint(policy),
-                      "target_id": target.id, "source_id": source["id"], "source_published_at": article["published_at"]}
-            ledger["records"].append(record)
+            if record is None:
+                record = {"id": uid(), "slot": slot, "state": "preparing", "claimed_at": now(),
+                          "url": article["url"], "original_hash": original_hash, "policy_hash": fingerprint(policy),
+                          "target_id": target.id, "source_id": source["id"], "source_published_at": article["published_at"],
+                          "input_hash": fingerprint(article), "preparation_attempts": []}
+                ledger["records"].append(record)
+            elif "preparation_attempts" not in record:
+                # Preserve older failed ledgers without inventing an unrecorded completion time.
+                record["preparation_attempts"] = [{"number": 1, "started_at": record["claimed_at"],
+                    "state": record["state"], "error": record.get("error"), "legacy_record": True}]
+            attempt = {"number": len(record["preparation_attempts"]) + 1,
+                       "started_at": now(), "state": "preparing", "operator_retry": bool(retry_record)}
+            if candidate is not None:
+                attempt.update(candidate_hash=fingerprint(candidate), operator_correction=True)
+            record["preparation_attempts"].append(attempt)
+            record.update(state="preparing", input_hash=fingerprint(article))
+            record["quality_trace"] = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
             self._save(ledger)
             quality = None
             try:
-                quality = self._quality()
-                prepared = quality.prepare(article["title"], article["original"], article["url"])
+                with self.core.db.session.begin() as session:
+                    self.core.db.audit(session, "hourly_article_operator" if retry_record else "article_quality",
+                        "hourly_article_prepare_attempt", record["id"], attempt=attempt["number"],
+                        operator_retry=bool(retry_record), source_hash=original_hash,
+                        input_hash=record["input_hash"], policy_hash=record["policy_hash"],
+                        candidate_hash=attempt.get("candidate_hash"), operator_correction=candidate is not None)
+                quality = self._quality(record["id"])
+                prepared = (quality.check_candidate(candidate["title"], candidate["body"], article["title"],
+                    article["original"], article["url"]) if candidate is not None else
+                    quality.prepare(article["title"], article["original"], article["url"]))
+                if record["slot"] != int(now() // 3600):
+                    raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
                 if prepared["url"] != article["url"]:
                     raise AgentError("ARTICLE_SOURCE_CHANGED", 409)
                 translation_hash = text_hash(prepared["translation"])
@@ -228,20 +343,163 @@ class HourlyArticleCycle:
                         media=[], source_revision=1, config_hash=self.core.settings.hash,
                         binding_hash=target.binding_hash, metadata_json={"origin": "hourly_article_test",
                             "record_id": record["id"], "rights_evidence": policy["rights_evidence"],
-                            "quality": "qwen_ministral_languagetool", "topic": prepared["topic"],
+                            "quality": "operator_ministral_languagetool" if candidate is not None else "qwen_ministral_languagetool",
+                            "operator_correction_hash": attempt.get("candidate_hash"), "topic": prepared["topic"],
                             "translation_hash": translation_hash})
                     session.add(variant)
                     session.flush()
                     self.core._history(session, variant, target, "article_quality")
+                    # Generation and database work may cross the reserved hour.
+                    # Raising inside the transaction rolls back every generated entity.
+                    if record["slot"] != int(now() // 3600):
+                        raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
                     record.update(variant_id=variant.id, translation_hash=translation_hash,
                                   prepared_hash=fingerprint(self.core.snapshot(variant, target)), state="prepared")
                     self.core.db.audit(session, "article_quality", "hourly_article_prepared", variant.id,
-                        source_hash=original_hash, policy_hash=record["policy_hash"])
+                        source_hash=original_hash, policy_hash=record["policy_hash"],
+                        candidate_hash=attempt.get("candidate_hash"), operator_correction=candidate is not None)
+                attempt.update(state="prepared", finished_at=now())
+                record.pop("error", None)
                 self._save(ledger)
                 return self._view(record)
             except Exception as exc:
                 record.update(state="needs_attention", error=exc.code if isinstance(exc, AgentError) else "ARTICLE_PREPARATION_INTERRUPTED")
+                attempt.update(state="needs_attention", error=record["error"], finished_at=now())
                 self._save(ledger)
+                with self.core.db.session.begin() as session:
+                    self.core.db.audit(session, "article_quality", "hourly_article_prepare_error", record["id"],
+                        attempt=attempt["number"], error=record["error"])
+                raise
+            finally:
+                if quality:
+                    quality.close()
+                    if not self.quality_factory:
+                        quality.translator.client.close()
+                        quality.reviewer.client.close()
+
+    def cancel_preparation(self, ident, reason="Operator reconciled and abandoned pre-draft preparation"):
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise AgentError("ARTICLE_CANCELLATION_REASON_INVALID")
+        with profile_lock(self.directory / "cycle.lock"):
+            ledger = self._load()
+            record = self._record(ledger, ident)
+            if record["state"] not in {"needs_attention", "preparing", "rejected", "failed"}:
+                raise AgentError("ARTICLE_PREPARATION_NOT_CANCELLABLE", 409)
+            self._assert_pre_draft(record)
+            action = {"at": now(), "action": "operator_cancelled", "previous_state": record["state"],
+                      "reason": reason.strip()}
+            record.setdefault("preparation_actions", []).append(action)
+            with self.core.db.session.begin() as session:
+                self.core.db.audit(session, "hourly_article_operator", "hourly_article_cancel_preparation", record["id"],
+                    policy_hash=record["policy_hash"], source_hash=record["original_hash"],
+                    previous_state=record["state"], reason=reason.strip())
+            record.update(state="cancelled", cancelled_at=action["at"])
+            self._save(ledger)
+            return self._view(record)
+
+    def abandon_prepared(self, ident, reason="Operator rejected an unpublished local article draft"):
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise AgentError("ARTICLE_CANCELLATION_REASON_INVALID")
+        with profile_lock(self.directory / "cycle.lock"):
+            ledger = self._load()
+            record = self._record(ledger, ident)
+            if (record["state"] not in {"prepared", "needs_attention", "rejected", "failed", "revising"}
+                    or not record.get("variant_id")
+                    or any(record.get(key) for key in ("postiz_id", "dispatch_id", "due_at"))):
+                raise AgentError("ARTICLE_PREPARED_NOT_ABANDONABLE", 409)
+            with self.core.db.session.begin() as session:
+                variant, target = self._unpublished_variant(session, record)
+                variant.state, variant.revision = "abandoned", variant.revision + 1
+                session.get(Draft, variant.draft_id).state = "article_rejected"
+                self.core._history(session, variant, target, "hourly_article_operator")
+                self.core.db.audit(session, "hourly_article_operator", "hourly_article_abandon_prepared", variant.id,
+                    record_id=record["id"], policy_hash=record["policy_hash"], reason=reason.strip())
+            action = {"at": now(), "action": "operator_abandoned_prepared", "previous_state": record["state"],
+                      "reason": reason.strip()}
+            record.setdefault("preparation_actions", []).append(action)
+            record.update(state="cancelled", cancelled_at=action["at"])
+            self._save(ledger)
+            return self._view(record)
+
+    def revise_prepared(self, ident, correction):
+        self._validate_correction(correction)
+        with profile_lock(self.directory / "cycle.lock"):
+            policy, ledger = self._policy(), self._load()
+            record = self._record(ledger, ident)
+            if (record["state"] != "prepared" or not record.get("variant_id")
+                    or record["policy_hash"] != fingerprint(policy)):
+                raise AgentError("ARTICLE_CORRECTION_NOT_ALLOWED", 409)
+            if record["slot"] != int(now() // 3600):
+                raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
+            self._source_target(policy)
+            with self.core.db.session.begin() as session:
+                variant, target = self._unpublished_variant(session, record)
+                prior_hash = fingerprint(self.core.snapshot(variant, target))
+                if prior_hash != record["prepared_hash"] or len(variant.sources) != 1:
+                    raise AgentError("ARTICLE_REVIEW_HASH_MISMATCH", 409)
+                material = session.get(Material, variant.sources[0]["id"])
+                if (not material or material.url != record["url"] or material.source_id != record["source_id"]
+                        or text_hash(material.text) != record["original_hash"]):
+                    raise AgentError("ARTICLE_SOURCE_CHANGED", 409)
+                original_title, original = material.title, material.text
+            attempt = {"started_at": now(), "candidate_hash": fingerprint(correction), "state": "checking"}
+            record.setdefault("correction_attempts", []).append(attempt)
+            record.update(state="revising", correction_blocked=True)
+            self._save(ledger)
+            quality = None
+            try:
+                quality = self._quality(record["id"])
+                checked = quality.check_candidate(correction["title"], correction["body"], original_title,
+                                                  original, record["url"])
+                if record["slot"] != int(now() // 3600):
+                    raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
+                self._source_target(self._policy())
+                if fingerprint(self._policy()) != record["policy_hash"] or checked["url"] != record["url"]:
+                    raise AgentError("ARTICLE_SOURCE_CHANGED", 409)
+                translation_hash = text_hash(checked["translation"])
+                if any(item is not record and item.get("translation_hash") == translation_hash for item in ledger["records"]):
+                    raise AgentError("ARTICLE_DUPLICATE_TRANSLATION", 409)
+                with self.core.db.session.begin() as session:
+                    variant, target = self._unpublished_variant(session, record)
+                    if fingerprint(self.core.snapshot(variant, target)) != prior_hash:
+                        raise AgentError("ARTICLE_REVIEW_HASH_MISMATCH", 409)
+                    duplicates = session.scalars(select(Variant).where(Variant.target_id == target.id, Variant.id != variant.id))
+                    if any(v.metadata_json.get("translation_hash") == translation_hash for v in duplicates):
+                        raise AgentError("ARTICLE_DUPLICATE_TRANSLATION", 409)
+                    draft = session.get(Draft, variant.draft_id)
+                    draft.current = {**draft.current, "title": checked["title"], "body": checked["body"]}
+                    draft.revision += 1
+                    draft.state, draft.config_id = "article_review", self.core.settings.hash
+                    session.add(DraftRevision(draft_id=draft.id, revision=draft.revision,
+                        payload=copy.deepcopy(draft.current), config_id=draft.config_id))
+                    variant.title, variant.body = checked["title"], checked["body"]
+                    variant.revision += 1
+                    variant.source_revision, variant.config_hash = draft.revision, draft.config_id
+                    variant.binding_hash, variant.state, variant.updated_at = target.binding_hash, "review_pending", now()
+                    variant.metadata_json = {**variant.metadata_json, "translation_hash": translation_hash,
+                        "topic": checked["topic"], "editorial_correction_hash": attempt["candidate_hash"]}
+                    self.core._history(session, variant, target, "hourly_article_operator")
+                    if record["slot"] != int(now() // 3600):
+                        raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
+                    record.update(prepared_hash=fingerprint(self.core.snapshot(variant, target)),
+                                  translation_hash=translation_hash, state="prepared", correction_blocked=False)
+                    self.core.db.audit(session, "hourly_article_operator", "hourly_article_revised_prepared", variant.id,
+                        record_id=record["id"], previous_hash=prior_hash, prepared_hash=record["prepared_hash"],
+                        candidate_hash=attempt["candidate_hash"], policy_hash=record["policy_hash"])
+                attempt.update(state="accepted", finished_at=now())
+                record.pop("error", None)
+                self._save(ledger)
+                return self._view(record)
+            except Exception as exc:
+                error = exc.code if isinstance(exc, AgentError) else "ARTICLE_CORRECTION_INTERRUPTED"
+                attempt.update(state="rejected", error=error, finished_at=now())
+                # Keep the original version intact, but block publication until an
+                # explicit corrected candidate passes. A fresh operator revision can retry.
+                record.update(state="prepared", correction_blocked=True, error=error)
+                self._save(ledger)
+                with self.core.db.session.begin() as session:
+                    self.core.db.audit(session, "hourly_article_operator", "hourly_article_correction_error", ident,
+                        error=error, candidate_hash=attempt["candidate_hash"])
                 raise
             finally:
                 if quality:
@@ -255,19 +513,21 @@ class HourlyArticleCycle:
             policy, ledger = self._policy(), self._load()
             record = self._record(ledger, ident)
             _, target = self._source_target(policy)
-            if record["state"] != "prepared" or record["policy_hash"] != fingerprint(policy):
+            if (record["state"] != "prepared" or record.get("correction_blocked")
+                    or record["policy_hash"] != fingerprint(policy)):
                 raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
             if record["slot"] != int(now() // 3600):
                 raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
             if record["source_published_at"] < now() - self.core.settings.channel(target.profile_id)["freshness_hours"] * 3600:
                 raise AgentError("STALE_SOURCE", 409)
-            view = self._view(record)
-            if reviewed_hash != record["prepared_hash"] or view["content_hash"] != reviewed_hash:
+            reviewed = self._snapshot(record)
+            if reviewed_hash != record["prepared_hash"] or fingerprint(reviewed) != reviewed_hash:
                 raise AgentError("ARTICLE_REVIEW_HASH_MISMATCH", 409)
             self._clear_outstanding(target.id)
             earliest = self._cadence(policy, now(), check_gap=False)
-            due = max(now() + 120, earliest) if due_at is None else due_at
-            if (type(due) not in {int, float} or not math.isfinite(due) or due < now() + 10
+            preparation_time = now()
+            due = max(preparation_time + 120, earliest) if due_at is None else due_at
+            if (type(due) not in {int, float} or not math.isfinite(due) or due < preparation_time + 120
                     or due >= (record["slot"] + 2) * 3600):
                 raise AgentError("ARTICLE_SCHEDULE_INVALID", 409)
             self._cadence(policy, due)
@@ -281,8 +541,16 @@ class HourlyArticleCycle:
                 record.update(state="staged", postiz_id=external)
                 self._save(ledger)
                 self.core.bridge.sync(force=True)
-                fresh = self._view(record)
-                if fresh["body"] != view["body"] or fresh["title"] != view["title"]:
+                fresh = self._snapshot(record)
+                metadata = fresh["metadata"]
+                if (self._reviewed_fields(fresh) != self._reviewed_fields(reviewed)
+                        or fresh["revision"] != reviewed["revision"] + 1
+                        or metadata.get("postiz_post_id") != external
+                        or metadata.get("postiz_state") != "QUEUE"
+                        or type(metadata.get("postiz_due_at")) not in {int, float}
+                        or abs(metadata["postiz_due_at"] - due) > 0.001
+                        or not isinstance(metadata.get("postiz_hash"), str)
+                        or len(metadata["postiz_hash"]) != 64):
                     raise AgentError("ARTICLE_REMOTE_CHANGED", 409)
                 self._clear_outstanding(target.id)
                 self._cadence(policy, due)
@@ -290,12 +558,12 @@ class HourlyArticleCycle:
                 self._save(ledger)
                 self.core.pause_target(target.id, False, actor="hourly_article_policy")
                 dispatch = self.core.approve_variant(record["variant_id"], fresh["revision"],
-                    fresh["content_hash"], due, actor="hourly_article_policy")
+                    fingerprint(fresh), due, actor="hourly_article_policy")
                 record.update(state="pending", dispatch_id=dispatch)
                 with self.core.db.session.begin() as session:
                     self.core.db.audit(session, "hourly_article_policy", "hourly_article_delegated_approval", dispatch,
                         policy_hash=record["policy_hash"], owner_instruction=policy["owner_instruction"],
-                        reviewed_hash=reviewed_hash, approved_hash=fresh["content_hash"], due_at=due)
+                        reviewed_hash=reviewed_hash, approved_hash=fingerprint(fresh), due_at=due)
                 self._save(ledger)
                 return self._view(record)
             except Exception as exc:

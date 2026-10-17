@@ -7,8 +7,9 @@ from sqlalchemy import select
 
 from max_postiz_agent.article_cycle import HourlyArticleCycle
 from max_postiz_agent.config import AgentError, fingerprint
-from max_postiz_agent.db import Material, now
-from max_postiz_agent.hub_models import Dispatch, DispatchAttempt, RemoteDraft, Target, TargetApproval, Variant
+from max_postiz_agent.db import Audit, Draft, Material, Story, now
+from max_postiz_agent.hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Target, TargetApproval, Variant, VariantRevision
+from max_postiz_agent.reddit import text_hash
 
 pytest_plugins = ["test_max_bridge"]
 
@@ -264,3 +265,500 @@ def test_unknown_send_remains_nonterminal_and_cannot_publish_again(cycle):
     with pytest.raises(AgentError, match="ARTICLE_RECONCILIATION_REQUIRED"):
         value.publish(prepared["id"], prepared["content_hash"])
     assert len(calls) == 1
+
+
+def failed_preparation(value, article):
+    class FailingQuality(Quality):
+        def prepare(self, *args):
+            raise AgentError("OPENCODE_GENERATION_FAILED")
+    value.quality_factory = FailingQuality
+    with pytest.raises(AgentError, match="OPENCODE_GENERATION_FAILED"):
+        value.prepare(article)
+    record = value._load()["records"][-1]
+    assert record["state"] == "needs_attention" and not record.get("variant_id")
+    value.quality_factory = Quality
+    return record
+
+
+def test_explicit_retry_preserves_record_slot_source_and_attempt_history(cycle):
+    value, core, article, records, calls, _, _ = cycle
+    failed = failed_preparation(value, article)
+    result = value.prepare(article, retry_record=failed["id"])
+    assert result["state"] == "prepared"
+    assert len(value._load()["records"]) == 1
+    for key in ("id", "slot", "url", "original_hash", "policy_hash", "claimed_at"):
+        assert result[key] == failed[key]
+    assert result["preparation_attempts"][0]["error"] == "OPENCODE_GENERATION_FAILED"
+    assert result["preparation_attempts"][1]["operator_retry"] is True
+    assert result["preparation_attempts"][1]["state"] == "prepared"
+    assert not records and not calls
+    with core.db.session() as session:
+        events = list(session.scalars(select(Audit).where(Audit.entity == failed["id"])))
+        assert [event.action for event in events].count("hourly_article_prepare_attempt") == 2
+        assert any(event.action == "hourly_article_prepare_error" for event in events)
+        assert session.query(Variant).count() == 1 and session.query(Dispatch).count() == 0
+
+
+def test_retry_migrates_failed_legacy_history_without_inventing_completion_time(cycle):
+    value, _, article, _, _, _, _ = cycle
+    failed = failed_preparation(value, article)
+    ledger = value._load()
+    ledger["records"][0].pop("preparation_attempts")
+    ledger["records"][0].pop("input_hash")
+    value._save(ledger)
+    result = value.prepare(article, retry_record=failed["id"])
+    prior = result["preparation_attempts"][0]
+    assert prior["legacy_record"] and prior["error"] == "OPENCODE_GENERATION_FAILED"
+    assert "finished_at" not in prior
+    assert result["input_hash"] == fingerprint(article)
+
+
+@pytest.mark.parametrize("change", [{"url": "https://science.example.org/another/"},
+    {"original": "An entirely different article with a different source body about the distant stars and galaxies."},
+    {"title": "A changed headline"}, {"published_at": -1}])
+def test_retry_rejects_changed_input_without_new_attempt(cycle, change):
+    value, _, article, _, _, _, _ = cycle
+    failed = failed_preparation(value, article)
+    with pytest.raises(AgentError):
+        value.prepare({**article, **change}, retry_record=failed["id"])
+    record = value._load()["records"][0]
+    assert len(record["preparation_attempts"]) == 1 and record["state"] == "needs_attention"
+
+
+def test_retry_rejects_policy_changes_and_expired_hour(cycle):
+    value, core, article, _, _, stamp, policy = cycle
+    failed = failed_preparation(value, article)
+    path = core.settings.root / "data/hourly-article-policy.local.json"
+    path.write_text(json.dumps({**policy, "owner_instruction": policy["owner_instruction"] + " changed"}))
+    with pytest.raises(AgentError, match="ARTICLE_RETRY_INPUT_MISMATCH"):
+        value.prepare(article, retry_record=failed["id"])
+    path.write_text(json.dumps(policy))
+    stamp[0] += 3600
+    with pytest.raises(AgentError, match="ARTICLE_SLOT_EXPIRED"):
+        value.prepare(article, retry_record=failed["id"])
+    assert len(value._load()["records"]) == 1
+
+
+@pytest.mark.parametrize("phase", ["variant", "remote", "dispatch", "orphaned_ledger"])
+def test_retry_never_replays_any_post_draft_phase(cycle, phase):
+    value, core, article, _, calls, _, _ = cycle
+    prepared = value.prepare(article)
+    if phase == "remote":
+        core.stage_remote(prepared["variant_id"])
+    elif phase == "dispatch":
+        value.publish(prepared["id"], prepared["content_hash"])
+    ledger = value._load()
+    record = ledger["records"][0]
+    record["state"] = "needs_attention"
+    if phase == "orphaned_ledger":
+        record.pop("variant_id")
+        record.pop("prepared_hash")
+    value._save(ledger)
+    count = len(calls)
+    with pytest.raises(AgentError, match="ARTICLE_RETRY_NOT_SAFE|ARTICLE_OUTSTANDING_DELIVERY"):
+        value.prepare(article, retry_record=prepared["id"])
+    assert len(calls) == count
+    with core.db.session() as session:
+        assert session.query(Variant).count() == 1
+
+
+def test_private_trace_appends_only_in_ignored_data_without_stdout(cycle, capsys):
+    value, core, _, _, _, _, _ = cycle
+    ident = "11111111-2222-4333-8444-555555555555"
+    trace = value._trace_writer(ident)
+    trace({"phase": "translation_received", "raw_output": "private source and model output"})
+    trace({"phase": "review_received", "raw_output": "private review"})
+    path = core.settings.root / f"data/hourly-articles/quality-{ident}.local.jsonl"
+    entries = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert len(entries) == 2 and all(item["record_id"] == ident for item in entries)
+    assert entries[0]["raw_output"] == "private source and model output"
+    assert entries[1]["phase"] == "review_received"
+    assert path.is_relative_to(core.settings.root / "data")
+    assert not capsys.readouterr().out
+    with pytest.raises(AgentError, match="ARTICLE_RECORD_ID_INVALID"):
+        value._trace_writer("../../outside")
+
+
+def test_default_quality_factory_wires_private_trace_without_model_requests(cycle, capsys):
+    value, core, _, _, _, _, _ = cycle
+    value.quality_factory = None
+    ident = "11111111-2222-4333-8444-555555555555"
+    quality = value._quality(ident)
+    try:
+        assert quality.translator.model == "proxmox/qwen35-9b"
+        assert quality.reviewer.model == "proxmox/qwen25-coder-7b"
+        quality._emit("translation_started", 1, context={"private": "source text"})
+        path = core.settings.root / f"data/hourly-articles/quality-{ident}.local.jsonl"
+        assert json.loads(path.read_text(encoding="utf-8"))["context"] == {"private": "source text"}
+        assert not capsys.readouterr().out
+    finally:
+        quality.close()
+        quality.translator.client.close()
+        quality.reviewer.client.close()
+
+
+def test_cancel_failed_preparation_preserves_history_and_consumes_same_slot(cycle):
+    value, core, article, _, calls, stamp, _ = cycle
+    failed = failed_preparation(value, article)
+    result = value.cancel_preparation(failed["id"], "Owner reconciled the failed LLM call")
+    assert result["state"] == "cancelled"
+    for key in ("id", "slot", "url", "original_hash", "policy_hash", "claimed_at", "preparation_attempts"):
+        assert result[key] == failed[key]
+    assert result["preparation_actions"][-1]["previous_state"] == "needs_attention"
+    assert calls == []
+    with core.db.session() as session:
+        assert session.query(Variant).count() == session.query(Dispatch).count() == 0
+        assert session.scalar(select(Audit).where(Audit.action == "hourly_article_cancel_preparation"))
+    with pytest.raises(AgentError, match="ARTICLE_SLOT_ALREADY_CLAIMED"):
+        value.prepare({**article, "url": "https://science.example.org/next/", "original": article["original"] + " New discovery."})
+    stamp[0] += 3600
+    with pytest.raises(AgentError, match="ARTICLE_DUPLICATE_SOURCE"):
+        value.prepare(article)
+    assert value.prepare({**article, "url": "https://science.example.org/next/",
+                          "original": article["original"] + " New discovery."})["state"] == "prepared"
+
+
+@pytest.mark.parametrize("phase", ["prepared", "orphaned_ledger", "remote", "dispatch"])
+def test_cancel_refuses_any_generated_or_external_state(cycle, phase):
+    value, core, article, _, calls, _, _ = cycle
+    prepared = value.prepare(article)
+    if phase == "remote":
+        core.stage_remote(prepared["variant_id"])
+    elif phase == "dispatch":
+        value.publish(prepared["id"], prepared["content_hash"])
+    ledger = value._load()
+    if phase != "prepared":
+        ledger["records"][0]["state"] = "needs_attention"
+        if phase == "orphaned_ledger":
+            ledger["records"][0].pop("variant_id")
+            ledger["records"][0].pop("prepared_hash")
+        value._save(ledger)
+    count = len(calls)
+    with pytest.raises(AgentError, match="ARTICLE_PREPARATION_NOT_CANCELLABLE|ARTICLE_PREPARATION_HAS_EXTERNAL_STATE"):
+        value.cancel_preparation(prepared["id"])
+    assert len(calls) == count
+
+
+def test_cancel_cannot_interrupt_active_locked_generation(cycle):
+    from max_postiz_agent.browser_runtime import profile_lock
+    value, _, article, _, _, _, _ = cycle
+    failed = failed_preparation(value, article)
+    with profile_lock(value.directory / "cycle.lock"):
+        with pytest.raises(AgentError, match="BROWSER_PROFILE_BUSY"):
+            value.cancel_preparation(failed["id"])
+    assert value._load()["records"][0]["state"] == "needs_attention"
+
+
+@pytest.mark.parametrize("rollover", ["generation", "transaction"])
+def test_preparation_crossing_hour_rolls_back_without_unusable_draft(cycle, monkeypatch, rollover):
+    value, core, article, records, calls, stamp, _ = cycle
+    if rollover == "generation":
+        class SlowQuality(Quality):
+            def prepare(self, *args):
+                result = super().prepare(*args)
+                stamp[0] += 3600
+                return result
+        value.quality_factory = SlowQuality
+    else:
+        original_history = core._history
+
+        def slow_history(*args):
+            original_history(*args)
+            stamp[0] += 3600
+
+        monkeypatch.setattr(core, "_history", slow_history)
+    reserved_slot = int(stamp[0] // 3600)
+    with pytest.raises(AgentError, match="ARTICLE_SLOT_EXPIRED"):
+        value.prepare(article)
+    record = value._load()["records"][0]
+    assert record["slot"] == reserved_slot and record["state"] == "needs_attention"
+    assert record["error"] == "ARTICLE_SLOT_EXPIRED" and not record.get("variant_id")
+    assert record["preparation_attempts"][-1]["error"] == "ARTICLE_SLOT_EXPIRED"
+    assert not records and not calls
+    with core.db.session() as session:
+        for model in (Story, Material, Draft, Variant, RemoteDraft, Dispatch, TargetApproval):
+            assert session.query(model).count() == 0
+    assert value.cancel_preparation(record["id"])["state"] == "cancelled"
+
+
+def test_abandon_expired_prepared_retains_history_without_external_operations(cycle):
+    value, core, article, records, calls, stamp, _ = cycle
+    prepared = value.prepare(article)
+    stamp[0] += 3600
+    with pytest.raises(AgentError, match="ARTICLE_SLOT_EXPIRED"):
+        value.publish(prepared["id"], prepared["content_hash"])
+    abandoned = value.abandon_prepared(prepared["id"], "Expired after an operator review")
+    assert abandoned["state"] == "cancelled" and abandoned["slot"] == prepared["slot"]
+    assert abandoned["variant_id"] == prepared["variant_id"]
+    assert abandoned["original_hash"] == prepared["original_hash"]
+    assert not calls and not records
+    with core.db.session() as session:
+        variant = session.get(Variant, prepared["variant_id"])
+        assert variant.state == "abandoned" and variant.revision == prepared["revision"] + 1
+        assert session.get(Draft, variant.draft_id).state == "article_rejected"
+        assert session.query(VariantRevision).count() == 2
+        assert session.query(Story).count() == session.query(Material).count() == 1
+        assert session.query(Dispatch).count() == session.query(RemoteDraft).count() == 0
+    with pytest.raises(AgentError, match="ARTICLE_DUPLICATE_SOURCE"):
+        value.prepare(article)
+    class DifferentQuality(Quality):
+        def prepare(self, *args):
+            result = super().prepare(*args)
+            result["translation"] += " Новая самостоятельная история."
+            result["body"] += " Новая самостоятельная история."
+            return result
+    value.quality_factory = DifferentQuality
+    assert value.prepare({**article, "url": "https://science.example.org/next/",
+                          "original": article["original"] + " New scientific story."})["state"] == "prepared"
+
+
+def test_abandon_keeps_consumed_slot_for_operator_rejected_text(cycle):
+    value, _, article, _, _, _, _ = cycle
+    prepared = value.prepare(article)
+    value.abandon_prepared(prepared["id"], "Operator rejected the translated text")
+    with pytest.raises(AgentError, match="ARTICLE_SLOT_ALREADY_CLAIMED"):
+        value.prepare({**article, "url": "https://science.example.org/another/"})
+
+
+@pytest.mark.parametrize("external", ["remote", "bridge", "dispatch", "mutation"])
+def test_abandon_refuses_any_existing_external_state(cycle, external):
+    value, core, article, _, _, _, _ = cycle
+    prepared = value.prepare(article)
+    if external == "dispatch":
+        value.publish(prepared["id"], prepared["content_hash"])
+    elif external == "remote":
+        core.stage_remote(prepared["variant_id"])
+    elif external in {"bridge", "mutation"}:
+        with core.db.session.begin() as session:
+            session.add(BridgePost(post_id="external-post", integration_id="integration-max",
+                group_id="external-group", target_id="max", variant_id=prepared["variant_id"] if external == "bridge" else "other-variant",
+                remote_hash="0" * 64, remote_state="DRAFT", due_at=now(),
+                mutation_owner="operator-lease" if external == "mutation" else None))
+    with pytest.raises(AgentError, match="ARTICLE_PREPARED_NOT_ABANDONABLE|ARTICLE_PREPARED_HAS_EXTERNAL_STATE"):
+        value.abandon_prepared(prepared["id"])
+    with core.db.session() as session:
+        assert session.get(Variant, prepared["variant_id"]).state != "abandoned"
+
+
+@pytest.mark.parametrize("changed", ["media", "sources", "target", "config", "binding", "metadata", "revision"])
+def test_delegated_approval_rejects_any_unreviewed_content_bearing_change(cycle, monkeypatch, changed):
+    value, core, article, _, calls, _, _ = cycle
+    prepared = value.prepare(article)
+    sync = core.bridge.sync
+
+    def changed_sync(*args, **kwargs):
+        result = sync(*args, **kwargs)
+        with core.db.session.begin() as session:
+            variant = session.get(Variant, prepared["variant_id"])
+            if changed == "media":
+                variant.media = [{"path": "data/injected.png", "sha256": "0" * 64, "mime": "image/png"}]
+            elif changed == "sources":
+                variant.sources = [{**variant.sources[0], "url": "https://science.example.org/injected/"}]
+            elif changed == "target":
+                session.get(Target, "max").destination = "-456"
+            elif changed == "config":
+                variant.config_hash = "0" * 64
+            elif changed == "binding":
+                variant.binding_hash = "0" * 64
+            elif changed == "metadata":
+                variant.metadata_json = {**variant.metadata_json, "rights_evidence": "unreviewed permission"}
+            else:
+                variant.revision += 1
+        return result
+
+    monkeypatch.setattr(core.bridge, "sync", changed_sync)
+    with pytest.raises(AgentError, match="ARTICLE_REMOTE_CHANGED"):
+        value.publish(prepared["id"], prepared["content_hash"])
+    assert len(calls) == 1
+    with core.db.session() as session:
+        assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 0
+
+
+def test_explicit_due_time_requires_full_two_minute_staging_window(cycle):
+    value, _, article, _, calls, stamp, _ = cycle
+    prepared = value.prepare(article)
+    with pytest.raises(AgentError, match="ARTICLE_SCHEDULE_INVALID"):
+        value.publish(prepared["id"], prepared["content_hash"], due_at=stamp[0] + 119)
+    assert not calls
+    assert value.publish(prepared["id"], prepared["content_hash"], due_at=stamp[0] + 120)["state"] == "pending"
+
+
+class CandidateQuality(Quality):
+    def check_candidate(self, title, body, original_title, original, url):
+        translation = title + "\n\n" + body
+        return {"title": title, "body": translation + "\n\nИсточник: " + url,
+                "translation": translation, "original": original_title + "\n\n" + original,
+                "url": url, "topic": "science"}
+
+
+def test_editorial_correction_rechecks_and_preserves_identity_with_coherent_revisions(cycle):
+    value, core, article, records, calls, _, _ = cycle
+    prepared = value.prepare(article)
+    value.quality_factory = CandidateQuality
+    correction = {"title": "Наблюдения за звёздным ветром", "body": "Исследователи изучили атмосферу далёкой звезды и уточнили свойства звёздного ветра."}
+    revised = value.revise_prepared(prepared["id"], correction)
+    assert revised["state"] == "prepared" and revised["correction_blocked"] is False
+    assert revised["id"] == prepared["id"] and revised["variant_id"] == prepared["variant_id"]
+    assert revised["content_hash"] != prepared["content_hash"]
+    assert revised["original_hash"] == prepared["original_hash"] and revised["slot"] == prepared["slot"]
+    assert correction["body"] in revised["body"] and article["url"] in revised["body"]
+    assert not calls and not records
+    with core.db.session() as session:
+        variant = session.get(Variant, revised["variant_id"])
+        draft = session.get(Draft, variant.draft_id)
+        material = session.get(Material, variant.sources[0]["id"])
+        assert material.text == article["original"] and material.url == article["url"]
+        assert variant.revision == draft.revision == variant.source_revision == 2
+        assert draft.current["body"] == variant.body
+        assert session.query(VariantRevision).count() == 2
+        assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 0
+        assert session.scalar(select(Audit).where(Audit.action == "hourly_article_revised_prepared"))
+    with pytest.raises(AgentError, match="ARTICLE_REVIEW_HASH_MISMATCH"):
+        value.publish(revised["id"], prepared["content_hash"])
+    assert value.publish(revised["id"], revised["content_hash"])["state"] == "pending"
+
+
+def test_rejected_editorial_correction_keeps_original_but_blocks_publication_until_rechecked(cycle):
+    value, _, article, _, calls, _, _ = cycle
+    prepared = value.prepare(article)
+    class RejectedCandidate(CandidateQuality):
+        def check_candidate(self, *args):
+            raise AgentError("ARTICLE_QUALITY_REJECTED")
+    value.quality_factory = RejectedCandidate
+    correction = {"title": "Новый заголовок", "body": "Исправленный текст о звёздном ветре и свойствах атмосферы далёкой звезды."}
+    with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+        value.revise_prepared(prepared["id"], correction)
+    rejected = value.status(prepared["id"])
+    assert rejected["body"] == prepared["body"] and rejected["content_hash"] == prepared["content_hash"]
+    assert rejected["correction_blocked"] and rejected["correction_attempts"][-1]["state"] == "rejected"
+    with pytest.raises(AgentError, match="ARTICLE_RECONCILIATION_REQUIRED"):
+        value.publish(prepared["id"], prepared["content_hash"])
+    value.quality_factory = CandidateQuality
+    revised = value.revise_prepared(prepared["id"], correction)
+    assert revised["correction_blocked"] is False and len(revised["correction_attempts"]) == 2
+    assert not calls
+
+
+@pytest.mark.parametrize("external", ["remote", "dispatch", "mutation"])
+def test_editorial_correction_refuses_existing_external_state_before_check(cycle, external):
+    value, core, article, _, calls, _, _ = cycle
+    prepared = value.prepare(article)
+    checked = []
+    class SpyQuality(CandidateQuality):
+        def check_candidate(self, *args):
+            checked.append(args)
+            return super().check_candidate(*args)
+    value.quality_factory = SpyQuality
+    if external == "remote":
+        core.stage_remote(prepared["variant_id"])
+    elif external == "dispatch":
+        value.publish(prepared["id"], prepared["content_hash"])
+    else:
+        with core.db.session.begin() as session:
+            session.add(BridgePost(post_id="external-edit", integration_id="integration-max", group_id="group-other",
+                target_id="max", variant_id="other-variant", remote_hash="0" * 64, remote_state="DRAFT",
+                due_at=now(), mutation_owner="operator-lease"))
+    count = len(calls)
+    with pytest.raises(AgentError, match="ARTICLE_CORRECTION_NOT_ALLOWED|ARTICLE_PREPARED_HAS_EXTERNAL_STATE"):
+        value.revise_prepared(prepared["id"], {"title": "Правка", "body": "Корректный русский текст."})
+    assert not checked and len(calls) == count
+
+
+def test_editorial_correction_expiry_and_duplicate_do_not_mutate_prior_version(cycle):
+    value, core, article, _, calls, stamp, _ = cycle
+    prepared = value.prepare(article)
+    correction = {"title": "Исправленный заголовок", "body": "Уточнённая история о наблюдениях учёных за звёздным ветром."}
+    value.quality_factory = CandidateQuality
+    ledger = value._load()
+    ledger["records"].append({"id": "earlier", "slot": prepared["slot"] - 1, "state": "cancelled",
+                              "translation_hash": text_hash(correction["title"] + "\n\n" + correction["body"])})
+    value._save(ledger)
+    with pytest.raises(AgentError, match="ARTICLE_DUPLICATE_TRANSLATION"):
+        value.revise_prepared(prepared["id"], correction)
+    class SlowCandidate(CandidateQuality):
+        def check_candidate(self, *args):
+            result = super().check_candidate(*args)
+            stamp[0] += 3600
+            return result
+    value.quality_factory = SlowCandidate
+    with pytest.raises(AgentError, match="ARTICLE_SLOT_EXPIRED"):
+        value.revise_prepared(prepared["id"], {**correction, "body": correction["body"] + " Новый самостоятельный текст."})
+    with core.db.session() as session:
+        variant = session.get(Variant, prepared["variant_id"])
+        assert variant.revision == 1 and variant.body == prepared["body"]
+        assert session.get(Draft, variant.draft_id).revision == 1
+    assert not calls
+    assert value.abandon_prepared(prepared["id"])["state"] == "cancelled"
+
+
+def test_operator_candidate_requires_existing_failed_pre_draft_retry(cycle):
+    value, _, article, _, calls, _, _ = cycle
+    candidate = {"title": "Проверенный русский заголовок", "body": "Проверенный русский текст о свойствах атмосферы и звёздного ветра."}
+    with pytest.raises(AgentError, match="ARTICLE_CANDIDATE_RETRY_REQUIRED"):
+        value.prepare(article, candidate=candidate)
+    assert not value._load()["records"] and not calls
+
+
+def test_operator_candidate_retry_checks_original_without_retranslating(cycle):
+    value, core, article, records, calls, _, _ = cycle
+    failed = failed_preparation(value, article)
+    checks = []
+    class CheckOnly(CandidateQuality):
+        def prepare(self, *args):
+            pytest.fail("A supplied operator candidate must not be translated again")
+
+        def check_candidate(self, *args):
+            checks.append(args)
+            return super().check_candidate(*args)
+    value.quality_factory = CheckOnly
+    candidate = {"title": "Уточнённый звёздный ветер", "body": "Исследователи уточнили особенности атмосферы далёкой звезды и свойства звёздного ветра."}
+    result = value.prepare(article, retry_record=failed["id"], candidate=candidate)
+    assert result["state"] == "prepared" and result["id"] == failed["id"] and result["slot"] == failed["slot"]
+    assert result["original_hash"] == failed["original_hash"] and result["input_hash"] == failed["input_hash"]
+    assert checks == [(candidate["title"], candidate["body"], article["title"], article["original"], article["url"])]
+    attempt = result["preparation_attempts"][-1]
+    assert attempt["operator_retry"] and attempt["operator_correction"]
+    assert attempt["candidate_hash"] == fingerprint(candidate)
+    assert not records and not calls
+    with core.db.session() as session:
+        variant = session.get(Variant, result["variant_id"])
+        assert variant.metadata_json["quality"] == "operator_ministral_languagetool"
+        assert variant.metadata_json["operator_correction_hash"] == fingerprint(candidate)
+        assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 0
+        events = list(session.scalars(select(Audit).where(Audit.action == "hourly_article_prepare_attempt")))
+        assert any(event.details.get("operator_correction") and event.details.get("candidate_hash") == fingerprint(candidate) for event in events)
+
+
+def test_operator_candidate_rejection_keeps_slot_without_draft_or_automatic_retry(cycle):
+    value, core, article, _, calls, _, _ = cycle
+    failed = failed_preparation(value, article)
+    checks = []
+    class Rejected(CandidateQuality):
+        def check_candidate(self, *args):
+            checks.append(args)
+            raise AgentError("TRANSLATION_NUMBER_CHANGED")
+    value.quality_factory = Rejected
+    with pytest.raises(AgentError, match="TRANSLATION_NUMBER_CHANGED"):
+        value.prepare(article, retry_record=failed["id"], candidate={"title": "Правка", "body": "Неверный русский текст."})
+    record = value._load()["records"][0]
+    assert len(checks) == 1 and record["state"] == "needs_attention" and not record.get("variant_id")
+    assert record["id"] == failed["id"] and record["slot"] == failed["slot"]
+    assert len(record["preparation_attempts"]) == 2
+    assert record["preparation_attempts"][-1]["error"] == "TRANSLATION_NUMBER_CHANGED"
+    assert not calls
+    with core.db.session() as session:
+        assert session.query(Draft).count() == session.query(Variant).count() == 0
+
+
+@pytest.mark.parametrize("phase", ["prepared", "remote", "dispatch"])
+def test_operator_candidate_never_retries_generated_or_external_records(cycle, phase):
+    value, core, article, _, calls, _, _ = cycle
+    prepared = value.prepare(article)
+    if phase == "remote":
+        core.stage_remote(prepared["variant_id"])
+    elif phase == "dispatch":
+        value.publish(prepared["id"], prepared["content_hash"])
+    count = len(calls)
+    with pytest.raises(AgentError, match="ARTICLE_RETRY_NOT_SAFE|ARTICLE_OUTSTANDING_DELIVERY"):
+        value.prepare(article, retry_record=prepared["id"], candidate={"title": "Правка", "body": "Русский текст."})
+    assert len(calls) == count
