@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "target_id": "max_test",
+  "source_id": "nasa_svs_articles",
+  "allowed_hosts": ["svs.gsfc.nasa.gov"],
+  "rights_evidence": "https://svs.gsfc.nasa.gov/help/",
+  "owner_instruction": "Replace with the actual owner delegation before enabling",
+  "min_gap_seconds": 3600,
+  "max_per_day": 24
+}

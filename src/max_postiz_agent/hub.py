@@ -422,13 +422,20 @@ class HubService(Service):
                 s.add(DispatchAttempt(dispatch_id=row.id, result=row.state, error=error))
         return completed
 
-    def stage_remote(self, variant_id):
+    def stage_remote(self, variant_id, due_at=None):
+        if due_at is not None and (
+            not isinstance(due_at, (int, float)) or isinstance(due_at, bool)
+            or not math.isfinite(due_at) or due_at < 0
+        ):
+            raise AgentError("SCHEDULE_INVALID")
         with self.db.session.begin() as s:
             v = self._variant(s, variant_id, True)
             t = self._target(s, v.target_id)
             bridge_target = t.route == "max_browser" and self.bridge.enabled and t.options.get("postiz_integration_id")
             if t.route != "postiz" and not bridge_target:
                 raise AgentError("TARGET_NOT_POSTIZ")
+            if due_at is not None and not bridge_target:
+                raise AgentError("BRIDGE_SCHEDULE_REQUIRED")
             link = s.get(RemoteDraft, v.id)
             if link:
                 raise AgentError("REMOTE_DRAFT_ALREADY_TRACKED", 409)
@@ -443,7 +450,8 @@ class HubService(Service):
                                                 options={"settings": {"hub_variant_id": v.id, "hub_correlation": link.correlation}})
             else:
                 remote_target = t
-            ident = self.postiz.create(remote_target, v.body, media)
+            ident = self.postiz.create(remote_target, v.body, media,
+                                       "draft" if due_at is None else "schedule", due_at)
         except AgentError:
             with self.db.session.begin() as s:
                 s.get(RemoteDraft, variant_id).state = "unknown"

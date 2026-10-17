@@ -424,6 +424,8 @@ class Service:
         with self.db.session.begin() as session:
             # Последовательно обрабатываем элементы: self.settings.sources['sources'].
             for source in self.settings.sources["sources"]:
+                if source.get("collection_mode", "scheduled") == "manual":
+                    continue
                 cursor = session.get(Cursor, source["id"])
                 # Обрабатываем ветвь при условии: not source['enabled'] or cursor.next_due > now().
                 if not source["enabled"] or cursor.next_due > now():

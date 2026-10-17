@@ -46,6 +46,12 @@
         "rights"
       ],
       "properties": {
+        "collection_mode": {
+          "enum": [
+            "manual",
+            "scheduled"
+          ]
+        },
         "purpose": {
           "enum": [
             "ideas",
