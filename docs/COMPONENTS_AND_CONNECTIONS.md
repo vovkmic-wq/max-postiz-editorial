@@ -1,0 +1,351 @@
+# Паспорт компонентов и подключений MAX–Postiz
+
+Снимок установки: **18 октября 2026, Europe/Moscow**. Редакционная VM
+проверена в 03:41–03:42 МСК; инфраструктура и модели — в ходе того же аудита.
+Версия исходников Python-пакета — **0.6.7**. Этот документ описывает
+действующую Linux-установку; более ранние датированные отчёты описывают
+состояние на момент своих проверок.
+
+Версии ниже разделены на прочитанные в работающей установке, указанные в
+deployment-файлах и непроверенные. Пароли, токены, cookies, приватные ключи
+и содержимое рабочих БД сюда не включены. IP, порты, имена компонентов и
+пути приведены для понимания подключений и восстановления.
+
+## 1. Узлы и размещение
+
+| Узел | Адрес и доступ | Назначение | Версия / состояние на момент аудита |
+|---|---|---|---|
+| Физический Proxmox `pve` | `https://10.20.30.142:8006/`, SSH `10.20.30.142:22` | Гипервизор VM 109 и 112 | Proxmox VE meta **8.4.0**, manager **8.4.21**, Debian **12**, kernel **6.8.12-43-pve** |
+| VM 109 | `10.20.30.95` | Общий API моделей, router и Qwen | Ubuntu **24.04.5 LTS**, kernel **6.8.0-147-generic**, 6 vCPU / 12 GiB RAM, running |
+| VM 112 `max-postiz-editorial` | `10.20.30.45`, SSH `:22`; проект `/opt/max-postiz` | Агент, Postiz, БД, OpenCode, LanguageTool, браузер MAX | Ubuntu **24.04.5 LTS**, kernel **6.8.0-147-generic**, 4 vCPU / 10 GiB RAM |
+| Отдельный GPU-сервер | `10.20.30.143` | Backend Ministral; не является VM на этом Proxmox | Ministral API доступен; OS/kernel этим аудитом не установлены, inference build указан ниже |
+| Keenetic / LAN | `10.20.30.254`, сеть `10.20.30.0/24` | Маршрутизация и существующий удалённый доступ владельца | Точный номер прошивки этим аудитом не проверен |
+| Компьютер владельца | Windows, проект `C:\script\20261011-Max postiz` | Git, исходники, диагностика и автоматизация Codex | Не является основным Linux worker |
+
+VM 109 имеет `onboot=1`, порядок запуска `order=10,up=90`; VM 112 —
+`onboot=1`, `order=20,up=30`. Последняя загрузка Proxmox 18 октября
+подтвердила автоматический запуск этих гостей. VM 110 — выключенный резерв;
+его не нужно включать для текстовой публикации.
+
+Панели доступны из LAN и через существующий WireGuard владельца
+(`10.77.0.2`). HTTP-адреса панелей рассчитаны на эту частную сеть;
+отдельная публичная HTTPS-публикация и проброс из интернета не настроены.
+Пароли панелей и ключи SSH хранятся отдельно от Git.
+
+## 2. Цепочка обработки и публикации
+
+```mermaid
+flowchart TD
+    S["Источники: NASA SVS / RSS / HTML / JSON API / ручной ввод"] --> C["Сборщики и архив"]
+    C --> H["Редакционный агент и PostgreSQL Hub"]
+    H --> O["OpenCode :4108"]
+    O --> R["Общий LLM API 10.20.30.95:8083/v1"]
+    R --> Q["Qwen: перевод"]
+    R --> M["Ministral: независимая проверка"]
+    Q --> H
+    M --> H
+    H <--> L["LanguageTool :8010"]
+    H <--> P["Postiz: редактор и календарь"]
+    P --> B["Provider max-browser и bridge агента"]
+    B --> A["Проверка согласования точной версии"]
+    A --> W["Существующий worker и Chrome"]
+    W --> X["Публичный канал MAX"]
+```
+
+1. Сборщики читают разрешённые RSS, HTML или JSON API. Они сохраняют
+   исходный текст, URL, дату, hash и историю; повторные материалы отсеиваются.
+   В текущей почасовой серии оператор выбирает один текст NASA SVS,
+   `fetch_nasa_article.py` получает его narrative-часть, общий фоновый
+   сборщик для этого источника не запускается.
+2. PostgreSQL Hub хранит материалы, черновики, варианты, согласования,
+   попытки доставки и аудит. Raw-файлы, медиа и журнал почасовых слотов
+   находятся отдельно в `data/`.
+3. Агент вызывает локальный OpenCode. Qwen переводит, другой backend
+   Ministral проверяет смысл и тему, LanguageTool проверяет русский язык.
+   Итоговый текст дополнительно сравнивается с оригиналом по правилам
+   [почасового сценария](HOURLY_ARTICLE_TESTS.md).
+4. Postiz хранит редакторскую версию и дату в календаре. Сохранение или
+   постановка в очередь сами по себе не согласуют текст. Собственный
+   `max-browser` связывает запись Postiz с вариантом в нашем агенте.
+5. Агент проверяет hash, адресата, дату и разрешение. Уже работающий worker
+   использует авторизованный профиль Chrome и отправляет сообщение в MAX.
+   Успех требует verified dispatch, Postiz `PUBLISHED` и фактического
+   точного текста в канале. `pending`, `owner_attested` или доступ к каналу
+   не доказывают доставку.
+
+В этом процессе **OpenCode** исполняет вызовы локальных моделей.
+**Codex** на компьютере владельца выполняет делегированный выбор статьи,
+редакторскую сверку, запуск отдельных фаз и контроль результата; это разные
+компоненты. Один запущенный Hub уже содержит worker, дополнительный worker
+для почасового теста не нужен.
+
+## 3. Проверенные версии редакционной VM
+
+Версионные команды и выборочные сведения `docker inspect` выполнены
+18 октября в 03:41–03:42 МСК без изменения runtime.
+
+| Компонент | Прочитанная версия | Роль |
+|---|---|---|
+| Исходники `max-postiz-agent` | **0.6.7** из `__version__` | Агент, API, сборщики, согласования и worker |
+| Python system / `.venv` | **3.12.3 / 3.12.3** | Выполнение Python-кода |
+| Node.js / npm | **22.23.3 / 10.9.9** | Запуск и установка OpenCode, инструменты сборки |
+| OpenCode CLI и npm-пакет | **2.0.17 / 2.0.17** | Локальный runtime LLM |
+| Docker client / server | **29.9.0 / 29.9.0** | Контейнеры инфраструктуры |
+| Docker Compose | **5.6.0** | Объединение compose-файлов |
+| nginx | **1.24.0**, Ubuntu build | LAN reverse proxy и защищённый owner-browser |
+| Google Chrome | **155.0.8059.79** | Авторизация и браузерная доставка MAX |
+| Playwright | **1.63.0** | Управление штатным Chrome |
+| OpenJDK | **21.0.12.1** | Runtime LanguageTool |
+| LanguageTool server JAR | **6.6** | Проверка русского текста |
+| FastAPI / Uvicorn | **0.142.2 / 0.54.0** | HTTP API и сервер Hub |
+| SQLAlchemy / Alembic | **2.0.54 / 1.20.0** | PostgreSQL ORM и миграции |
+| psycopg / psycopg-binary | **3.3.6 / 3.3.6** | Драйвер PostgreSQL |
+| HTTPX | **0.28.1** | HTTP-клиент интеграций |
+| feedparser / beautifulsoup4 | **6.0.14 / 4.15.0** | RSS и HTML |
+| Pydantic / cryptography / Pillow | **2.13.5 / 49.0.0 / 12.3.0** | Валидация, шифрование backup, обработка изображений |
+
+Установленная distribution metadata `max-postiz-agent` в VM всё ещё
+показывает **0.6.0**, хотя в исходниках указан `__version__=0.6.7`. Это
+зафиксированное расхождение метаданных установки; переустановка пакета в
+рамках документирования не выполнялась. `package.json` нашего npm-wrapper
+с версией `0.2.0` также не является версией Python-проекта или OpenCode.
+`pytest` и `ruff` в рабочей `.venv` VM не установлены; тестовые инструменты
+есть в среде разработки.
+
+Списки зависимостей сохранены в [requirements.lock](../requirements.lock),
+[requirements-browser.lock](../requirements-browser.lock),
+[requirements-images.lock](../requirements-images.lock) и отдельных dev/
+deployment lock-файлах. OpenCode закреплён в
+[package-lock.json](../package-lock.json). Lock-файлы относятся к пакетам;
+они не фиксируют версии всех системных apt-пакетов и внешних серверов.
+
+### Postiz и контейнеры
+
+| Компонент / контейнер | Версия или идентификатор | Подключение |
+|---|---|---|
+| Postiz с MAX provider, `max-postiz-postiz-1` | Фактический локальный tag **`max-postiz-linux:0.5.0`**; историческая upstream-база **2.25.1**, seed **`max-postiz-browser:0.4.0`** | nginx `:4007` → host loopback `:14007` → container `:5000` |
+| Hub PostgreSQL | Server **17.11** | VM loopback `127.0.0.1:55438` → container `:5432`, БД `editorial_hub` |
+| Postiz PostgreSQL | Server **17.11** | Только Docker `postiz-postgres:5432`, БД `postiz-db-local` |
+| Redis | **7.2.16** | Только Docker `postiz-redis:6379` |
+| Temporal server | **1.28.1** | Docker `temporal:7233`, также host loopback `:7233` |
+| Temporal PostgreSQL | Server **16.15** | Только Docker `temporal-postgresql:5432` |
+| Temporal Elasticsearch | **7.17.27**, JVM **22.0.2** | Только Docker `temporal-elasticsearch:9200` |
+| Temporal UI | В compose заявлена **2.34.0**; фактически выбран закреплённый image digest | Host loopback `127.0.0.1:8088` → container `:8080` |
+| Temporal admin tools | В compose заявлены server-tools **1.28.1**, tctl **1.18.4**, CLI **1.4.1**; фактически выбран закреплённый image digest | Внутренняя сеть Temporal, host port отсутствует |
+
+При аудите все **9 контейнеров running**; **8 healthy**. У admin-tools
+healthcheck не задан, поэтому ему не присваивается выдуманный статус healthy.
+Версии UI/admin-tools из таблицы относятся к декларации compose; отдельная
+версионная команда UI не подтвердилась, поскольку Node в UI image отсутствует.
+
+У текущего Postiz `package.json.version` возвращает `1.0.0`; это metadata
+монорепозитория, а не независимое подтверждение product release 2.25.1.
+Происхождение upstream и патчей описано в
+[source-manifest.json](../deployment/postiz-max/source-manifest.json).
+Фактический image ID работающего custom Postiz:
+
+```text
+sha256:7940324a4e3d4f7193826b90679dfba192689b335fb9d8c53071277d01fb82e9
+```
+
+Порядок compose: [базовый](../deployment/postiz/compose.yaml) →
+[images.lock](../deployment/postiz/images.lock.yaml) →
+[MAX bridge](../deployment/postiz-max/compose.bridge.yaml) →
+[Linux override](../deployment/linux/compose.yaml). Последний override
+заменяет upstream Postiz digest локальным custom tag. Поэтому утверждение
+«все итоговые образы закреплены upstream digest» неверно: инфраструктура
+закреплена, а для custom Postiz нужны сохранённый image и цепочка сборки.
+
+## 4. Модели и их подключения
+
+Агент обращается к OpenCode `http://127.0.0.1:4108` **внутри VM 112**.
+OpenCode использует provider `proxmox` и общий OpenAI-compatible API
+**`http://10.20.30.95:8083/v1`**.
+
+| Назначение | ID в OpenCode | ID общего API | Размещение backend |
+|---|---|---|---|
+| Основной переводчик | `proxmox/qwen35-9b` | `qwen35-9b` | VM 109, внутренний `http://127.0.0.1:8080`; Qwen3.5-9B-abliterated Q4_K_M |
+| Независимый редактор | `proxmox/qwen25-coder-7b` | `qwen25-coder-7b`, также каталог содержит `ministral3-8b` | Отдельный GPU-узел `http://10.20.30.143:8086`, backend alias `ministral3-8b-abliterated-k2200` |
+
+`qwen25-coder-7b` здесь является сохранённым совместимым именем для
+**Ministral 3 8B**, а не доказательством работы Qwen Coder 7B. Не заменять
+его по одному названию и не возвращать прежние LLM endpoint/model из MAX.
+
+Qwen обслуживает llama.cpp **0.5.0-dev**, build **1**, commit **a97cce8**
+(полный commit `a97cce86a8addeb9f40cba7a261c94b1f0c576cb`). В running
+параметрах этого backend проверены контекст 16384, 6 threads и 16 GPU layers.
+HTTP `/props` Ministral сообщает **build_info=b1-a97cce8**; полный commit,
+OS и kernel отдельного GPU-сервера этим доступом не установлены.
+
+Router в VM 109 работает на Python **3.12.3**; отдельная версия приложения
+не установлена. SHA-256 прочитанного router source:
+
+```text
+8937473d340b44631801554c8abee83ecf814eac7e203dc04973a6e3a80b719d
+```
+
+`127.0.0.1:8080` выше — только фактический **внутренний backend VM 109**.
+Клиентская конфигурация проекта остаётся на **10.20.30.95:8083/v1**;
+переносить клиент на прежний MAX endpoint нельзя. Службы VM 109 —
+`model-router.service` и `llama-server@qwen35-9b.service`. GPU-проверка
+выполнена через существующий ограниченный доступ и HTTP metadata, без
+расширения прав или запуска второго сервера.
+
+Проверенные параметры текущего article-профиля OpenCode:
+
+| Модель | `max_tokens` | `temperature` | Дополнительно |
+|---|---|---|---|
+| Qwen | 2048 | 0.2 | `chat_template_kwargs.enable_thinking=false` |
+| Ministral | 512 | 0 | Независимый backend проверки |
+
+Параметры читаются из private `data/opencode-runtime/opencode.json`.
+Схема их безопасного применения с backup есть в
+[`configure_article_models.py`](../scripts/configure_article_models.py).
+Модель не получает права самостоятельно менять адресатов или отправлять
+посты. Контекстные лимиты из примера конфигурации не следует выдавать за
+измерение ёмкости работающего inference backend.
+
+## 5. Карта сетевых подключений
+
+`127.0.0.1` в этой таблице означает loopback **указанного сервера**;
+открытие такого адреса на компьютере владельца обращается к другому узлу.
+
+| Откуда → куда | Адрес / протокол | Область и назначение |
+|---|---|---|
+| Владелец → панель агента | `http://10.20.30.45:8090/hub` | LAN/VPN, nginx → Hub `127.0.0.1:8091` |
+| Владелец → Postiz | `http://10.20.30.45:4007/` | LAN/VPN, nginx → `127.0.0.1:14007` |
+| Владелец → вход MAX | `http://10.20.30.45:8090/api/owner-browser/vnc.html?autoconnect=1&resize=scale&path=api/owner-browser/websockify` | Через owner-сессию Hub; далее noVNC, не прямой публичный VNC |
+| Hub → Postiz Public API | `http://127.0.0.1:14007/api/public/v1` | Loopback VM 112; ключ хранится отдельно |
+| Postiz container → bridge Hub | `http://host.docker.internal:8091/api/max-bridge` | Host gateway Docker; bridge key не заменяет согласование |
+| Hub backend | `0.0.0.0:8091` | Фактически слушает все интерфейсы; доступ ограничивается firewall для локального proxy и Docker, это не loopback listener |
+| Агент → OpenCode | `http://127.0.0.1:4108` | Loopback VM 112, авторизация приложения отдельно |
+| OpenCode → model router | `http://10.20.30.95:8083/v1` | LAN, `/models`, `/chat/completions` |
+| Агент → LanguageTool | `http://127.0.0.1:8010` | Loopback VM 112, HTTP `/v2/check` |
+| Hub → PostgreSQL Hub | `127.0.0.1:55438` | Только VM 112; URI с паролем находится в `.env.local` |
+| Postiz → свои БД/Redis/Temporal | Docker DNS имена из раздела 3 | Отдельные compose-сети `postiz-network` / `temporal-network` |
+| Владелец через SSH tunnel → Temporal UI | `http://127.0.0.1:8088` на VM 112 | Диагностика workflow; в LAN напрямую не опубликован |
+| noVNC → VNC → Xvfb | `127.0.0.1:6080` → `127.0.0.1:5900` → display `:99` | Приватный экран owner-browser, Xvfb без TCP listener |
+| Chrome worker → MAX | `https://web.max.ru`, канал `https://max.ru/channel_neurovideo_max` | Авторизованный пользовательский профиль, исходящий HTTPS |
+| Fetch helper → NASA SVS | `https://svs.gsfc.nasa.gov` | Исходящий HTTPS, проверка прав каждого материала, без скачивания медиа в этой серии |
+| Workstation → Proxmox/VM | SSH `:22`, PVE HTTPS `:8006` | Проверка закреплённых host keys, ключи/пароли отдельно от Git |
+
+Обычный `ss` также показывает nginx `:80` и системные DNS/SSH listeners;
+это не дополнительные адреса редакторской панели. Полный `docker inspect`,
+`docker compose config` с подставленными env и process environment не нужны
+для чтения этого паспорта и могут раскрыть секреты.
+
+## 6. Источники, адресаты и автоматизация
+
+| Элемент | Текущее назначение и пределы |
+|---|---|
+| NASA SVS / `nasa_svs_articles` | Разрешённый начальный источник почасовых тестов; полный текст выбирается отдельно, права проверяются на странице и в NASA SVS help |
+| `max_test` | Тестовый адресат MAX, channel ID `-79860712657053`, публичный URL `https://max.ru/channel_neurovideo_max`; provider `max-browser`, Bot API token не используется |
+| Пикабу `pikabu_neuro_images` | Привязанный профиль, ручной экспорт и attestation; не входит в почасовой автотест |
+| `pikabu_main` | Без адресата, выключен |
+| Telegram / VK | Выключены; данным почасовым поручением не включаются |
+| Reddit API | Код клиента и заявки есть; подтверждённое одобрение доступа и разрешения на переводы/внешнее распространение отсутствуют, активного Reddit API сбора нет |
+| Reddit manual / IFTTT Gmail intake | Код альтернативного приёма есть; живое подключение IFTTT не подтверждено, не подменяет разрешение источника |
+| Reddit «10 постов каждые 4 часа» | Спецификация будущего профиля, выключена; не является текущим расписанием NASA |
+| Vezdepost | Исторически изученный вариант; не установлен в действующей цепочке |
+
+На момент аудита private hourly policy включена для `max_test`, разрешает
+только `svs.gsfc.nasa.gov`, `min_gap_seconds=3600`, `max_per_day=24`.
+Между подтверждёнными публикациями адресат возвращается на паузу; это не
+отключает само делегированное почасовое поручение.
+
+Codex heartbeat `max-postiz` активен на компьютере владельца, номинально раз
+в час на 40-й минуте; фактический запуск может задерживаться. Доставка
+дополнительно ограничена журналом слотов и интервалом после последней
+фактической публикации. Пропущенные часы не догоняются. Desktop heartbeat
+не является daemon внутри VM: без работающей среды Codex выбор и проверка
+следующей статьи этой автоматизацией не выполняются.
+
+Фактические scheduler settings и prompt находятся вне репозитория, в
+`$CODEX_HOME/automations/max-postiz/automation.toml`. Сохранённая инструкция
+сценария — [prompts/HOURLY_ARTICLE_TESTS.md](../prompts/HOURLY_ARTICLE_TESTS.md),
+процедура — [docs/HOURLY_ARTICLE_TESTS.md](HOURLY_ARTICLE_TESTS.md), полномочия
+— [AGENTS.md](../AGENTS.md). Исходный
+[IMPLEMENTATION_PROMPT.md](../prompts/IMPLEMENTATION_PROMPT.md) описывает
+начальное задание, а не актуальный снимок каждого сервера.
+
+## 7. Файлы настроек, данные и внешние компоненты
+
+| Путь относительно `/opt/max-postiz`, если не указано иначе | Содержимое / способ подключения | В Git |
+|---|---|---|
+| `config/app.json`, `config/sources.json`, `config/publishing.json` | Реальные настройки runtime, источников и адресатов | Нет; примеры и схемы есть |
+| `.env.local` | Именованные настройки подключения БД, Postiz, OpenCode, авторизации и backup | Нет; `.env.example` есть |
+| `deployment/postiz/.env` | Compose credentials и public origin | Нет; пример есть |
+| `data/opencode-runtime/opencode.json` | Реальный provider, модели и article-профиль | Нет; пример и configurator есть |
+| `data/hourly-article-policy.local.json` | Включённая делегированная политика и её аудит | Нет; пример есть |
+| `data/hourly-articles/ledger.local.json` | Занятые слоты, URL/hash, подготовка и результат каждой статьи | Нет; удалять для повторной отправки нельзя |
+| `data/max-browser/` | Авторизованный профиль Chrome | Нет; повторный вход владельца может потребоваться |
+| `data/archive/`, `data/media/`, `data/backups/` | Исходные материалы, файлы, закрытые резервные копии | Нет |
+| Docker named volumes | Hub/Postiz/Temporal PostgreSQL, Redis, Elasticsearch, Postiz uploads/config | Нет |
+| `/etc/systemd/system/max-postiz-*.service`, nginx config | Запуск и proxy | Исходные шаблоны в `deployment/linux/` |
+| `/usr/local/sbin/max-postiz-eno1-tso`, systemd unit на PVE | Закреплённая проверка NIC и TSO off | Исходники в `deployment/proxmox/` |
+| `$CODEX_HOME/automations/max-postiz/automation.toml` на workstation | Активная desktop-автоматизация | Нет; человекочитаемое описание выше |
+
+Для текстовой цепочки не нужны ComfyUI, генерация изображений или видео.
+Их адаптеры и примеры сохранены как опциональные компоненты:
+`config/comfy/`, `deployment/comfy/`, `image_pipeline.py`, `video_tools.py`.
+Отдельный CT 111 ComfyUI упомянут в [STARTUP_AND_HEALTH.md](STARTUP_AND_HEALTH.md);
+его адрес, версия и состояние в данном аудите не проверялись. В опциональном
+примере Wan bridge указан `http://10.20.30.95:8190`; это декларация примера,
+а не подтверждение работающей генерации в текущей текстовой цепочке. Openverse,
+локальные image/video weights и workflow также не считаются подключёнными
+лишь по наличию кода. Docker Desktop на Windows относится к резервной/
+разработческой установке и не нужен работающему Docker Engine VM 112.
+
+## 8. Автозапуск, проверки и восстановление
+
+В VM включены Docker, nginx, `max-postiz-hub`, `max-postiz-opencode`,
+`max-postiz-spelling`, display/VNC/noVNC. Службы проекта используют
+`Restart=always`, основные контейнеры — `restart: always`. Отдельная
+`max-postiz-login.service` для интерактивного входа не включена автоматически.
+После перезагрузки проверяют и сервисы, и действительность сессии MAX.
+
+На PVE в 03:31 МСК применён `max-postiz-eno1-tso.service`: TSO физического
+Intel I219-V `eno1` выключен. Unit enabled/active, запускается до pve-guests,
+сверяет конкретный host/NIC и не перезапускает сеть. Подробности, границы
+меры и откат — [E1000E_RECOVERY.md](E1000E_RECOVERY.md). Долговременная
+устойчивость и следующая загрузка с этим новым unit ещё не доказаны.
+Независимого аппаратного управления питанием этим изменением не добавлено.
+
+Проверки без вывода секретов:
+
+```powershell
+# Workstation, из корня проекта: TCP, затем глубокая проверка через SSH.
+.\.venv\Scripts\python.exe scripts/check-network.py --output data/network-check.local.json
+.\scripts\check-startup.ps1 -Deep
+```
+
+```sh
+# Внутри VM 112; короткие реальные запросы обеим моделям только с --deep.
+cd /opt/max-postiz
+.venv/bin/python deployment/linux/check-stack.py --deep
+# Только проверка корректности compose; без раскрытия подставленных env.
+sudo bash deployment/linux/postiz.sh config --quiet
+```
+
+В предыдущей проверке после восстановления 18 октября пройдены 27/27 deep
+checks с реальными ответами моделей. Аудит этого паспорта читает версии и
+подключения; новых публикаций и inference для него не запускали. Наличие
+HTTP 200 или healthy-контейнеров само по себе не подтверждает публикацию.
+
+Для восстановления нужны исходники, приватные настройки и резервные копии
+данных, сохранённый custom image Postiz и доступный LLM-сервер. Один clone
+репозитория не переносит cookies, БД, веса моделей или desktop scheduler.
+Linux Dockerfile начинается с локального seed `max-postiz-browser:0.4.0`;
+полная чистая пересборка без него не подтверждена. Не все bootstrap-загрузки
+закреплены неизменно: текущие Docker/Chrome apt packages, последний Node 22
+LTS и LanguageTool-stable могут отличаться от снимка этого документа.
+
+Порядок переноса и восстановления: [LINUX_DEPLOYMENT.md](LINUX_DEPLOYMENT.md),
+[STARTUP_AND_HEALTH.md](STARTUP_AND_HEALTH.md),
+[OPERATIONS.md](OPERATIONS.md). Старый Windows worker и Linux worker нельзя
+включать одновременно. Перед изменением runtime сверяют `sending/unknown`
+и mutation lease; после неопределённого исхода отправку не повторяют.
+
+При обновлении установки следует обновить этот паспорт и новую запись
+[CHANGELOG.md](../CHANGELOG.md), сохраняя прежние записи. Версионный снимок
+не заменяет проверку текущего состояния перед публикацией или переносом.

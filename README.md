@@ -1,55 +1,100 @@
 # Редакция MAX / Пикабу / Postiz
-Связка Python 3.12 + PostgreSQL + OpenCode 2.0.17 для сбора материалов, архива, дедупликации, подготовки публикаций и согласования отдельных версий для каждой площадки.
 
-Версия проекта: **0.6.0**. [История версий](CHANGELOG.md) обновляется при каждом изменении
-по [правилам проекта](AGENTS.md). [Промпт установки Docker и Postiz](prompts/POSTIZ_DEPLOYMENT_PROMPT.md)
-сохранён вместе с исходным промптом реализации.
+Связка Python + PostgreSQL + OpenCode для сбора материалов, архива,
+дедупликации, перевода, редактирования и согласованной публикации.
+Версия исходников: **0.6.7**. [История версий](CHANGELOG.md) ведётся по
+[правилам проекта](AGENTS.md).
 
-Ручная очередь Reddit и вход IFTTT через Gmail доступны в `/hub`.
-Настройка: [Reddit IFTTT и ручной отбор](docs/REDDIT_INTAKE.md).
-Подключение внешних аккаунтов и автопубликация не подтверждаются наличием формы.
+**[Паспорт компонентов, версий и подключений](docs/COMPONENTS_AND_CONNECTIONS.md)** —
+актуальная точка входа для Linux-установки, проверенной 18 октября 2026.
+В нём описаны серверы, модели, контейнеры, порты, служебные зависимости,
+автозапуск и ограничения восстановления. Старые датированные отчёты ниже
+сохраняются как история и не заменяют этот снимок.
 
-План следующего этапа от 14 октября: [VM и автоматический канал Reddit](docs/SERVER_REDDIT_AUTOMATION_PLAN.md),
-[промпт](prompts/REDDIT_AUTOMATION_PROMPT.md), [пример спецификации](config/reddit_automation.example.json).
-Выбран режим 10 отдельных постов каждые 4 часа; пока он не реализован и не включён.
+## Действующая установка
 
-Текущий запуск в Linux VM: [панель агента](http://10.20.30.45:8090/hub), [Postiz](http://10.20.30.45:4007). [Эксплуатация и откат](docs/LINUX_DEPLOYMENT.md). Доступ из LAN и через существующий WireGuard. Пароли — только в игнорируемом `data/LINUX_ACCESS.local.txt`; после входа в Hub используется HttpOnly-сессия.
+Основной проект работает в Linux VM 112 на Proxmox:
+`editorial@10.20.30.45`, `/opt/max-postiz`.
+[Панель агента](http://10.20.30.45:8090/hub),
+[Postiz](http://10.20.30.45:4007/) доступны из LAN и через существующий VPN.
+[Эксплуатация и перенос](docs/LINUX_DEPLOYMENT.md),
+[автозапуск и проверка](docs/STARTUP_AND_HEALTH.md).
+Данные входа хранятся отдельно от исходников в игнорируемых файлах.
 
-## Подключения в этой установке
-- MAX: прежний тестовый канал `-79860712657053`, профиль `max_test`. 13 октября в 15:21 по Москве опубликован один согласованный тестовый текст через браузер; сохранение после reload и новой сессии проверено. Канал возвращён на паузу.
-- Пикабу: `user8853170`, профиль `pikabu_neuro_images`. Ручной экспорт и подтверждение ссылкой; автоматическая отправка и чтение владельца через API не заявляются.
-- `pikabu_main` отключён: в исходном проекте нет привязанного адресата.
-- Telegram и VK отключены по текущему указанию.
-- LLM: общий API `http://10.20.30.95:8083/v1`; основная модель `proxmox/qwen35-9b`, второй выбор `proxmox/qwen25-coder-7b` (Ministral 3 8B). Реальные ответы обеих моделей через OpenCode подтверждены; получен пробный черновик Qwen. [Проверка подключения](docs/LLM_CONNECTION_REPORT.md).
-- PostgreSQL 17 в Linux доступен на loopback 55438; база `editorial_hub` восстановлена из Windows. Исходный Windows экземпляр сохранён для тестов и отката. Базы не выставляются в LAN.
-- Postiz 2.25.1 с собственным провайдером **MAX — браузер** развёрнут на http://10.20.30.45:4007. Редактор и календарь передают версии нашему агенту. Provider bridge проверен на прежнем черновике без отправки; браузер Linux требует нового входа владельца. Данные входа — только в `data/postiz-access.json`.
+Агент вызывает OpenCode **2.0.17** на `127.0.0.1:4108` внутри VM.
+Общий LLM API — **http://10.20.30.95:8083/v1**. Переводчик —
+`proxmox/qwen35-9b`; независимый редактор — `proxmox/qwen25-coder-7b`
+(совместимое имя backend Ministral 3 8B). LanguageTool проверяет русский текст.
+Postiz использует custom image `max-postiz-linux:0.5.0` на исторической
+upstream-базе 2.25.1; версия этого image не является версией Python-проекта.
 
-В Postiz подготовлен тестовый черновик от Qwen; проверен импорт сохранённой правки.
-Все адресаты на паузе. В 0.4.1 выполнена одна согласованная тестовая публикация;
-Postiz показал PUBLISHED. [Отчёт живого теста](docs/MAX_TEST_PUBLICATION_REPORT.md).
-[Порядок работы с MAX](docs/MAX_BROWSER_ADAPTER.md),
-[результаты проверки и ограничения](docs/MAX_BROWSER_ADAPTER_REPORT.md),
-[промпт адаптера](prompts/MAX_BROWSER_ADAPTER_PROMPT.md).
+Postiz отвечает за редактор и календарь. Наш provider **MAX — браузер**
+передаёт версии агенту; согласование точного текста и доставка выполняются
+агентом через прежний Chrome transport. Бот MAX для этого маршрута не нужен.
+Вход владельца может потребоваться при истечении браузерной сессии.
+[Подключение](docs/MAX_POSTIZ_CONNECTION.md),
+[инструкция адаптера](docs/MAX_BROWSER_ADAPTER.md).
 
-Адресаты изначально на паузе. Снимите паузу выбранного адресата в панели, сохраните текст и согласуйте конкретную версию с датой. Пикабу выдаёт экспорт; MAX отправляет только согласованную запись. Источники скопированы отключёнными: редактор включает нужные после проверки настроек и прав.
+## Текущий сценарий и площадки
 
-## Запуск на этой машине
+- Почасовая серия: одна новая для канала статья NASA SVS, Qwen → независимый
+  Ministral → LanguageTool → редакторская сверка → Postiz → MAX. Только
+  `max_test`, не чаще одного сообщения за 3600 секунд, без догоняющих пачек.
+  [Процедура](docs/HOURLY_ARTICLE_TESTS.md),
+  [актуальная инструкция сценария](prompts/HOURLY_ARTICLE_TESTS.md).
+- MAX: тестовый канал `-79860712657053`, публичный адрес
+  https://max.ru/channel_neurovideo_max. Между завершёнными публикациями
+  адресат возвращается на паузу. Две статьи от 17 октября проверены 18 октября:
+  точные тексты в MAX по одному разу, Postiz PUBLISHED и dispatch verified.
+- Пикабу `pikabu_neuro_images`: ручной экспорт и подтверждение ссылкой;
+  автоматическая публикация не заявляется. `pikabu_main` без привязки выключен.
+- Telegram и VK выключены. Почасовая серия не включает остальные маршруты.
+- Reddit API ожидает одобрения доступа. Режим 10 постов каждые 4 часа остаётся
+  спецификацией и выключен: [план](docs/SERVER_REDDIT_AUTOMATION_PLAN.md).
+  Есть ручная очередь и код IFTTT/Gmail intake, но живое подключение IFTTT
+  не подтверждено: [документ приёма](docs/REDDIT_INTAKE.md).
+- Vezdepost не установлен в действующей цепочке.
+
+Почасовой выбор и контроль запускает desktop-автоматизация Codex, а не
+самостоятельный cron в VM. Согласование другим маршрутам этот сценарий
+не даёт. `sending/unknown` и mutation lease требуют сверки, повторять
+неизвестную отправку нельзя. Наличие доступа к каналу не доказывает доставку.
+
+## Проверка и резервный стенд
+
+На рабочем компьютере из корня проекта:
+
 ```powershell
-.\.venv\Scripts\python.exe scripts/local_postgres.py start
-# В отдельном терминале, если OpenCode ещё не запущен:
-.\.venv\Scripts\python.exe scripts/serve_opencode.py --binary data/tools/opencode/opencode.exe --port 4108
-# В другом терминале:
-.\scripts\start.ps1
+.\.venv\Scripts\python.exe scripts/check-network.py --output data/network-check.local.json
+.\scripts\check-startup.ps1 -Deep
 ```
-Процессы запускаются локально, службы Windows не установлены. Для остановки панели/OpenCode завершите их терминалы; PostgreSQL: `python scripts/local_postgres.py stop`.
 
-Postiz: запустите Docker Desktop, затем `.\scripts\postiz.ps1 start`.
-Проверка: `.\scripts\postiz.ps1 status`; остановка с сохранением данных:
-`.\scripts\postiz.ps1 stop`. [Инструкция](deployment/postiz/README.md),
-[результаты установки](docs/POSTIZ_DEPLOYMENT_REPORT.md).
+В Linux VM: `.venv/bin/python deployment/linux/check-stack.py --deep`.
+Hub уже запускает worker; второй worker для проверки не нужен.
+[Разбор сетевого сбоя](docs/NETWORK_RECOVERY.md),
+[мера TSO и откат](docs/E1000E_RECOVERY.md).
 
-## Чистая установка и документы
-Смотрите [развёртывание](docs/DEPLOYMENT.md), [эксплуатацию](docs/OPERATIONS.md), [интеграции](docs/INTEGRATIONS.md), [приёмку](docs/ACCEPTANCE.md) и [отчёт проверки](docs/VALIDATION_REPORT.md).
+Windows-скрипты `scripts/start.ps1`, `scripts/local_postgres.py`,
+`scripts/serve_opencode.py` и `scripts/postiz.ps1` сохранены для локального
+стенда и отката. Рабочий Linux-экземпляр и старый Windows worker нельзя
+включать одновременно. Docker Desktop Windows не нужен Docker Engine VM.
 
-[Исходный промпт](prompts/IMPLEMENTATION_PROMPT.md), [описание проекта](docs/PROJECT_BRIEF.md), [ТЗ](docs/TECHNICAL_SPEC.md), [архитектура](docs/ARCHITECTURE.md), [контракты](docs/CONTRACTS.md), [модель данных](docs/DATA_MODEL.md), [повторное использование MAX](docs/REUSE_MAP.md), [редакционный процесс](docs/EDITORIAL_WORKFLOW.md), [решения](docs/DECISIONS.md).
+## Документы и исходники
 
+[Описание проекта](docs/PROJECT_BRIEF.md), [ТЗ](docs/TECHNICAL_SPEC.md),
+[архитектура](docs/ARCHITECTURE.md), [контракты](docs/CONTRACTS.md),
+[модель данных](docs/DATA_MODEL.md), [повторное использование MAX](docs/REUSE_MAP.md),
+[редакционный процесс](docs/EDITORIAL_WORKFLOW.md), [решения](docs/DECISIONS.md),
+[ручная публикация](docs/MANUAL_PUBLICATION.md), [эксплуатация](docs/OPERATIONS.md).
+
+[Исходный промпт реализации](prompts/IMPLEMENTATION_PROMPT.md),
+[промпт Linux VM](prompts/LINUX_VM_DEPLOYMENT_PROMPT.md),
+[промпт Docker/Postiz](prompts/POSTIZ_DEPLOYMENT_PROMPT.md),
+[промпт MAX adapter](prompts/MAX_BROWSER_ADAPTER_PROMPT.md).
+Исходные задания и старые отчёты сохраняют контекст своих дат.
+
+Git содержит исходники, инструкции, примеры настроек и manifests зависимостей.
+Действующие credentials, БД, cookies, Docker volumes/images, веса LLM и desktop
+scheduler settings хранятся отдельно. Для полного восстановления нужны их
+закрытые резервные копии и сохранённый custom image Postiz; один git clone
+не является восстановлением работающей установки.
