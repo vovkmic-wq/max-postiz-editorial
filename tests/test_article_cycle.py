@@ -34,7 +34,7 @@ def cycle(bridge, monkeypatch):
     policy = {"enabled": True, "target_id": "max", "source_id": "example_rss",
               "allowed_hosts": ["science.example.org"], "rights_evidence": "test_permission",
               "owner_instruction": "2026-10-17 hourly translated article tests",
-              "min_gap_seconds": 3600, "max_per_day": 24}
+              "min_gap_seconds": 3600, "max_per_day": 24, "max_source_age_hours": 8760}
     data = core.settings.root / "data"
     data.mkdir(exist_ok=True)
     (data / "hourly-article-policy.local.json").write_text(json.dumps(policy))
@@ -72,6 +72,25 @@ def test_prepare_preserves_real_source_and_never_schedules_or_approves(cycle):
         assert variant.sources[0]["id"] == material.id
         assert variant.metadata_json["rights_evidence"] == policy["rights_evidence"]
         assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 0
+
+
+def test_hourly_policy_allows_archival_science_within_its_explicit_age_limit(cycle):
+    value, _, article, _, calls, stamp, policy = cycle
+    article["published_at"] = stamp[0] - 30 * 24 * 3600
+    prepared = value.prepare(article)
+    result = value.publish(prepared["id"], prepared["content_hash"])
+    assert result["state"] == "pending"
+    assert len(calls) == 1
+
+
+def test_hourly_policy_rejects_source_age_above_its_limit(cycle):
+    value, _, article, _, calls, stamp, policy = cycle
+    policy["max_source_age_hours"] = 24 * 30
+    article["published_at"] = stamp[0] - (24 * 30 + 1) * 3600
+    source, target = value._source_target(policy)
+    with pytest.raises(AgentError, match="STALE_SOURCE"):
+        value._article(article, policy, source, target)
+    assert not calls
 
 
 def test_exact_review_required_and_schedule_once_with_source_evidence(cycle):

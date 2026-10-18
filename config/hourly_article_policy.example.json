@@ -6,5 +6,6 @@
   "rights_evidence": "https://svs.gsfc.nasa.gov/help/",
   "owner_instruction": "Replace with the actual owner delegation before enabling",
   "min_gap_seconds": 3600,
-  "max_per_day": 24
+  "max_per_day": 24,
+  "max_source_age_hours": 8760
 }

@@ -33,7 +33,7 @@ class HourlyArticleCycle:
         try:
             policy = json.loads(path.read_text(encoding="utf-8-sig"))
             required = {"enabled", "target_id", "source_id", "allowed_hosts", "rights_evidence",
-                        "owner_instruction", "min_gap_seconds", "max_per_day"}
+                        "owner_instruction", "min_gap_seconds", "max_per_day", "max_source_age_hours"}
             if (set(policy) != required or type(policy["enabled"]) is not bool
                     or not all(isinstance(policy[k], str) and policy[k].strip()
                                for k in ("target_id", "source_id", "rights_evidence", "owner_instruction"))
@@ -41,7 +41,9 @@ class HourlyArticleCycle:
                     or any(not isinstance(x, str) or not x or x != x.lower()
                            or any(c in x for c in "/:@?# ") for x in policy["allowed_hosts"])
                     or type(policy["min_gap_seconds"]) is not int or policy["min_gap_seconds"] < 3600
-                    or type(policy["max_per_day"]) is not int or not 1 <= policy["max_per_day"] <= 24):
+                    or type(policy["max_per_day"]) is not int or not 1 <= policy["max_per_day"] <= 24
+                    or type(policy["max_source_age_hours"]) is not int
+                    or not 72 <= policy["max_source_age_hours"] <= 8760):
                 raise ValueError
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise AgentError("ARTICLE_POLICY_INVALID", 409) from exc
@@ -110,7 +112,7 @@ class HourlyArticleCycle:
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             raise AgentError("ARTICLE_INPUT_INVALID") from exc
         if (article["published_at"] > now() + 300
-                or article["published_at"] < now() - self.core.settings.channel(target.profile_id)["freshness_hours"] * 3600):
+                or article["published_at"] < now() - policy["max_source_age_hours"] * 3600):
             raise AgentError("STALE_SOURCE", 409)
         return {**article, "url": url}
 
@@ -518,7 +520,7 @@ class HourlyArticleCycle:
                 raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
             if record["slot"] != int(now() // 3600):
                 raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
-            if record["source_published_at"] < now() - self.core.settings.channel(target.profile_id)["freshness_hours"] * 3600:
+            if record["source_published_at"] < now() - policy["max_source_age_hours"] * 3600:
                 raise AgentError("STALE_SOURCE", 409)
             reviewed = self._snapshot(record)
             if reviewed_hash != record["prepared_hash"] or fingerprint(reviewed) != reviewed_hash:
