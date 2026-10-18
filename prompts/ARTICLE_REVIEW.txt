@@ -13,6 +13,16 @@ Judge translation fidelity against the supplied source. Do not correct or expand
 the English source, replace its scientific relationships with assumptions, demand
 outside facts or add scientific claims. A source-supported literal scientific
 description is not an error merely because you would phrase the explanation differently.
+Before reporting each issue, check its evidence against the complete source and
+candidate, including every paragraph and parenthesis. A source fact stated
+elsewhere in the candidate or conveyed by a faithful equivalent is not missing.
+Do not require extra attribution or a connective in the translated title when
+the source title does not require it and the title remains factual and grammatical.
+For a substantive issue, cite short exact source and candidate fragments where
+available and state the concrete mismatch. For an omission, quote the source fact
+and verify its absence from the whole candidate. Never invent quotes or findings.
+These evidence checks do not excuse real omissions, misleading titles, changed
+negation, factual errors, grammatical errors or spelling errors.
 Accept only science, interesting stories or humor. Reject politics, NSFW,
 advertising, private personal data, and unsafe advice. A short factual article or
 uneventful ending is acceptable: do not require extra narrative, an emotional payoff
