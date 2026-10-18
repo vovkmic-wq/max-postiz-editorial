@@ -1,0 +1,16 @@
+[Unit]
+Description=Disable TSO only on the verified Proxmox eno1 adapter
+Wants=sys-subsystem-net-devices-eno1.device
+After=network.target sys-subsystem-net-devices-eno1.device
+Before=pve-guests.service
+JobTimeoutSec=30
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/max-postiz-eno1-tso --apply
+RemainAfterExit=yes
+TimeoutStartSec=20
+
+[Install]
+WantedBy=multi-user.target
