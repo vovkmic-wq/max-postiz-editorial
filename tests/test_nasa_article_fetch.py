@@ -62,7 +62,28 @@ def test_no_fallback_to_search_excerpt(monkeypatch):
         fetcher.fetch_article("https://svs.gsfc.nasa.gov/5648/")
 
 
-def test_copyright_exception_requires_review(monkeypatch):
-    api(monkeypatch, media_groups=[{"widget": "Basic text", "description": "All rights reserved. " * 12}])
+def test_documented_html_narrative_is_cleaned_without_media_caption(monkeypatch):
+    text = ("Earth's gravity measurements help scientists follow water across the planet. "
+            "This scientific description is the complete narrative, not a video caption.")
+    calls, _ = api(monkeypatch, media_groups=[
+        {"widget": "Basic text with HTML", "description": "<p>" + text + "</p>"},
+        {"widget": "Video player", "description": "Caption must never replace the narrative."},
+    ])
+    result = fetcher.fetch_article("https://svs.gsfc.nasa.gov/5648/")
+    assert calls == ["https://svs.gsfc.nasa.gov/api/5648/"]
+    assert result["original"] == text
+
+
+def test_media_descriptions_alone_are_not_an_article(monkeypatch):
+    api(monkeypatch, media_groups=[
+        {"widget": "Video player", "description": "A long caption masquerading as an article. " * 10},
+    ])
+    with pytest.raises(AgentError, match="ARTICLE_SOURCE_NARRATIVE_REQUIRED"):
+        fetcher.fetch_article("https://svs.gsfc.nasa.gov/5648/")
+
+
+@pytest.mark.parametrize("widget", ["Basic text", "Basic text with HTML"])
+def test_copyright_exception_requires_review(monkeypatch, widget):
+    api(monkeypatch, media_groups=[{"widget": widget, "description": "All rights reserved. " * 12}])
     with pytest.raises(AgentError, match="ARTICLE_SOURCE_RIGHTS_REVIEW_REQUIRED"):
         fetcher.fetch_article("https://svs.gsfc.nasa.gov/5648/")

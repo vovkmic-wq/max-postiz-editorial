@@ -22,6 +22,49 @@ from .network import resemblances_ip
 SPELLING_URL = "http://127.0.0.1:8010/v2/check"
 TOPICS = {"science", "stories", "humor"}
 MAGELLANIC_EVIDENCE = "https://www.astronet.ru/db/msg/1167613/lmc.html"
+MAX_REVIEW_ISSUES = 3
+MAX_REVIEW_ISSUE_CHARS = 1024
+
+
+def _normalize_review(value):
+    """Unwrap one unambiguous issue envelope without changing the verdict."""
+    if (not isinstance(value, dict) or set(value) != {"approved", "topic", "issues"}
+            or type(value["approved"]) is not bool
+            or not isinstance(value["topic"], str)
+            or not isinstance(value["issues"], list)
+            or len(value["issues"]) > MAX_REVIEW_ISSUES):
+        raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
+    issues = []
+    for issue in value["issues"]:
+        if isinstance(issue, dict) and set(issue) == {"issue"}:
+            issue = issue["issue"]
+        if (not isinstance(issue, str) or not issue.strip()
+                or len(issue) > MAX_REVIEW_ISSUE_CHARS):
+            raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
+        # Preserve every character of a negative finding; do not truncate or filter it.
+        issues.append(issue)
+    return {"approved": value["approved"], "topic": value["topic"], "issues": issues}
+
+
+def _numeric_feedback(original, translated):
+    source, candidate = numbers(original), numbers(translated)
+    unexpected = candidate - source
+    notation_repairs = []
+    for observed in sorted(unexpected):
+        # A diagnostic suggestion only. The gate still compares the exact raw tokens.
+        possible = [token for token in source
+                    if token.replace(",", ".") == observed.replace(",", ".")]
+        if len(possible) == 1:
+            notation_repairs.append({"observed": observed, "required": possible[0]})
+    return {"code": "TRANSLATION_NUMBER_CHANGED",
+            "original_numbers": sorted(source), "translated_numbers": sorted(candidate),
+            "missing_numbers": sorted(source - candidate),
+            "unexpected_numbers": sorted(unexpected), "notation_repairs": notation_repairs,
+            "advice": "Copy every numeric token character-for-character from the source, including decimal "
+                      "dots or commas and zero padding, even when Russian typography normally differs. "
+                      "Do not convert units, times or number formats; translate their qualifiers. "
+                      "Replace unexpected notation in every occurrence, including identifiers. "
+                      "Do not merely add the source notation beside a localized copy."}
 
 
 def adjudicate_scientific_spelling(original, translated, matches):
@@ -144,7 +187,9 @@ class ArticleQuality:
         url = canonical_article_url(url)
         title, original, source = _validated_source(title, original)
         context = {"instruction": self.translation_prompt,
-                   "source_untrusted": {"title": title, "body": original, "url": url}}
+                   "source_untrusted": {"title": title, "body": original, "url": url},
+                   "numeric_tokens_must_match_exactly": sorted(numbers(source))}
+        rejected_candidates = {}
         for attempt in range(1, 4):
             self._emit("translation_started", attempt, context=context)
             raw_translation = None
@@ -179,17 +224,19 @@ class ArticleQuality:
                 if len(full) > 3500:
                     raise AgentError("ARTICLE_POST_TOO_LONG")
             except AgentError as exc:
-                context["repair_feedback"] = ({
-                    "code": exc.code,
-                    "original_numbers": sorted(numbers(source)),
-                    "translated_numbers": sorted(numbers(text)),
-                    "advice": "Preserve the original numeric notation and translate its qualifiers. "
-                              "Do not convert units, times or number formats; correct the changed numeric tokens.",
-                } if exc.code == "TRANSLATION_NUMBER_CHANGED" else exc.code)
+                context["repair_feedback"] = (_numeric_feedback(source, text)
+                    if exc.code == "TRANSLATION_NUMBER_CHANGED" else exc.code)
                 self._emit("gate_rejected", attempt, error=exc.code, characters=len(full))
                 self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
             self._emit("gate_passed", attempt, characters=len(full))
+            if text in rejected_candidates:
+                # A fresh translation may be reviewed; the same rejected text cannot
+                # obtain approval by repeatedly sampling the independent reviewer.
+                context["repair_feedback"] = copy.deepcopy(rejected_candidates[text])
+                self._emit("candidate_repeated", attempt, feedback=context["repair_feedback"])
+                self._emit("retry", attempt, feedback=context["repair_feedback"])
+                continue
             review_context = {"instruction": self.review_prompt,
                               "source_untrusted": source, "translation_untrusted": text}
             self._emit("review_started", attempt, context=review_context)
@@ -208,15 +255,21 @@ class ArticleQuality:
                 self._emit("review_invalid", attempt, error=exc.code, raw=raw_review)
                 self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
-            if (set(reviewed) != {"approved", "topic", "issues"}
-                    or type(reviewed["approved"]) is not bool
-                    or not isinstance(reviewed["topic"], str)
-                    or not isinstance(reviewed["issues"], list)
-                    or any(not isinstance(issue, str) for issue in reviewed["issues"])):
-                context["repair_feedback"] = "Independent review schema invalid; approval was not granted."
+            try:
+                normalized = _normalize_review(reviewed)
+            except AgentError:
+                context["repair_feedback"] = {"code": "ARTICLE_REVIEW_SCHEMA_INVALID",
+                    "review_untrusted": reviewed,
+                    "advice": "Independent review schema invalid; approval was not granted. "
+                              "Preserve any negative findings and correct the candidate against the source."}
+                if reviewed.get("approved") is False or reviewed.get("issues"):
+                    rejected_candidates[text] = copy.deepcopy(context["repair_feedback"])
                 self._emit("review_invalid", attempt, error="ARTICLE_REVIEW_SCHEMA_INVALID", review=reviewed)
                 self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
+            if normalized != reviewed:
+                self._emit("review_normalized", attempt, raw_review=reviewed, review=normalized)
+            reviewed = normalized
             self._emit("review_parsed", attempt, review=reviewed)
             self._emit("spelling_started", attempt)
             try:
@@ -236,6 +289,7 @@ class ArticleQuality:
             context["repair_feedback"] = {"review_approved": reviewed["approved"],
                 "topic": reviewed["topic"], "review_issues": reviewed["issues"],
                 "spelling_matches": unresolved[:20]}
+            rejected_candidates[text] = copy.deepcopy(context["repair_feedback"])
             self._emit("retry", attempt, feedback=context["repair_feedback"])
         self._emit("rejected", 3, error="ARTICLE_QUALITY_REJECTED",
                    feedback=context.get("repair_feedback"))
@@ -278,14 +332,15 @@ class ArticleQuality:
             self._emit("review_invalid", 1, error=exc.code, raw=raw_review)
             self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED")
             raise AgentError("ARTICLE_QUALITY_REJECTED") from exc
-        if (set(reviewed) != {"approved", "topic", "issues"}
-                or type(reviewed["approved"]) is not bool
-                or not isinstance(reviewed["topic"], str)
-                or not isinstance(reviewed["issues"], list)
-                or any(not isinstance(issue, str) for issue in reviewed["issues"])):
+        try:
+            normalized = _normalize_review(reviewed)
+        except AgentError as exc:
             self._emit("review_invalid", 1, error="ARTICLE_REVIEW_SCHEMA_INVALID", review=reviewed)
             self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED")
-            raise AgentError("ARTICLE_QUALITY_REJECTED")
+            raise AgentError("ARTICLE_QUALITY_REJECTED") from exc
+        if normalized != reviewed:
+            self._emit("review_normalized", 1, raw_review=reviewed, review=normalized)
+        reviewed = normalized
         self._emit("review_parsed", 1, review=reviewed)
         self._emit("spelling_started", 1)
         try:

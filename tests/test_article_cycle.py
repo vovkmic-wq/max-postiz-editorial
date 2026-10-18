@@ -653,7 +653,10 @@ def test_rejected_editorial_correction_keeps_original_but_blocks_publication_unt
     with pytest.raises(AgentError, match="ARTICLE_RECONCILIATION_REQUIRED"):
         value.publish(prepared["id"], prepared["content_hash"])
     value.quality_factory = CandidateQuality
-    revised = value.revise_prepared(prepared["id"], correction)
+    with pytest.raises(AgentError, match="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"):
+        value.revise_prepared(prepared["id"], correction)
+    revised = value.revise_prepared(prepared["id"], {**correction,
+        "body": "Исследователи изучили необычную атмосферу далёкой звезды и обнаружили звёздный ветер."})
     assert revised["correction_blocked"] is False and len(revised["correction_attempts"]) == 2
     assert not calls
 
@@ -781,3 +784,143 @@ def test_operator_candidate_never_retries_generated_or_external_records(cycle, p
     with pytest.raises(AgentError, match="ARTICLE_RETRY_NOT_SAFE|ARTICLE_OUTSTANDING_DELIVERY"):
         value.prepare(article, retry_record=prepared["id"], candidate={"title": "Правка", "body": "Русский текст."})
     assert len(calls) == count
+
+
+def candidate_failure(value, article, candidate, operation, error):
+    record = failed_preparation(value, article) if operation == "prepare" else value.prepare(article)
+
+    class Rejected(CandidateQuality):
+        def check_candidate(self, *args):
+            raise AgentError(error)
+
+    value.quality_factory = Rejected
+    with pytest.raises(AgentError, match=error):
+        candidate_operation(value, article, record, candidate, operation)
+    return value._load()["records"][0]
+
+
+def candidate_operation(value, article, record, candidate, operation):
+    if operation == "prepare":
+        return value.prepare(article, retry_record=record["id"], candidate=candidate)
+    return value.revise_prepared(record["id"], candidate)
+
+
+@pytest.mark.parametrize("operation", ["prepare", "revise"])
+@pytest.mark.parametrize("initial_padding", [False, True])
+def test_substantive_candidate_refusal_is_durable_and_whitespace_cannot_resample_it(cycle, operation, initial_padding):
+    value, core, article, records, calls, _, _ = cycle
+    candidate = {"title": "Звёздный ветер", "body": "Учёные исследовали необычную атмосферу далёкой звезды."}
+    supplied = {k: " \n" + v + "\n " for k, v in candidate.items()} if initial_padding else candidate
+    failed = candidate_failure(value, article, supplied, operation, "ARTICLE_QUALITY_REJECTED")
+    attempts_key = "preparation_attempts" if operation == "prepare" else "correction_attempts"
+    before_attempts = failed[attempts_key]
+    assert before_attempts[-1]["candidate_hash"] == fingerprint(candidate)
+    assert before_attempts[-1]["candidate_raw_hash"] == fingerprint(supplied)
+    checked = []
+
+    def factory():
+        checked.append(True)
+        return CandidateQuality()
+
+    # A new process-equivalent object reads refusal history from the private ledger.
+    restarted = HourlyArticleCycle(core, factory)
+    retry = candidate if initial_padding else {k: " " + v + " " for k, v in candidate.items()}
+    with pytest.raises(AgentError, match="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"):
+        candidate_operation(restarted, article, failed, retry, operation)
+    after = restarted._load()["records"][0]
+    assert after[attempts_key] == before_attempts and after["state"] == failed["state"]
+    assert after["preparation_actions"][-1]["action"] == "rejected_candidate_replay_blocked"
+    assert after["preparation_actions"][-1]["candidate_normalized_hash"] == fingerprint(candidate)
+    assert not checked and not calls and not records
+    with core.db.session() as session:
+        event = session.scalar(select(Audit).where(Audit.action == "hourly_article_candidate_replay_blocked"))
+        assert event.details["candidate_normalized_hash"] == fingerprint(candidate)
+        assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 0
+        assert session.query(Variant).count() == (0 if operation == "prepare" else 1)
+
+
+@pytest.mark.parametrize("operation", ["prepare", "revise"])
+@pytest.mark.parametrize("error", ["OPENCODE_GENERATION_FAILED", "ARTICLE_SPELLING_UNAVAILABLE", "ARTICLE_TRACE_FAILED"])
+def test_infrastructure_failure_does_not_blacklist_the_same_candidate(cycle, operation, error):
+    value, core, article, records, calls, _, _ = cycle
+    candidate = {"title": "Звёздный ветер", "body": "Учёные исследовали необычную атмосферу далёкой звезды."}
+    failed = candidate_failure(value, article, candidate, operation, error)
+    restarted = HourlyArticleCycle(core, CandidateQuality)
+    result = candidate_operation(restarted, article, failed, candidate, operation)
+    assert result["state"] == "prepared" and not result.get("correction_blocked")
+    attempts_key = "preparation_attempts" if operation == "prepare" else "correction_attempts"
+    assert result[attempts_key][-2]["error"] == error
+    assert result[attempts_key][-1]["candidate_hash"] == fingerprint(candidate)
+    assert not any(x["action"] == "rejected_candidate_replay_blocked" for x in result.get("preparation_actions", []))
+    assert not calls and not records
+
+
+def test_preparation_refusal_also_blocks_later_revision_after_a_different_candidate_passed(cycle):
+    value, core, article, _, calls, _, _ = cycle
+    candidate = {"title": "Звёздный ветер", "body": "Учёные исследовали необычную атмосферу далёкой звезды."}
+    failed = candidate_failure(value, article, candidate, "prepare", "ARTICLE_QUALITY_REJECTED")
+    restarted = HourlyArticleCycle(core, CandidateQuality)
+    corrected = {**candidate, "body": "Учёные изучили необычную атмосферу далёкой звезды и обнаружили звёздный ветер."}
+    prepared = restarted.prepare(article, retry_record=failed["id"], candidate=corrected)
+    with pytest.raises(AgentError, match="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"):
+        HourlyArticleCycle(core, CandidateQuality).revise_prepared(prepared["id"], candidate)
+    with core.db.session() as session:
+        assert session.get(Variant, prepared["variant_id"]).body == prepared["body"]
+        assert session.query(VariantRevision).count() == 1
+    assert not calls
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_legacy_refusal_hash_is_respected_and_corrupt_hash_fails_closed(cycle, malformed):
+    value, core, article, _, calls, _, _ = cycle
+    candidate = {"title": "Звёздный ветер", "body": "Учёные исследовали необычную атмосферу далёкой звезды."}
+    failed = candidate_failure(value, article, candidate, "prepare", "ARTICLE_QUALITY_REJECTED")
+    ledger = value._load()
+    attempt = ledger["records"][0]["preparation_attempts"][-1]
+    attempt.pop("candidate_raw_hash")
+    if malformed:
+        attempt["candidate_hash"] = "not-a-valid-content-hash"
+    value._save(ledger)
+    checked = []
+
+    def factory():
+        checked.append(True)
+        return CandidateQuality()
+
+    error = "ARTICLE_LEDGER_INVALID" if malformed else "ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"
+    with pytest.raises(AgentError, match=error):
+        HourlyArticleCycle(core, factory).prepare(article, retry_record=failed["id"], candidate=candidate)
+    assert not checked and not calls
+
+
+@pytest.mark.parametrize("origin", ["automatic", "candidate", "candidate_then_infrastructure"])
+def test_quality_refusal_requires_an_exact_candidate_instead_of_blind_translation_retry(cycle, origin):
+    value, core, article, _, calls, _, _ = cycle
+    candidate = {"title": "Звёздный ветер", "body": "Учёные исследовали необычную атмосферу далёкой звезды."}
+    if origin.startswith("candidate"):
+        failed = candidate_failure(value, article, candidate, "prepare", "ARTICLE_QUALITY_REJECTED")
+        if origin == "candidate_then_infrastructure":
+            class Unavailable(CandidateQuality):
+                def check_candidate(self, *args):
+                    raise AgentError("ARTICLE_SPELLING_UNAVAILABLE")
+
+            value.quality_factory = Unavailable
+            changed = {**candidate, "body": candidate["body"] + " Обнаружен звёздный ветер."}
+            with pytest.raises(AgentError, match="ARTICLE_SPELLING_UNAVAILABLE"):
+                value.prepare(article, retry_record=failed["id"], candidate=changed)
+            failed = value._load()["records"][0]
+            assert failed["error"] == "ARTICLE_SPELLING_UNAVAILABLE"
+    else:
+        class Rejected(Quality):
+            def prepare(self, *args):
+                raise AgentError("ARTICLE_QUALITY_REJECTED")
+
+        value.quality_factory = Rejected
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            value.prepare(article)
+        failed = value._load()["records"][0]
+    restarted = HourlyArticleCycle(core, CandidateQuality)
+    with pytest.raises(AgentError, match="ARTICLE_CORRECTION_CANDIDATE_REQUIRED"):
+        restarted.prepare(article, retry_record=failed["id"])
+    assert restarted._load()["records"][0]["preparation_attempts"] == failed["preparation_attempts"]
+    assert not calls

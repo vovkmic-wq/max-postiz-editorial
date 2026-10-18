@@ -237,6 +237,47 @@ class HourlyArticleCycle:
                 or "Перевод и редактура с помощью нейросетей." in correction["body"]):
             raise AgentError("ARTICLE_CORRECTION_INVALID")
 
+    @staticmethod
+    def _candidate_hash(candidate):
+        return fingerprint({key: candidate[key].strip() for key in ("title", "body")})
+
+    def _guard_candidate_replay(self, ledger, record, candidate, operation):
+        """A persisted substantive refusal cannot be replaced by a fresh model sample."""
+        candidate_hash = self._candidate_hash(candidate)
+        supplied_hash = fingerprint(candidate)
+        rejected = False
+        for name in ("preparation_attempts", "correction_attempts"):
+            attempts = record.get(name, [])
+            if not isinstance(attempts, list) or any(not isinstance(item, dict) for item in attempts):
+                raise AgentError("ARTICLE_LEDGER_INVALID", 409)
+            for attempt in attempts:
+                # Infrastructure errors, including LanguageTool unavailability, are
+                # retryable. Their state may say 'rejected'; only this code is final.
+                if attempt.get("error") != "ARTICLE_QUALITY_REJECTED":
+                    continue
+                hashes = [attempt[key] for key in ("candidate_hash", "candidate_normalized_hash", "candidate_raw_hash")
+                          if key in attempt]
+                if not hashes:
+                    # Historical automatic Qwen attempts have no explicit candidate hash.
+                    if name == "correction_attempts" or attempt.get("operator_correction"):
+                        raise AgentError("ARTICLE_LEDGER_INVALID", 409)
+                    continue
+                if any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value)
+                       for value in hashes):
+                    raise AgentError("ARTICLE_LEDGER_INVALID", 409)
+                if candidate_hash in hashes or supplied_hash in hashes:
+                    rejected = True
+        if rejected:
+            record.setdefault("preparation_actions", []).append({
+                "at": now(), "action": "rejected_candidate_replay_blocked", "operation": operation,
+                "candidate_normalized_hash": candidate_hash, "error": "ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"})
+            self._save(ledger)
+            with self.core.db.session.begin() as session:
+                self.core.db.audit(session, "article_quality", "hourly_article_candidate_replay_blocked",
+                    record["id"], operation=operation, candidate_normalized_hash=candidate_hash,
+                    source_hash=record["original_hash"], error="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED")
+            raise AgentError("ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED", 409)
+
     def prepare(self, article, retry_record=None, candidate=None):
         if candidate is not None:
             if not retry_record:
@@ -268,6 +309,10 @@ class HourlyArticleCycle:
                     self._assert_pre_draft(record)
                 except AgentError as exc:
                     raise AgentError("ARTICLE_RETRY_NOT_SAFE", 409) from exc
+                if candidate is None and (record.get("error") == "ARTICLE_QUALITY_REJECTED" or any(
+                        item.get("error") == "ARTICLE_QUALITY_REJECTED"
+                        for item in record.get("preparation_attempts", []))):
+                    raise AgentError("ARTICLE_CORRECTION_CANDIDATE_REQUIRED", 409)
             else:
                 record = None
                 if any(item["slot"] == slot for item in ledger["records"]):
@@ -291,10 +336,13 @@ class HourlyArticleCycle:
                 # Preserve older failed ledgers without inventing an unrecorded completion time.
                 record["preparation_attempts"] = [{"number": 1, "started_at": record["claimed_at"],
                     "state": record["state"], "error": record.get("error"), "legacy_record": True}]
+            if candidate is not None:
+                self._guard_candidate_replay(ledger, record, candidate, "prepare_candidate")
             attempt = {"number": len(record["preparation_attempts"]) + 1,
                        "started_at": now(), "state": "preparing", "operator_retry": bool(retry_record)}
             if candidate is not None:
-                attempt.update(candidate_hash=fingerprint(candidate), operator_correction=True)
+                attempt.update(candidate_hash=self._candidate_hash(candidate), operator_correction=True,
+                               candidate_raw_hash=fingerprint(candidate))
             record["preparation_attempts"].append(attempt)
             record.update(state="preparing", input_hash=fingerprint(article))
             record["quality_trace"] = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
@@ -444,7 +492,9 @@ class HourlyArticleCycle:
                         or text_hash(material.text) != record["original_hash"]):
                     raise AgentError("ARTICLE_SOURCE_CHANGED", 409)
                 original_title, original = material.title, material.text
-            attempt = {"started_at": now(), "candidate_hash": fingerprint(correction), "state": "checking"}
+            self._guard_candidate_replay(ledger, record, correction, "revise_prepared")
+            attempt = {"started_at": now(), "candidate_hash": self._candidate_hash(correction), "state": "checking",
+                       "candidate_raw_hash": fingerprint(correction)}
             record.setdefault("correction_attempts", []).append(attempt)
             record.update(state="revising", correction_blocked=True)
             self._save(ledger)

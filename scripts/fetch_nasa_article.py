@@ -30,8 +30,11 @@ def fetch_article(url):
             or data.get("url") not in {canonical, canonical.replace("https://", "http://", 1)}):
         raise AgentError("ARTICLE_SOURCE_METADATA_INVALID")
     title = clean_html(data["title"])
+    # Both are dedicated narrative widgets in the documented SVS Page API.
+    # Descriptions attached to media players/images remain captions, not articles.
+    narrative_widgets = {"Basic text", "Basic text with HTML"}
     sections = [g.get("description", "") for g in data.get("media_groups", [])
-                if g.get("widget") == "Basic text" and g.get("description")]
+                if g.get("widget") in narrative_widgets and g.get("description")]
     if not sections:
         raise AgentError("ARTICLE_SOURCE_NARRATIVE_REQUIRED")
     original = "\n\n".join(clean_html(section) for section in sections)

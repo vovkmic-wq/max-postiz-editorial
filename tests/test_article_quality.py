@@ -139,7 +139,7 @@ def test_independent_rejection_cannot_be_ignored(approval):
             check.prepare(TITLE, ORIGINAL, URL)
     finally:
         check.close()
-    assert len(translator.prompts) == len(reviewer.prompts) == 3
+    assert len(translator.prompts) == 3 and len(reviewer.prompts) == 1
 
 
 def test_spelling_issues_block_even_unanimous_models():
@@ -475,3 +475,205 @@ def test_numeric_format_feedback_repairs_time_notation_without_relaxing_gate():
     assert "Do not convert units, times or number formats" in feedback["advice"]
     assert translator.prompts[1]["previous_translation"] == converted
     assert "11:59 вечера" in result["translation"] and "23:59" not in result["translation"]
+
+
+@pytest.mark.parametrize("keep_identifier_dot", [False, True])
+def test_decimal_feedback_repairs_every_occurrence_instead_of_adding_a_correct_copy(keep_identifier_dot):
+    original = ("Scientists measured particles smaller than 2.5 micrometers, called PM2.5. "
+                "They studied the observations before sharing the results of their measurements.")
+    preserved = {"title": "Учёные исследуют мелкие частицы",
+        "body": "Учёные измерили частицы размером менее 2.5 микрометра, называемые PM2.5. "
+                "Они изучили наблюдения, прежде чем сообщить результаты измерений."}
+    localized = {**preserved, "body": preserved["body"].replace("2.5", "2,5",
+                                                                1 if keep_identifier_dot else -1)}
+    translator, reviewer = Model(localized, preserved), Model(APPROVAL)
+    check = quality(translator, reviewer)
+    try:
+        result = check.prepare("Scientists study fine particles", original, URL)
+    finally:
+        check.close()
+    assert len(translator.prompts) == 2 and len(reviewer.prompts) == 1
+    assert translator.prompts[0]["numeric_tokens_must_match_exactly"] == ["2.5"]
+    feedback = translator.prompts[1]["repair_feedback"]
+    assert feedback["original_numbers"] == ["2.5"]
+    assert feedback["unexpected_numbers"] == ["2,5"]
+    assert feedback["missing_numbers"] == ([] if keep_identifier_dot else ["2.5"])
+    assert feedback["notation_repairs"] == [{"observed": "2,5", "required": "2.5"}]
+    assert "character-for-character" in feedback["advice"]
+    assert "Do not merely add" in feedback["advice"]
+    assert "source decimal separator" in translator.prompts[0]["instruction"]
+    assert translator.prompts[1]["previous_translation"] == localized
+    assert "2,5" not in result["translation"]
+
+
+def test_equal_decimal_value_with_changed_notation_still_exhausts_the_strict_gate():
+    original = ORIGINAL.replace("3 hours", "2.5 hours")
+    translator = Model({**TRANSLATION, "body": TRANSLATION["body"].replace("3 часа", "2,5 часа")})
+    reviewer = Model(APPROVAL)
+    check = quality(translator, reviewer)
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.prepare(TITLE, original, URL)
+    finally:
+        check.close()
+    assert len(translator.prompts) == 3 and not reviewer.prompts
+
+
+def test_object_findings_keep_negative_verdict_and_spelling_evidence_without_resampling_review():
+    issue = "Отрицание из исходного текста не сохранено. " * 6
+    rejection = {"approved": False, "topic": "science", "issues": [{"issue": issue}]}
+    typo = {"message": "Опечатка в проверяемом тексте", "offset": 5, "length": 4}
+    translator, reviewer = Model(TRANSLATION), Model(rejection, APPROVAL)
+    events, spelling_calls = [], []
+
+    def spelling(request):
+        spelling_calls.append(request)
+        return httpx.Response(200, json={"matches": [typo]})
+
+    check = ArticleQuality(translator, reviewer, trace=events.append,
+                           transport=httpx.MockTransport(spelling))
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.prepare(TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+    assert len(translator.prompts) == 3 and len(reviewer.prompts) == len(spelling_calls) == 1
+    normalization = next(event for event in events if event["phase"] == "review_normalized")
+    assert normalization["raw_review"] == rejection
+    assert normalization["review"] == {"approved": False, "topic": "science", "issues": [issue]}
+    feedback = translator.prompts[1]["repair_feedback"]
+    assert feedback["review_approved"] is False and feedback["review_issues"] == [issue]
+    assert feedback["spelling_matches"] == [typo]
+    assert translator.prompts[2]["repair_feedback"] == feedback
+    assert sum(event["phase"] == "candidate_repeated" for event in events) == 2
+    assert not any(event["phase"] in {"review_invalid", "accepted"} for event in events)
+
+
+def test_new_translation_after_object_rejection_requires_its_own_independent_review():
+    rejected = {**TRANSLATION, "body": TRANSLATION["body"].replace("изучили свет", "изучили и интересовались светом")}
+    issue = "У согласованных глаголов разные требования к дополнению; исправьте управление."
+    translator = Model(rejected, TRANSLATION)
+    reviewer = Model({"approved": False, "topic": "science", "issues": [{"issue": issue}]}, APPROVAL)
+    check = quality(translator, reviewer)
+    try:
+        result = check.prepare(TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+    assert len(translator.prompts) == len(reviewer.prompts) == 2
+    assert translator.prompts[1]["repair_feedback"]["review_issues"] == [issue]
+    assert translator.prompts[1]["repair_feedback"]["review_approved"] is False
+    assert reviewer.prompts[0]["translation_untrusted"] != reviewer.prompts[1]["translation_untrusted"]
+    assert reviewer.prompts[1]["translation_untrusted"] == result["translation"]
+
+
+@pytest.mark.parametrize("approved", [False, True])
+def test_exact_candidate_object_findings_are_rejected_after_spelling_without_translator(approved):
+    issue = "В переводе изменено исходное утверждение."
+    translator = Model("Must not run")
+    reviewer = Model({"approved": approved, "topic": "science", "issues": [{"issue": issue}]}, APPROVAL)
+    events = []
+    check = quality(translator, reviewer, trace=events.append)
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.check_candidate(TRANSLATION["title"], TRANSLATION["body"], TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+    assert not translator.prompts and len(reviewer.prompts) == 1
+    assert any(event["phase"] == "spelling_returned" for event in events)
+    assert events[-1]["feedback"]["review_approved"] is approved
+    assert events[-1]["feedback"]["review_issues"] == [issue]
+
+
+@pytest.mark.parametrize("issues", [
+    [{"issue": "Ошибка", "fix": "Подмена"}], [{"message": "Ошибка"}],
+    [{"issue": []}], [{"issue": ""}], [{"issue": True}], [["Ошибка"]],
+    [{"issue": "Ошибка"}] * 4, [{"issue": "x" * 1025}],
+])
+def test_unknown_or_oversized_issue_shapes_never_become_empty_approved_findings(issues):
+    translator, reviewer = Model(TRANSLATION), Model({**APPROVAL, "issues": issues})
+    events = []
+    check = quality(translator, reviewer, trace=events.append)
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.check_candidate(TRANSLATION["title"], TRANSLATION["body"], TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+    assert not translator.prompts and len(reviewer.prompts) == 1
+    assert any(event["phase"] == "review_invalid" for event in events)
+    assert not any(event["phase"] == "accepted" for event in events)
+
+
+def test_unrecognized_negative_review_cannot_be_replaced_by_another_verdict_for_same_text():
+    rejection = {"approved": False, "topic": "science", "issues": [{"message": "Ошибка смысла"}]}
+    translator, reviewer = Model(TRANSLATION), Model(rejection, APPROVAL)
+    check = quality(translator, reviewer)
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.prepare(TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+    assert len(translator.prompts) == 3 and len(reviewer.prompts) == 1
+    assert translator.prompts[1]["repair_feedback"]["review_untrusted"] == rejection
+
+
+def test_trace_failure_during_issue_normalization_fails_closed_before_spelling():
+    def unavailable_trace(event):
+        if event["phase"] == "review_normalized":
+            raise OSError("Private trace cannot be written")
+
+    reviewer = Model({"approved": False, "topic": "science", "issues": [{"issue": "Ошибка"}]})
+    check = quality(reviewer=reviewer, trace=unavailable_trace)
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_TRACE_FAILED"):
+            check.check_candidate(TRANSLATION["title"], TRANSLATION["body"], TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+
+
+def test_article_prompts_reach_native_opencode_sessions_without_generic_editor_schema(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from max_postiz_agent.adapters import OpenCode
+
+    for key in ("ARTICLE_TEST_OC_MODEL", "ARTICLE_TEST_OC_SECRET"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("ARTICLE_TEST_OC_BASE", "http://127.0.0.1:4108")
+    sessions, generated = {}, []
+
+    def native(request):
+        if request.method == "POST" and request.url.path == "/api/session":
+            payload = json.loads(request.content)
+            assert payload["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}]
+            ident = "ses_article_" + str(len(sessions) + 1)
+            sessions[ident] = payload["model"]["id"]
+            return httpx.Response(200, json={"data": {"id": ident}})
+        if request.url.path.endswith("/generate"):
+            payload = json.loads(request.content)
+            assert set(payload) == {"prompt"}
+            assert "For this service task use this exact JSON shape" not in payload["prompt"]
+            context = json.loads(payload["prompt"])
+            model = sessions[request.url.path.split("/")[-2]]
+            generated.append((model, context))
+            response = TRANSLATION if model == "qwen35-9b" else APPROVAL
+            return httpx.Response(200, json={"data": {"text": json.dumps(response, ensure_ascii=False)}})
+        return httpx.Response(200, json={})
+
+    def editor(model):
+        options = {"adapter_mode": "live", "base_url_env": "ARTICLE_TEST_OC_BASE",
+                   "model_id_env": "ARTICLE_TEST_OC_MODEL", "auth_secret_env": "ARTICLE_TEST_OC_SECRET",
+                   "model_id": "proxmox/" + model, "task_timeout_seconds": 5,
+                   "generate_transport": "session", "runtime_dir": "data/opencode-runtime"}
+        return OpenCode(SimpleNamespace(root=tmp_path, app={"opencode": options}), httpx.MockTransport(native))
+
+    translator, reviewer = editor("qwen35-9b"), editor("qwen25-coder-7b")
+    check = quality(translator, reviewer)
+    try:
+        result = check.prepare(TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+        translator.client.close()
+        reviewer.client.close()
+    assert [model for model, _ in generated] == ["qwen35-9b", "qwen25-coder-7b"]
+    assert generated[0][1]["numeric_tokens_must_match_exactly"] == ["3"]
+    assert generated[1][1]["translation_untrusted"] == result["translation"]
+    assert '"issues":["' in generated[1][1]["instruction"]
