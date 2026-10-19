@@ -85,7 +85,8 @@ class MaxBridge:
         data = self._open(token, "channel")
         return self.target(data["target"], data["destination"])
 
-    def normalize(self, remote):
+    @staticmethod
+    def normalize(remote):
         try:
             if "image" not in remote or "childrenPost" not in remote:
                 raise AgentError("BRIDGE_POSTIZ_SCHEMA_REQUIRED", 409)

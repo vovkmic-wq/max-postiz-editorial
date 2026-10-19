@@ -1,11 +1,12 @@
 {
   "enabled": false,
-  "approval_mode": "human",
+  "approval_mode": "automatic",
+  "review_rubric": "meaning-first-v1",
   "target_id": "max_test",
   "source_id": "nasa_svs_articles",
   "allowed_hosts": ["svs.gsfc.nasa.gov"],
   "rights_evidence": "https://svs.gsfc.nasa.gov/help/",
-  "owner_instruction": "Human editor must approve the exact text, target and date in Hub; automation prepares drafts only",
+  "owner_instruction": "Owner instruction 2026-10-19: automatic hourly MAX publication after meaning-first-v1 review; stylistic warnings are advisory; material errors and hard gates block delivery",
   "min_gap_seconds": 3600,
   "max_per_day": 24,
   "max_source_age_hours": 8760

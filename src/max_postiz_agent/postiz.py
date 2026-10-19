@@ -100,5 +100,29 @@ class PostizClient:
             raise AgentError("POSTIZ_ID_INVALID")
         return self.request("DELETE", "/posts/" + quote(post_id, safe=""))
 
+    def reschedule_existing(self, post_id, expected_body, due_at):
+        """Update one unpublished text post through createOrUpdatePost by its ID."""
+        from .max_bridge import MaxBridge
+        import json
+        remote = self.get_post(post_id)
+        body, images, _, _ = MaxBridge.normalize(remote)
+        if remote["state"] not in {"DRAFT", "QUEUE"} or images or body != expected_body:
+            raise AgentError("BRIDGE_REMOTE_CHANGED", 409)
+        settings = remote.get("settings") or {}
+        if isinstance(settings, str):
+            settings = json.loads(settings)
+        if not isinstance(settings, dict) or settings.get("__type") != "max-browser":
+            raise AgentError("BRIDGE_REMOTE_INVALID", 409)
+        payload = {"type": "schedule", "date": datetime.fromtimestamp(due_at, UTC).isoformat(),
+                   "shortLink": False, "tags": [], "republish": False,
+                   "posts": [{"integration": {"id": remote["integration"]["id"]}, "group": remote["group"],
+                              "settings": settings, "value": [{"id": post_id,
+                              "content": remote["content"], "image": []}]}]}
+        result = self.request("POST", "/posts", json=payload)
+        if (not isinstance(result, list) or len(result) != 1
+                or not isinstance(result[0], dict) or result[0].get("postId") != post_id):
+            raise AgentError("POSTIZ_UNKNOWN", 503)
+        return post_id
+
     def close(self):
         self.client.close()

@@ -5,6 +5,7 @@ The caller must validate the source and its rights before passing its text here.
 """
 
 import copy
+import hashlib
 import ipaddress
 import json
 import re
@@ -24,6 +25,9 @@ TOPICS = {"science", "stories", "humor"}
 MAGELLANIC_EVIDENCE = "https://www.astronet.ru/db/msg/1167613/lmc.html"
 MAX_REVIEW_ISSUES = 3
 MAX_REVIEW_ISSUE_CHARS = 1024
+LEGACY_REVIEW_RUBRIC = "legacy"
+MEANING_FIRST_REVIEW_RUBRIC = "meaning-first-v1"
+REVIEW_RUBRICS = {LEGACY_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC}
 
 
 def _normalize_review(value):
@@ -44,6 +48,38 @@ def _normalize_review(value):
         # Preserve every character of a negative finding; do not truncate or filter it.
         issues.append(issue)
     return {"approved": value["approved"], "topic": value["topic"], "issues": issues}
+
+
+def normalize_rubric_review(value, rubric):
+    """Separate advisory wording from substantive issues without changing a verdict."""
+    if rubric == LEGACY_REVIEW_RUBRIC:
+        return _normalize_review(value)
+    if rubric != MEANING_FIRST_REVIEW_RUBRIC:
+        raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
+    if not isinstance(value, dict) or set(value) != {"approved", "topic", "issues", "warnings"}:
+        raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
+    normalized = _normalize_review({key: value[key] for key in ("approved", "topic", "issues")})
+    warnings = value["warnings"]
+    if (not isinstance(warnings, list) or len(warnings) > MAX_REVIEW_ISSUES
+            or any(not isinstance(item, str) or not item.strip()
+                   or len(item) > MAX_REVIEW_ISSUE_CHARS for item in warnings)):
+        raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
+    return {**normalized, "warnings": copy.deepcopy(warnings)}
+
+
+def article_reference_urls(text):
+    """Read literal reference URLs without dereferencing or rewriting them."""
+    return {value.rstrip(".,;") for value in re.findall(r"https?://[^\s<>\"\]\)]+", text)}
+
+
+def rubric_translation_gate(original, translated, rubric):
+    """Keep numerical/language constraints and preserve every embedded reference."""
+    if not isinstance(rubric, str) or rubric not in REVIEW_RUBRICS:
+        raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
+    translation_gate(original, translated)
+    if (rubric == MEANING_FIRST_REVIEW_RUBRIC
+            and article_reference_urls(original) != article_reference_urls(translated)):
+        raise AgentError("TRANSLATION_REFERENCE_CHANGED")
 
 
 def _numeric_feedback(original, translated):
@@ -102,6 +138,28 @@ def adjudicate_scientific_spelling(original, translated, matches):
     return adjudicated, unresolved
 
 
+def rubric_spelling(original, translated, matches, rubric):
+    """Retain style suggestions as audited advice; grammar and unknown rules block."""
+    if not isinstance(rubric, str) or rubric not in REVIEW_RUBRICS:
+        raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
+    adjudicated, unresolved = adjudicate_scientific_spelling(original, translated, matches)
+    if rubric == LEGACY_REVIEW_RUBRIC:
+        return adjudicated, unresolved
+    blocking = []
+    for match in unresolved:
+        rule, kind = match.get("rule"), match.get("type")
+        if (isinstance(rule, dict) and rule.get("issueType") in {"style", "register"}
+                and isinstance(kind, dict) and kind.get("typeName") in {"Other", "Style", "Register"}
+                and isinstance(rule.get("category"), dict)
+                and isinstance(rule["category"].get("id"), str) and rule["category"]["id"]
+                and rule["category"].get("id") not in {"GRAMMAR", "TYPOS", "CONFUSED_WORDS"}):
+            adjudicated.append({"match": copy.deepcopy(match), "reason": "NON_BLOCKING_STYLE_RULE",
+                                "review_rubric": rubric})
+        else:
+            blocking.append(match)
+    return adjudicated, blocking
+
+
 def canonical_article_url(value):
     """Validate a public HTTPS reference without resolving or requesting its host."""
     try:
@@ -147,7 +205,8 @@ def _validated_source(title, original):
 
 class ArticleQuality:
     def __init__(self, translator, reviewer, spelling_url=SPELLING_URL, transport=None,
-                 prompt_dir=None, trace=None, allow_human_rejection=False):
+                 prompt_dir=None, trace=None, allow_human_rejection=False,
+                 review_rubric=LEGACY_REVIEW_RUBRIC):
         if (translator is reviewer or (
                 getattr(translator, "model", None) and getattr(reviewer, "model", None)
                 and translator.model == reviewer.model)):
@@ -161,9 +220,15 @@ class ArticleQuality:
         if type(allow_human_rejection) is not bool:
             raise AgentError("ARTICLE_REVIEW_MODE_INVALID")
         self.allow_human_rejection = allow_human_rejection
+        if not isinstance(review_rubric, str) or review_rubric not in REVIEW_RUBRICS:
+            raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
+        self.review_rubric = review_rubric
         prompts = Path(prompt_dir) if prompt_dir else Path(__file__).resolve().parents[2] / "prompts"
         self.translation_prompt = (prompts / "ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8")
-        self.review_prompt = (prompts / "ARTICLE_REVIEW.txt").read_text(encoding="utf-8")
+        review_file = ("ARTICLE_REVIEW_MEANING_FIRST_V1.txt"
+                       if review_rubric == MEANING_FIRST_REVIEW_RUBRIC else "ARTICLE_REVIEW.txt")
+        self.review_prompt = (prompts / review_file).read_text(encoding="utf-8")
+        self.review_prompt_hash = hashlib.sha256(self.review_prompt.encode()).hexdigest()
         self.spelling_url = spelling_url
         self.spelling = httpx.Client(timeout=60, trust_env=False, transport=transport)
 
@@ -188,7 +253,7 @@ class ArticleQuality:
 
     def _human_evidence(self, prepared, title, original, reviewed, raw, matches,
                         adjudicated, unresolved):
-        if self.allow_human_rejection:
+        if self.allow_human_rejection or self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC:
             prepared["machine_review_status"] = "passed" if reviewed["approved"] else "rejected"
             prepared["machine_review_evidence"] = {
                 "review_raw": raw, "review": copy.deepcopy(reviewed),
@@ -197,6 +262,12 @@ class ArticleQuality:
                 "spelling_unresolved": copy.deepcopy(unresolved), "hard_gates_passed": True,
                 "text_hash": fingerprint({"title": prepared["title"], "body": prepared["body"]}),
                 "source_hash": fingerprint({"title": title, "body": original, "url": prepared["url"]})}
+            if self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC:
+                prepared.update(review_rubric=self.review_rubric,
+                                review_prompt_hash=self.review_prompt_hash,
+                                warnings=copy.deepcopy(reviewed["warnings"]))
+                prepared["machine_review_evidence"].update(
+                    review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash)
         return prepared
 
     def prepare(self, title, original, url):
@@ -237,7 +308,7 @@ class ArticleQuality:
             full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
             context["previous_translation"] = translated
             try:
-                translation_gate(source, text)
+                rubric_translation_gate(source, text, self.review_rubric)
                 if len(full) > 3500:
                     raise AgentError("ARTICLE_POST_TOO_LONG")
             except AgentError as exc:
@@ -256,6 +327,9 @@ class ArticleQuality:
                 continue
             review_context = {"instruction": self.review_prompt,
                               "source_untrusted": source, "translation_untrusted": text}
+            if self.review_rubric != LEGACY_REVIEW_RUBRIC:
+                review_context.update(review_rubric=self.review_rubric,
+                                      review_prompt_hash=self.review_prompt_hash)
             self._emit("review_started", attempt, context=review_context)
             raw_review = None
             try:
@@ -278,7 +352,7 @@ class ArticleQuality:
                 self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
             try:
-                normalized = _normalize_review(reviewed)
+                normalized = normalize_rubric_review(reviewed, self.review_rubric)
             except AgentError:
                 context["repair_feedback"] = {"code": "ARTICLE_REVIEW_SCHEMA_INVALID",
                     "review_untrusted": reviewed,
@@ -302,7 +376,7 @@ class ArticleQuality:
                 self._emit("spelling_failed", attempt, error=exc.code)
                 raise
             self._emit("spelling_returned", attempt, matches=matches)
-            adjudicated, unresolved = adjudicate_scientific_spelling(source, text, matches)
+            adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric)
             self._emit("spelling_adjudicated", attempt, adjudicated=adjudicated, unresolved=unresolved)
             passed = reviewed["approved"] and not reviewed["issues"]
             human_rejection = (self.allow_human_rejection and reviewed["approved"] is False
@@ -336,7 +410,7 @@ class ArticleQuality:
         self._emit("candidate_started", 1, mode="candidate", candidate={"title": title, "body": body},
                    source_untrusted={"title": original_title, "body": original, "url": url})
         try:
-            translation_gate(source, text)
+            rubric_translation_gate(source, text, self.review_rubric)
             if len(full) > 3500:
                 raise AgentError("ARTICLE_POST_TOO_LONG")
         except AgentError as exc:
@@ -346,6 +420,9 @@ class ArticleQuality:
         self._emit("gate_passed", 1, characters=len(full))
         review_context = {"instruction": self.review_prompt,
                           "source_untrusted": source, "translation_untrusted": text}
+        if self.review_rubric != LEGACY_REVIEW_RUBRIC:
+            review_context.update(review_rubric=self.review_rubric,
+                                  review_prompt_hash=self.review_prompt_hash)
         self._emit("review_started", 1, context=review_context)
         raw_review = None
         try:
@@ -361,7 +438,7 @@ class ArticleQuality:
             self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED")
             raise AgentError("ARTICLE_QUALITY_REJECTED") from exc
         try:
-            normalized = _normalize_review(reviewed)
+            normalized = normalize_rubric_review(reviewed, self.review_rubric)
         except AgentError as exc:
             self._emit("review_invalid", 1, error="ARTICLE_REVIEW_SCHEMA_INVALID", review=reviewed)
             self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED")
@@ -377,7 +454,7 @@ class ArticleQuality:
             self._emit("spelling_failed", 1, error=exc.code)
             raise
         self._emit("spelling_returned", 1, matches=matches)
-        adjudicated, unresolved = adjudicate_scientific_spelling(source, text, matches)
+        adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric)
         self._emit("spelling_adjudicated", 1, adjudicated=adjudicated, unresolved=unresolved)
         passed = reviewed["approved"] and not reviewed["issues"]
         human_rejection = (self.allow_human_rejection and reviewed["approved"] is False

@@ -36,8 +36,12 @@ class HourlyArticleCycle:
             policy = json.loads(path.read_text(encoding="utf-8-sig"))
             required = {"enabled", "target_id", "source_id", "allowed_hosts", "rights_evidence",
                         "owner_instruction", "min_gap_seconds", "max_per_day", "max_source_age_hours"}
-            if (set(policy) not in (required, required | {"approval_mode"})
-                    or policy.get("approval_mode", "legacy") not in {"legacy", "human"}
+            mode = policy.get("approval_mode", "legacy")
+            valid_keys = (set(policy) == required | {"approval_mode", "review_rubric"}
+                          and policy.get("review_rubric") == "meaning-first-v1") if mode == "automatic" else (
+                              set(policy) in (required, required | {"approval_mode"}))
+            if (not valid_keys
+                    or policy.get("approval_mode", "legacy") not in {"legacy", "human", "automatic"}
                     or type(policy["enabled"]) is not bool
                     or not all(isinstance(policy[k], str) and policy[k].strip()
                                for k in ("target_id", "source_id", "rights_evidence", "owner_instruction"))
@@ -182,8 +186,9 @@ class HourlyArticleCycle:
             if translator is not None:
                 cleanup.callback(translator.client.close)
             policy_path = self.core.settings.root / "data/hourly-article-policy.local.json"
-            human_mode = policy_path.exists() and self._policy(enabled=False).get("approval_mode") == "human"
-            if (human_mode and not review_only and (not isinstance(translator, DedicatedTranslator)
+            mode = self._policy(enabled=False).get("approval_mode") if policy_path.exists() else "legacy"
+            human_mode = mode == "human"
+            if (mode in {"human", "automatic"} and not review_only and (not isinstance(translator, DedicatedTranslator)
                                                   or translator.model != "hy-mt2-7b-q8")):
                 raise AgentError("HUMAN_HY_TRANSLATOR_REQUIRED", 409)
             if translator is None:
@@ -195,7 +200,8 @@ class HourlyArticleCycle:
             reviewer.model = "proxmox/qwen25-coder-7b"
             quality = ArticleQuality(translator, reviewer, prompt_dir=self.core.settings.root / "prompts",
                                      trace=self._trace_writer(record_id) if record_id else None,
-                                     allow_human_rejection=human_mode)
+                                     allow_human_rejection=human_mode,
+                                     review_rubric="meaning-first-v1" if mode == "automatic" else "legacy")
             cleanup.pop_all()
             return quality
 
@@ -353,13 +359,16 @@ class HourlyArticleCycle:
                     raise AgentError("ARTICLE_CORRECTION_CANDIDATE_REQUIRED", 409)
             else:
                 record = None
-                if any(item["slot"] == slot for item in ledger["records"]):
+                if any(item["slot"] == slot or item.get("automatic_slot") == slot for item in ledger["records"]):
                     raise AgentError("ARTICLE_SLOT_ALREADY_CLAIMED", 409)
             other_records = [item for item in ledger["records"] if item is not record]
-            if (policy.get("approval_mode") == "human"
-                    and sum(item["state"] == "awaiting_human_review" for item in other_records) >= 24):
-                raise AgentError("ARTICLE_HUMAN_REVIEW_BACKLOG", 409)
+            if (policy.get("approval_mode") in {"human", "automatic"}
+                    and sum(item["state"] in {"awaiting_human_review", "automatic_ready", "pending", "sending",
+                                              "unknown", "awaiting_postiz"} for item in other_records) >= 24):
+                raise AgentError("ARTICLE_AUTOMATIC_BACKLOG" if policy["approval_mode"] == "automatic"
+                                 else "ARTICLE_HUMAN_REVIEW_BACKLOG", 409)
             if any(item["state"] not in {"published", "failed", "cancelled", "rejected", "awaiting_human_review"}
+                   and not (item["state"] == "automatic_ready" and item.get("automatic_enrolled"))
                    for item in other_records):
                 raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
             if any(item.get("url") == article["url"] or item.get("original_hash") == original_hash for item in other_records):
@@ -451,6 +460,8 @@ class HourlyArticleCycle:
             session.add(DraftRevision(draft_id=draft.id, revision=1, payload=copy.deepcopy(payload),
                                      config_id=self.core.settings.hash))
             from .human_review import candidate_body, machine_metadata, text_hash as machine_text_hash
+            if policy.get("approval_mode") == "automatic":
+                from .automatic_policy import machine_metadata
             variant = Variant(draft_id=draft.id, target_id=target.id, title=prepared["title"],
                 body=prepared["body"], sources=[{"id": material.id, "url": material.url, "source_id": source["id"]}],
                 media=[], source_revision=1, config_hash=self.core.settings.hash,
@@ -483,9 +494,9 @@ class HourlyArticleCycle:
                 machine_review_status=variant.metadata_json.get("machine_review_status", "passed"),
                 machine_review_evidence_hash=variant.metadata_json.get("machine_review_evidence_hash"),
                 operator_correction=bool(attempt.get("operator_correction")))
-        if policy.get("approval_mode") == "human":
+        if policy.get("approval_mode") in {"human", "automatic"}:
             reviewed = self._snapshot(record)
-            record["state"] = "staging_human_draft"
+            record["state"] = "staging_human_draft" if policy["approval_mode"] == "human" else "staging_automatic_draft"
             self._save(ledger)
             external = self.core.stage_remote(record["variant_id"])
             fresh = self._snapshot(record)
@@ -493,7 +504,7 @@ class HourlyArticleCycle:
                     or fresh["revision"] != reviewed["revision"] + 1
                     or fresh["metadata"].get("postiz_state") != "DRAFT"):
                 raise AgentError("ARTICLE_REMOTE_CHANGED", 409)
-            record.update(state="awaiting_human_review", postiz_id=external,
+            record.update(state="awaiting_human_review" if policy["approval_mode"] == "human" else "automatic_ready", postiz_id=external,
                           prepared_hash=fingerprint(fresh))
         if attempt:
             attempt.update(state=record["state"], finished_at=now())
@@ -616,6 +627,8 @@ class HourlyArticleCycle:
         with profile_lock(self.directory / "cycle.lock"):
             policy, ledger = self._policy(), self._load()
             record = self._record(ledger, ident)
+            if policy.get("approval_mode") == "automatic" and record.get("postiz_id"):
+                raise AgentError("ARTICLE_EDIT_IN_POSTIZ_REQUIRED", 409)
             if (record["state"] != "prepared" or not record.get("variant_id")
                     or record["policy_hash"] != fingerprint(policy)):
                 raise AgentError("ARTICLE_CORRECTION_NOT_ALLOWED", 409)
@@ -705,8 +718,17 @@ class HourlyArticleCycle:
                     close_quality(quality, close_models=not self.quality_factory)
 
     def publish(self, ident, reviewed_hash, due_at=None):
-        """Hourly automation never grants the final human's approval."""
-        raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
+        """Only the explicit automatic policy may grant a policy approval."""
+        with profile_lock(self.directory / "cycle.lock"):
+            if self._policy().get("approval_mode") != "automatic":
+                raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
+            from .automatic_policy import publish
+            ledger = self._load()
+            return publish(self, self._record(ledger, ident), ledger, reviewed_hash, due_at)
+
+    def migrate_automatic(self, ident, reason):
+        from .automatic_migration import migrate
+        return migrate(self, ident, reason)
 
     def status(self, ident=None):
         with profile_lock(self.directory / "cycle.lock"):
@@ -715,6 +737,14 @@ class HourlyArticleCycle:
             if not ledger["records"]:
                 return {"state": "empty"}
             record = self._record(ledger, ident) if ident else ledger["records"][-1]
+            if ident is None:
+                by_variant = {item.get("variant_id"): item for item in ledger["records"] if item.get("variant_id")}
+                with self.core.db.session() as session:
+                    active = session.scalar(select(Dispatch).where(Dispatch.variant_id.in_(by_variant),
+                        Dispatch.state.in_(ACTIVE)).order_by(
+                            Dispatch.state.in_({"sending", "unknown"}).desc(), Dispatch.due_at.asc()))
+                    if active:
+                        record = by_variant[active.variant_id]
             if record.get("variant_id"):
                 with self.core.db.session() as session:
                     delivery = session.scalar(select(Dispatch).where(Dispatch.variant_id == record["variant_id"])

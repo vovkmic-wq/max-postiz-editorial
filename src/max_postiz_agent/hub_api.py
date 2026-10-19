@@ -103,7 +103,7 @@ class RedditMailInput(Input):
 def hub_app(service, run_worker=False, *, dispatch_only=False):
     worker_action = service.dispatch_tick if dispatch_only else service.tick
     app = create_app(service, run_worker=run_worker, legacy_image_worker=False, worker_tick=worker_action)
-    app.state.worker_mode = "human_hourly_dispatch_only" if dispatch_only else "full"
+    app.state.worker_mode = "hourly_dispatch_only" if dispatch_only else "full"
     # The old scheduler creates a base MAX Service and would bypass target approvals.
     app.router.routes = [route for route in app.router.routes
                          if getattr(route, "path", "") != "/api/v1/images/schedule/{action}"]
@@ -239,6 +239,7 @@ def hub_app(service, run_worker=False, *, dispatch_only=False):
                 variants.append(value)
             return {"targets": [serialize(t) for t in s.scalars(select(Target))], "variants": variants,
                     "role": role,
+                    "worker_mode": app.state.worker_mode, "worker_enabled": bool(run_worker),
                     "tasks": [serialize(t) for t in s.scalars(select(RecurringTask))],
                     "dispatches": [serialize(d) for d in s.scalars(select(Dispatch).order_by(Dispatch.due_at.desc()).limit(200))],
                     "postiz_configured": bool(service.postiz.base and service.postiz.key),
@@ -268,6 +269,8 @@ def hub_app(service, run_worker=False, *, dispatch_only=False):
     def approve(ident: str, value: ApprovalInput, request: Request,
                 authorization: str | None = Header(default=None), role=Depends(editor)):
         details = service.hourly_review_details(ident)
+        if details.get("automatic_policy") is True:
+            raise AgentError("ARTICLE_AUTOMATIC_POLICY_REQUIRED", 409)
         hourly = details.get("hourly_article", False)
         human_confirmed = False
         exception = {}

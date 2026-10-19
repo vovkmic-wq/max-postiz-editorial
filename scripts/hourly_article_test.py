@@ -25,6 +25,9 @@ def main():
     publish.add_argument("record_id")
     publish.add_argument("--reviewed-hash", required=True)
     publish.add_argument("--due-at", type=float)
+    migrate = sub.add_parser("migrate-automatic")
+    migrate.add_argument("record_id")
+    migrate.add_argument("--reason", required=True)
     status = sub.add_parser("status")
     status.add_argument("record_id", nargs="?")
     cancel = sub.add_parser("cancel-preparation")
@@ -61,6 +64,8 @@ def main():
                 restore_cancelled=args.restore_cancelled, reason=args.reason)
         elif args.action == "publish":
             result = cycle.publish(args.record_id, args.reviewed_hash, args.due_at)
+        elif args.action == "migrate-automatic":
+            result = cycle.migrate_automatic(args.record_id, args.reason)
         elif args.action == "cancel-preparation":
             result = cycle.cancel_preparation(args.record_id, args.reason)
         elif args.action == "abandon-prepared":

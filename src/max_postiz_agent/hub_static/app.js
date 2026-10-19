@@ -5,10 +5,33 @@ function status(value,error=false){el('status').textContent=value;el('status').c
 function node(tag,text){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;}
 function button(parent,label,fn){const b=node('button',label);b.onclick=async()=>{b.disabled=true;try{await fn();status('Готово');await refresh();}catch(e){status(e.message,true);}finally{b.disabled=false;}};parent.append(b);return b;}
 
+function automaticArticleStatus(card,v,target,state,details){
+ const banner=node('section');banner.className='automatic-policy';banner.setAttribute('aria-label','Автоматический маршрут');
+ banner.append(node('h4','Автоматическая публикация по политике'),node('p','Эта карточка показывает состояние подготовки и доставки. Согласование человеком здесь не требуется. Наличие черновика или машинной проверки само по себе не подтверждает публикацию.'));
+ banner.append(node('p',`Состояние: ${details?.status||'details_unavailable'} · машинная проверка: ${details?.machine_review_status||'unconfirmed'}`));
+ const paused=details?.target_paused??target?.paused;
+ banner.append(node('p',paused?'Адресат на паузе. Это не подтверждение готовности к отправке.':'Адресат активен. Отправка зависит от политики, даты, проверок и интервала.'));
+ const meta=v.metadata_json||{};
+ banner.append(node('p',`Postiz: ${meta.postiz_state||'состояние не подтверждено'}`));
+ if(Number.isFinite(meta.postiz_due_at))banner.append(node('p','Дата Postiz: '+new Date(meta.postiz_due_at*1000).toLocaleString('ru-RU',{timeZone:'Europe/Moscow'})+' (Москва)'));
+ else banner.append(node('p','Дата отправки в Postiz ещё не подтверждена.'));
+ banner.append(node('p',`Рубрика: ${details?.review_rubric||meta.review_rubric||'не подтверждена'}`));
+ if(details?.automatic_machine_review_valid!==true){const blocked=node('p','Нет подтверждённых машинных доказательств для автоматической отправки.');blocked.className='error';blocked.setAttribute('role','alert');banner.append(blocked);}
+ const issues=Array.isArray(details?.machine_review_issues)?details.machine_review_issues:[];
+ if(issues.length){const list=node('ul');list.className='error';list.setAttribute('aria-label','Замечания машинной проверки');for(const issue of issues)if(typeof issue==='string')list.append(node('li',issue));banner.append(list);}
+ const warnings=Array.isArray(details?.machine_review_warnings)?details.machine_review_warnings:[];
+ if(warnings.length){const list=node('ul');list.setAttribute('aria-label','Неблокирующие замечания');for(const warning of warnings)if(typeof warning==='string')list.append(node('li',warning));banner.append(node('h4','Неблокирующие замечания'),list);}
+ const evidence=details?.machine_review_evidence;
+ if(evidence&&typeof evidence==='object'&&!Array.isArray(evidence)){const proof=node('details');proof.className='machine-evidence';proof.append(node('summary','Исходные доказательства машинной проверки'),node('pre',JSON.stringify(evidence,null,2)));banner.append(proof);}
+ if(state.postiz_public_origin){const link=node('a','Открыть Postiz: редактор и календарь');link.href=state.postiz_public_origin+'/';link.target='_blank';link.rel='noopener noreferrer';banner.append(link);}
+ card.append(banner);
+}
+
 async function renderVariant(v,state){
  const card=node('article');card.className='card';
  const meta={...v.metadata_json},target=state.targets.find(t=>t.id===v.target_id),platform=target?.platform;
  const hourly=meta.origin==='hourly_article_test',editable=['owner','editor'].includes(state.role);
+ const automatic=hourly&&meta.approval_mode==='automatic';
  const postizTextCanonical=hourly&&Boolean(meta.postiz_post_id);
  const terminal=['published','abandoned'].includes(v.state);
  card.append(node('h3',`${v.target_id}: ${v.title}`),node('p',`Версия ${v.revision} · ${v.state}`));
@@ -17,8 +40,8 @@ async function renderVariant(v,state){
   try{details=await api(`/api/hub/variants/${v.id}/article-review`);}
   catch(error){details={machine_review_current:false,status:'details_unavailable'};card.append(node('p',error.message));}
   card.append(node('p',`Адресат: ${v.target_id} · ${target?.platform||'платформа недоступна'} · канал ${target?.destination||'недоступен — обновите карточку'}`));
-  card.append(node('p','DRAFT в Postiz → дата и QUEUE в календаре Postiz → финальное «Согласовать» в Hub. После правки в Postiz нажмите «Получить правки Postiz» и повторите проверку. Человек сравнивает оригинал и перевод; машинная проверка не заменяет его решение.'));
-  if(postizTextCanonical)card.append(node('p','Редактируйте текст в Postiz, затем получите правки и повторите Ministral + LanguageTool. В Hub текст показан только для сравнения и согласования.'));
+  if(!automatic){card.append(node('p','DRAFT в Postiz → дата и QUEUE в календаре Postiz → финальное «Согласовать» в Hub. После правки в Postiz нажмите «Получить правки Postiz» и повторите проверку. Человек сравнивает оригинал и перевод; машинная проверка не заменяет его решение.'));
+   if(postizTextCanonical)card.append(node('p','Редактируйте текст в Postiz, затем получите правки и повторите Ministral + LanguageTool. В Hub текст показан только для сравнения и согласования.'));}
  }
  const comparison=node('div');comparison.className=hourly?'article-comparison':'';card.append(comparison);
  if(hourly){
@@ -30,6 +53,7 @@ async function renderVariant(v,state){
  if(hourly)editor.append(node('h4','Перевод и правка (Русский)'));
  const title=node('input');title.value=v.title;title.readOnly=postizTextCanonical;title.setAttribute('aria-label','Заголовок');editor.append(title);
  const area=node('textarea');area.value=v.body;area.readOnly=postizTextCanonical;area.setAttribute('aria-label','Текст публикации');editor.append(area);
+ if(automatic){title.readOnly=true;area.readOnly=true;automaticArticleStatus(card,v,target,state,details);return card;}
  let media=[...v.media],updateReviewControls=()=>{};
  const tags=node('input'),community=node('input');
  if(platform==='pikabu'){tags.value=(meta.tags||[]).join(', ');tags.setAttribute('aria-label','Теги через запятую');community.value=meta.community||'';community.placeholder='Сообщество (необязательно)';editor.append(tags,community);}

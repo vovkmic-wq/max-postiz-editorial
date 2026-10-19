@@ -327,10 +327,27 @@ class HubService(Service):
 
     def approve_variant(self, ident, revision, body_hash, due_at, actor="editor", *, human_confirmed=False,
                         machine_exception_confirmed=False, machine_review_notes=""):
+        return self._approve_variant(ident, revision, body_hash, due_at, actor,
+                                     human_confirmed=human_confirmed,
+                                     machine_exception_confirmed=machine_exception_confirmed,
+                                     machine_review_notes=machine_review_notes)
+
+    def approve_hourly_policy(self, ident, revision, body_hash, due_at):
+        from .automatic_policy import POLICY_ACTOR
+        return self._approve_variant(ident, revision, body_hash, due_at, POLICY_ACTOR, automatic=True)
+
+    def _approve_variant(self, ident, revision, body_hash, due_at, actor, *, human_confirmed=False,
+                         machine_exception_confirmed=False, machine_review_notes="", automatic=False):
         from .human_review import eligible, hourly
         # Authorization must precede bridge synchronization or any other mutation.
         with self.db.session() as check:
-            if hourly(self._variant(check, ident)) and (human_confirmed is not True or actor not in {"owner", "editor"}):
+            variant = self._variant(check, ident)
+            if automatic:
+                from .automatic_policy import POLICY_ACTOR, eligible as automatic_eligible
+                if actor != POLICY_ACTOR:
+                    raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 403)
+                automatic_eligible(self, check, variant)
+            elif hourly(variant) and (human_confirmed is not True or actor not in {"owner", "editor"}):
                 raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
         self.bridge.sync(force=True)
         if type(due_at) not in {int, float} or not math.isfinite(due_at) or due_at < 0:
@@ -347,16 +364,21 @@ class HubService(Service):
             human_hourly = hourly(v)
             exception_evidence, exception_notes = None, None
             if human_hourly:
-                policy = eligible(self, s, v)
-                exception_evidence = self._hourly_machine_exception(s, v)
-                if exception_evidence is not None:
-                    if machine_exception_confirmed is not True:
-                        raise AgentError("ARTICLE_MACHINE_EXCEPTION_CONFIRMATION_REQUIRED", 403)
-                    exception_notes = _machine_exception_notes(machine_review_notes)
-                elif machine_exception_confirmed is not False or machine_review_notes != "":
-                    raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOT_ALLOWED", 409)
+                if automatic:
+                    from .automatic_policy import automatic_evidence
+                    policy = automatic_eligible(self, s, v)
+                    policy_evidence = automatic_evidence(s, v)
+                else:
+                    policy = eligible(self, s, v)
+                    exception_evidence = self._hourly_machine_exception(s, v)
+                    if exception_evidence is not None:
+                        if machine_exception_confirmed is not True:
+                            raise AgentError("ARTICLE_MACHINE_EXCEPTION_CONFIRMATION_REQUIRED", 403)
+                        exception_notes = _machine_exception_notes(machine_review_notes)
+                    elif machine_exception_confirmed is not False or machine_review_notes != "":
+                        raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOT_ALLOWED", 409)
                 if due_at < now():
-                    raise AgentError("HUMAN_RESCHEDULE_REQUIRED", 409)
+                    raise AgentError("ARTICLE_AUTOMATIC_DATE_INVALID" if automatic else "HUMAN_RESCHEDULE_REQUIRED", 409)
                 if s.scalar(select(Dispatch).join(Variant).where(Variant.target_id == t.id,
                                                                Dispatch.state.in_(ACTIVE))):
                     raise AgentError("ARTICLE_OUTSTANDING_DELIVERY", 409)
@@ -366,7 +388,8 @@ class HubService(Service):
                     raise AgentError("BRIDGE_EDIT_IN_PROGRESS", 409)
                 from .article_cycle import HourlyArticleCycle
                 HourlyArticleCycle(self)._cadence(policy, due_at)
-                actor = "human_editor:" + actor
+                if not automatic:
+                    actor = "human_editor:" + actor
             if t.paused and not human_hourly:
                 raise AgentError("TARGET_PAUSED", 409)
             if s.scalar(select(Dispatch).where(Dispatch.variant_id == ident, Dispatch.state.in_(ACTIVE | {"published", "owner_attested"}))):
@@ -396,7 +419,15 @@ class HubService(Service):
             s.add(d)
             v.state = "approved"
             self.db.audit(s, actor, "target_approve", v.id, revision=v.revision, hash=h)
-            if human_hourly:
+            if human_hourly and automatic:
+                self.db.audit(s, actor, "hourly_article_policy_review", a.id,
+                              approval_id=a.id, variant_id=v.id, revision=v.revision,
+                              content_hash=body_hash, snapshot_hash=h, due_at=due_at,
+                              target_id=t.id, destination=t.destination,
+                              evidence_hash=policy_evidence["evidence_hash"], policy_hash=fingerprint(policy),
+                              review_rubric=v.metadata_json["review_rubric"],
+                              approval_mode="automatic", owner_instruction=policy["owner_instruction"])
+            elif human_hourly:
                 self.db.audit(s, actor, "hourly_article_human_review", v.id,
                               revision=v.revision, content_hash=body_hash, due_at=due_at,
                               approval_id=a.id, machine_text_hash=v.metadata_json["machine_text_hash"],
@@ -422,14 +453,23 @@ class HubService(Service):
         if not a or a.revoked or a.snapshot_hash != current or d.snapshot_hash != current:
             raise AgentError("APPROVAL_STALE", 409)
         if hourly(v):
-            if a.actor not in HUMAN_ACTORS:
-                raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
-            policy = eligible(self, s, v)
-            exception_evidence = self._hourly_machine_exception(s, v)
-            if exception_evidence is not None:
-                self._check_machine_exception_approval(s, v, t, d, a, exception_evidence)
+            automatic = v.metadata_json.get("approval_mode") == "automatic"
+            if automatic:
+                from .automatic_policy import POLICY_ACTOR, automatic_evidence, check_approval
+                from .automatic_policy import eligible as automatic_eligible
+                if a.actor != POLICY_ACTOR:
+                    raise AgentError("ARTICLE_POLICY_APPROVAL_STALE", 403)
+                policy = automatic_eligible(self, s, v)
+                check_approval(self, s, v, t, d, a, automatic_evidence(s, v), policy)
+            else:
+                if a.actor not in HUMAN_ACTORS:
+                    raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
+                policy = eligible(self, s, v)
+                exception_evidence = self._hourly_machine_exception(s, v)
+                if exception_evidence is not None:
+                    self._check_machine_exception_approval(s, v, t, d, a, exception_evidence)
             if now() - d.due_at > 3600:
-                raise AgentError("HUMAN_RESCHEDULE_REQUIRED", 409)
+                raise AgentError("ARTICLE_AUTOMATIC_SLOT_EXPIRED" if automatic else "HUMAN_RESCHEDULE_REQUIRED", 409)
             if s.scalar(select(Dispatch).join(Variant).where(
                     Variant.target_id == t.id, Dispatch.id != d.id, Dispatch.state.in_(ACTIVE))):
                 raise AgentError("ARTICLE_OUTSTANDING_DELIVERY", 409)
@@ -489,22 +529,25 @@ class HubService(Service):
             return Delivery("scheduled", ident)
         raise AgentError("TARGET_ROUTE_UNSUPPORTED")
 
-    def publish_due(self, *, human_hourly_only=False):
+    def publish_due(self, *, human_hourly_only=False, hourly_only=False):
         completed = 0
         scope = None
-        if human_hourly_only:
+        if human_hourly_only or hourly_only:
             from .article_cycle import HourlyArticleCycle
             from .human_review import HUMAN_ACTORS
             policy = HourlyArticleCycle(self)._policy()
-            if policy.get("approval_mode") != "human":
+            mode = policy.get("approval_mode")
+            if mode not in ({"human"} if human_hourly_only else {"human", "automatic"}):
                 raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
+            from .automatic_policy import POLICY_ACTOR
+            actors = HUMAN_ACTORS if mode == "human" else {POLICY_ACTOR}
             scope = (select(Dispatch.id).join(Variant).join(Target)
                      .join(TargetApproval, TargetApproval.id == Dispatch.approval_id).where(
                          Target.id == policy["target_id"], Target.platform == "max", Target.route == "max_browser",
                          Variant.metadata_json["origin"].as_string() == "hourly_article_test",
-                         Variant.metadata_json["approval_mode"].as_string() == "human",
+                         Variant.metadata_json["approval_mode"].as_string() == mode,
                          Variant.metadata_json["policy_hash"].as_string() == fingerprint(policy),
-                         TargetApproval.actor.in_(HUMAN_ACTORS), TargetApproval.revoked.is_(False)))
+                         TargetApproval.actor.in_(actors), TargetApproval.revoked.is_(False)))
         # Expired send leases are uncertain; never select them for a second send.
         with self.db.session.begin() as s:
             expired = update(Dispatch).where(Dispatch.state == "sending", Dispatch.lease_until < now())
@@ -905,14 +948,14 @@ class HubService(Service):
             if exc.code == "ARTICLE_POLICY_DISABLED":
                 return 0
             raise
-        if policy.get("approval_mode") != "human":
+        if policy.get("approval_mode") not in {"human", "automatic"}:
             raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
         try:
             self.bridge.sync(target_id=policy["target_id"])
         except AgentError as exc:
             self.bridge.last_error = exc.code
             return 0
-        return self.publish_due(human_hourly_only=True)
+        return self.publish_due(hourly_only=True)
 
     def close(self):
         self.postiz.close()

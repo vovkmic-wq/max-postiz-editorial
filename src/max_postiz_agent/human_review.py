@@ -158,16 +158,33 @@ def details(core, ident):
         delivery = session.scalar(select(Dispatch).where(Dispatch.variant_id == ident)
                                   .order_by(Dispatch.state.in_(ACTIVE).desc(),
                                             (Dispatch.state == "published").desc(), Dispatch.due_at.desc()))
-        status = delivery.state if delivery else "awaiting_human_review" if current else "machine_recheck_required"
-        return {"hourly_article": True, "human_review_required": True,
+        automatic = variant.metadata_json.get("approval_mode") == "automatic"
+        automatic_proof = None
+        if automatic:
+            from .automatic_policy import automatic_evidence
+            automatic_proof = automatic_evidence(session, variant)
+        status = (delivery.state if delivery else
+                  "automatic_ready" if automatic_proof else "automatic_blocked" if automatic else
+                  "awaiting_human_review" if current else "machine_recheck_required")
+        if automatic and delivery and delivery.state == "published" and not delivery.verified:
+            status = "published_unverified"
+        return {"hourly_article": True, "human_review_required": not automatic,
+                "automatic_policy": automatic,
+                "automatic_machine_review_valid": automatic_proof is not None,
                 "source_title": source["title"], "source_body": source["body"],
                 "source_url": source["url"], "machine_review_current": current,
                 "machine_review_status": variant.metadata_json.get(
                     "machine_review_status", "passed" if current else "unconfirmed"),
                 "machine_review_issues": variant.metadata_json.get("machine_review_issues", []),
-                "machine_exception_eligible": rejected_evidence(session, variant) is not None,
+                "machine_review_warnings": copy.deepcopy(variant.metadata_json.get("machine_review_warnings", [])),
+                "review_rubric": variant.metadata_json.get("review_rubric"),
+                "review_prompt_hash": variant.metadata_json.get("review_prompt_hash"),
+                "machine_exception_eligible": not automatic and rejected_evidence(session, variant) is not None,
                 "machine_review_evidence": copy.deepcopy(variant.metadata_json.get("machine_review_evidence")),
                 "machine_review_evidence_hash": variant.metadata_json.get("machine_review_evidence_hash"),
+                "target_paused": session.get(Target, variant.target_id).paused,
+                "dispatch_state": delivery.state if delivery else None,
+                "delivery_verified": delivery.verified if delivery else False,
                 "status": status, "revision": variant.revision,
                 "content_hash": fingerprint(core.snapshot(variant, session.get(Target, variant.target_id)))}
 
