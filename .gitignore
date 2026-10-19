@@ -30,4 +30,6 @@ config/image_channels.json
 
 config/holidays.json
 config/reddit_intake.json
+config/translation.json
+config/translation-service.json
 deployment/postiz/.env

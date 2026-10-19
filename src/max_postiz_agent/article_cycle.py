@@ -168,10 +168,27 @@ class HourlyArticleCycle:
         if self.quality_factory:
             return self.quality_factory()
         from .article_quality import ArticleQuality
-        translator, reviewer = OpenCode(self.core.settings), OpenCode(self.core.settings)
-        translator.model, reviewer.model = "proxmox/qwen35-9b", "proxmox/qwen25-coder-7b"
+        from .translation import configured_translator
+        translator = configured_translator(self.core.settings)
+        if translator is None:
+            translator = OpenCode(self.core.settings)
+            translator.model = "proxmox/qwen35-9b"
+        reviewer = OpenCode(self.core.settings)
+        reviewer.model = "proxmox/qwen25-coder-7b"
         return ArticleQuality(translator, reviewer, prompt_dir=self.core.settings.root / "prompts",
                               trace=self._trace_writer(record_id) if record_id else None)
+
+    @staticmethod
+    def _quality_provenance(quality, operator_candidate=False):
+        from .translation import DedicatedTranslator
+        if operator_candidate:
+            return {"quality": "operator_ministral_languagetool"}
+        translator = getattr(quality, "translator", None)
+        if isinstance(translator, DedicatedTranslator):
+            return {"quality": "dedicated_translation_independent_review_languagetool",
+                    "translation_model": translator.model,
+                    "review_model": getattr(quality.reviewer, "model", None)}
+        return {"quality": "qwen_ministral_languagetool"}
 
     def _assert_pre_draft(self, record):
         if any(record.get(key) for key in ("variant_id", "postiz_id", "dispatch_id", "due_at", "prepared_hash")):
@@ -393,7 +410,7 @@ class HourlyArticleCycle:
                         media=[], source_revision=1, config_hash=self.core.settings.hash,
                         binding_hash=target.binding_hash, metadata_json={"origin": "hourly_article_test",
                             "record_id": record["id"], "rights_evidence": policy["rights_evidence"],
-                            "quality": "operator_ministral_languagetool" if candidate is not None else "qwen_ministral_languagetool",
+                            **self._quality_provenance(quality, operator_candidate=candidate is not None),
                             "operator_correction_hash": attempt.get("candidate_hash"), "topic": prepared["topic"],
                             "translation_hash": translation_hash})
                     session.add(variant)

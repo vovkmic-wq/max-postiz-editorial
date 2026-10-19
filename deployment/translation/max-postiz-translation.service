@@ -1,0 +1,28 @@
+[Unit]
+Description=MAX/Postiz dedicated EN to RU translation gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=editorial
+Group=editorial
+WorkingDirectory=/opt/max-postiz
+ExecStart=/opt/max-postiz/translation-venv/bin/python /opt/max-postiz/deployment/translation/service.py --config /opt/max-postiz/config/translation-service.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+MemoryMax=1500M
+CPUQuota=200%
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+CapabilityBoundingSet=
+IPAddressDeny=any
+IPAddressAllow=127.0.0.0/8
+IPAddressAllow=10.20.30.143/32
+
+[Install]
+WantedBy=multi-user.target

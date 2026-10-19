@@ -1,0 +1,8 @@
+{
+  "prompt_path": "/opt/max-postiz/prompts/DEDICATED_TRANSLATE.txt",
+  "opus_path": "/opt/max-postiz/data/translation-models/opus-mt-en-ru-int8",
+  "opus_source": "/opt/max-postiz/data/translation-models/opus-source",
+  "gguf": {
+    "hy-mt2-7b-q8": "http://10.20.30.143:8089"
+  }
+}

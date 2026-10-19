@@ -1,0 +1,29 @@
+[
+  {
+    "id": "hy-mt2-1.8b-q8",
+    "repo": "tencent/Hy-MT2-1.8B-GGUF",
+    "revision": "a0c709d9fac510f2c807aa3af52872340dc37a4a",
+    "file": "Hy-MT2-1.8B-Q8_0.gguf",
+    "size": 1908528192,
+    "sha256": "5c3fe0b1408a5ceb0143184ef247b11b579c525f4b02b060e6c851bb76fef1a4",
+    "gpu_layers": 99
+  },
+  {
+    "id": "hy-mt2-7b-q8",
+    "repo": "tencent/Hy-MT2-7B-GGUF",
+    "revision": "ab8472660ac61fac25f1af43fac2599d52a8a775",
+    "file": "HY-MT2-7B-Q8_0.gguf",
+    "size": 7981928896,
+    "sha256": "58b3ad55dd6f6fa08c695cddc34fb5f8f708a844f78ae10508071914b0ed67c0",
+    "gpu_layers": 10
+  },
+  {
+    "id": "translategemma-12b-q4",
+    "repo": "mradermacher/translategemma-12b-it-GGUF",
+    "revision": "41d7c8aa650b26791225ad9d0597e674e680da96",
+    "file": "translategemma-12b-it.Q4_K_M.gguf",
+    "size": 7300794112,
+    "sha256": "b7aac4b4be7ab0c49b6556c29c4467e74313df7f1e95d9f9676bb2adf0afa528",
+    "gpu_layers": 16
+  }
+]
