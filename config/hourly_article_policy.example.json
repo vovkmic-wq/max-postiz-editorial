@@ -1,10 +1,11 @@
 {
   "enabled": false,
+  "approval_mode": "human",
   "target_id": "max_test",
   "source_id": "nasa_svs_articles",
   "allowed_hosts": ["svs.gsfc.nasa.gov"],
   "rights_evidence": "https://svs.gsfc.nasa.gov/help/",
-  "owner_instruction": "Replace with the actual owner delegation before enabling",
+  "owner_instruction": "Human editor must approve the exact text, target and date in Hub; automation prepares drafts only",
   "min_gap_seconds": 3600,
   "max_per_day": 24,
   "max_source_age_hours": 8760

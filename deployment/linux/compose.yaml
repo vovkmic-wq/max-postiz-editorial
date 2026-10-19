@@ -8,10 +8,10 @@ services:
       NEXT_PUBLIC_BACKEND_URL: ${POSTIZ_PUBLIC_ORIGIN}/api
       MAX_BRIDGE_URL: http://host.docker.internal:8091/api/max-bridge
       NODE_OPTIONS: --max-old-space-size=2048
-      # Owner pause: all 36 queues of the installed custom Postiz image.
+      # Only the owner-approved human MAX route is enabled; email/other routes stay paused.
       # RUN_CRON uses truthiness, so the string 'false' would still enable it.
       RUN_CRON: ''
-      EXCLUDE_QUEUE: bluesky,devto,discord,dribbble,email,email-bulk,facebook,gmb,hashnode,instagram,kick,lemmy,linkedin,listmonk,main,mastodon,max,medium,mewe,moltbook,nostr,pinterest,reddit,skool,slack,telegram,threads,tiktok,tumblr,twitch,vk,whop,wordpress,wrapcast,x,youtube
+      EXCLUDE_QUEUE: bluesky,devto,discord,dribbble,email,email-bulk,facebook,gmb,hashnode,instagram,kick,lemmy,linkedin,listmonk,mastodon,medium,mewe,moltbook,nostr,pinterest,reddit,skool,slack,telegram,threads,tiktok,tumblr,twitch,vk,whop,wordpress,wrapcast,x,youtube
     extra_hosts:
       - host.docker.internal:host-gateway
     ports: !override

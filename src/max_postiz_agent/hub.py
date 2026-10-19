@@ -178,6 +178,13 @@ class HubService(Service):
             v = self._variant(s, ident, True)
             if v.revision != revision:
                 raise AgentError("REVISION_CONFLICT", 409)
+            from .human_review import hourly
+            from .hub_models import BridgePost
+            if hourly(v) and (v.metadata_json.get("postiz_post_id") or s.get(RemoteDraft, v.id)
+                              or s.scalar(select(BridgePost).where(BridgePost.variant_id == v.id))):
+                # A local edit would diverge from the canonical Postiz editor;
+                # unchanged remote hashes must not make that edit sendable.
+                raise AgentError("ARTICLE_EDIT_IN_POSTIZ_REQUIRED", 409)
             self._invalidate(s, v)
             draft = s.get(Draft, v.draft_id)
             t = self._target(s, v.target_id)
@@ -266,10 +273,24 @@ class HubService(Service):
             from .pikabu_metadata import metadata
             metadata(v.title, v.metadata_json)
 
-    def approve_variant(self, ident, revision, body_hash, due_at, actor="editor"):
+    def hourly_review_details(self, variant_id):
+        from .human_review import details
+        return details(self, variant_id)
+
+    def recheck_hourly_variant(self, variant_id, revision, content_hash):
+        from .human_review import recheck
+        return recheck(self, variant_id, revision, content_hash)
+
+    def approve_variant(self, ident, revision, body_hash, due_at, actor="editor", *, human_confirmed=False):
+        from .human_review import eligible, hourly, machine_current
+        # Authorization must precede bridge synchronization or any other mutation.
+        with self.db.session() as check:
+            if hourly(self._variant(check, ident)) and (human_confirmed is not True or actor not in {"owner", "editor"}):
+                raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
         self.bridge.sync(force=True)
-        if not isinstance(due_at, (int, float)) or not math.isfinite(due_at) or due_at < 0:
+        if type(due_at) not in {int, float} or not math.isfinite(due_at) or due_at < 0:
             raise AgentError("SCHEDULE_INVALID")
+        due_at = float(due_at)
         with self.db.session.begin() as s:
             v = self._variant(s, ident, True)
             t = s.scalar(select(Target).where(Target.id == v.target_id).with_for_update())
@@ -278,7 +299,24 @@ class HubService(Service):
                 raise AgentError("REVISION_CONFLICT", 409)
             self._quality(s, v, t)
             self.bridge.check_approval(s, v, due_at)
-            if t.paused:
+            human_hourly = hourly(v)
+            if human_hourly:
+                policy = eligible(self, s, v)
+                if not machine_current(s, v):
+                    raise AgentError("ARTICLE_MACHINE_RECHECK_REQUIRED", 409)
+                if due_at < now():
+                    raise AgentError("HUMAN_RESCHEDULE_REQUIRED", 409)
+                if s.scalar(select(Dispatch).join(Variant).where(Variant.target_id == t.id,
+                                                               Dispatch.state.in_(ACTIVE))):
+                    raise AgentError("ARTICLE_OUTSTANDING_DELIVERY", 409)
+                from .hub_models import BridgePost
+                if s.scalar(select(BridgePost).where(BridgePost.target_id == t.id,
+                                                     BridgePost.mutation_owner.is_not(None))):
+                    raise AgentError("BRIDGE_EDIT_IN_PROGRESS", 409)
+                from .article_cycle import HourlyArticleCycle
+                HourlyArticleCycle(self)._cadence(policy, due_at)
+                actor = "human_editor:" + actor
+            if t.paused and not human_hourly:
                 raise AgentError("TARGET_PAUSED", 409)
             if s.scalar(select(Dispatch).where(Dispatch.variant_id == ident, Dispatch.state.in_(ACTIVE | {"published", "owner_attested"}))):
                 raise AgentError("DELIVERY_ALREADY_EXISTS", 409)
@@ -294,6 +332,8 @@ class HubService(Service):
                 raise AgentError("DAILY_LIMIT_REACHED", 409)
             if any(abs(d.due_at - due_at) < min_gap for d in previous):
                 raise AgentError("SCHEDULE_GAP_TOO_SHORT", 409)
+            if human_hourly:
+                t.paused = False
             # Snapshot plus schedule form one immutable approval.
             h = fingerprint({"content": snapshot, "due_at": due_at})
             a = TargetApproval(variant_id=v.id, revision=v.revision, snapshot_hash=h,
@@ -305,10 +345,15 @@ class HubService(Service):
             s.add(d)
             v.state = "approved"
             self.db.audit(s, actor, "target_approve", v.id, revision=v.revision, hash=h)
+            if human_hourly:
+                self.db.audit(s, actor, "hourly_article_human_review", v.id,
+                              revision=v.revision, content_hash=body_hash, due_at=due_at,
+                              approval_id=a.id, machine_text_hash=v.metadata_json["machine_text_hash"])
             s.flush()
             return d.id
 
     def _valid_dispatch(self, s, d):
+        from .human_review import HUMAN_ACTORS, eligible, hourly, machine_current
         v = self._variant(s, d.variant_id)
         self.bridge.check_approval(s, v, d.due_at)
         t = self._target(s, v.target_id)
@@ -316,6 +361,23 @@ class HubService(Service):
         current = fingerprint({"content": self.snapshot(v, t), "due_at": d.due_at})
         if not a or a.revoked or a.snapshot_hash != current or d.snapshot_hash != current:
             raise AgentError("APPROVAL_STALE", 409)
+        if hourly(v):
+            if a.actor not in HUMAN_ACTORS:
+                raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
+            policy = eligible(self, s, v)
+            if not machine_current(s, v):
+                raise AgentError("ARTICLE_MACHINE_RECHECK_REQUIRED", 409)
+            if now() - d.due_at > 3600:
+                raise AgentError("HUMAN_RESCHEDULE_REQUIRED", 409)
+            if s.scalar(select(Dispatch).join(Variant).where(
+                    Variant.target_id == t.id, Dispatch.id != d.id, Dispatch.state.in_(ACTIVE))):
+                raise AgentError("ARTICLE_OUTSTANDING_DELIVERY", 409)
+            from .hub_models import BridgePost
+            if s.scalar(select(BridgePost).where(BridgePost.target_id == t.id,
+                                                BridgePost.mutation_owner.is_not(None))):
+                raise AgentError("BRIDGE_EDIT_IN_PROGRESS", 409)
+            from .article_cycle import HourlyArticleCycle
+            HourlyArticleCycle(self)._cadence(policy, now())
         if t.paused:
             raise AgentError("TARGET_PAUSED", 409)
         self._quality(s, v, t)
@@ -366,17 +428,35 @@ class HubService(Service):
             return Delivery("scheduled", ident)
         raise AgentError("TARGET_ROUTE_UNSUPPORTED")
 
-    def publish_due(self):
+    def publish_due(self, *, human_hourly_only=False):
         completed = 0
+        scope = None
+        if human_hourly_only:
+            from .article_cycle import HourlyArticleCycle
+            from .human_review import HUMAN_ACTORS
+            policy = HourlyArticleCycle(self)._policy()
+            if policy.get("approval_mode") != "human":
+                raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
+            scope = (select(Dispatch.id).join(Variant).join(Target)
+                     .join(TargetApproval, TargetApproval.id == Dispatch.approval_id).where(
+                         Target.id == policy["target_id"], Target.platform == "max", Target.route == "max_browser",
+                         Variant.metadata_json["origin"].as_string() == "hourly_article_test",
+                         Variant.metadata_json["approval_mode"].as_string() == "human",
+                         Variant.metadata_json["policy_hash"].as_string() == fingerprint(policy),
+                         TargetApproval.actor.in_(HUMAN_ACTORS), TargetApproval.revoked.is_(False)))
         # Expired send leases are uncertain; never select them for a second send.
         with self.db.session.begin() as s:
-            s.execute(update(Dispatch).where(Dispatch.state == "sending", Dispatch.lease_until < now())
-                      .values(state="unknown", error="SEND_LEASE_EXPIRED"))
+            expired = update(Dispatch).where(Dispatch.state == "sending", Dispatch.lease_until < now())
+            if scope is not None:
+                expired = expired.where(Dispatch.id.in_(scope))
+            s.execute(expired.values(state="unknown", error="SEND_LEASE_EXPIRED"))
         for _ in range(50):
             with self.db.session.begin() as s:
                 query = select(Dispatch).join(Variant).join(Target).where(
                     Dispatch.state.in_({"pending", "retry_wait"}), Target.paused.is_(False),
                     or_(Dispatch.due_at <= now(), Target.route == "postiz")).order_by(Dispatch.due_at)
+                if scope is not None:
+                    query = query.where(Dispatch.id.in_(scope))
                 # Lock content and dispatch together; editors take Variant first.
                 # SKIP LOCKED avoids waiting on a concurrently edited variant.
                 d = s.scalar(query.with_for_update(skip_locked=True, of=(Variant, Dispatch, Target)))
@@ -385,7 +465,8 @@ class HubService(Service):
                 try:
                     _, t = self._valid_dispatch(s, d)
                 except AgentError as exc:
-                    if exc.code in {"TARGET_PAUSED", "BRIDGE_EDIT_IN_PROGRESS"}:
+                    if exc.code in {"TARGET_PAUSED", "BRIDGE_EDIT_IN_PROGRESS", "ARTICLE_HOURLY_GAP",
+                                    "ARTICLE_OUTSTANDING_DELIVERY"}:
                         # Pausing freezes work without invalidating its approval.
                         break
                     d.state, d.error = "cancelled", exc.code
@@ -419,7 +500,10 @@ class HubService(Service):
                         error = "RETRY_REQUIRES_OPERATOR"
                 row.error, row.owner, row.lease_until = error, None, 0
                 self._variant(s, row.variant_id).state = row.state
-                s.add(DispatchAttempt(dispatch_id=row.id, result=row.state, error=error))
+                s.add(DispatchAttempt(dispatch_id=row.id, result=row.state, error=error, created_at=now()))
+                from .human_review import hourly
+                if row.state == "published" and row.verified and hourly(self._variant(s, row.variant_id)):
+                    self._target(s, self._variant(s, row.variant_id).target_id).paused = True
         return completed
 
     def stage_remote(self, variant_id, due_at=None):
@@ -750,6 +834,24 @@ class HubService(Service):
             self.reddit_mail_error = exc.code
         self.reddit_intake.process_one()
         return value
+
+    def dispatch_tick(self):
+        """One existing worker, restricted to the human-approved hourly route."""
+        from .article_cycle import HourlyArticleCycle
+        try:
+            policy = HourlyArticleCycle(self)._policy()
+        except AgentError as exc:
+            if exc.code == "ARTICLE_POLICY_DISABLED":
+                return 0
+            raise
+        if policy.get("approval_mode") != "human":
+            raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
+        try:
+            self.bridge.sync(target_id=policy["target_id"])
+        except AgentError as exc:
+            self.bridge.last_error = exc.code
+            return 0
+        return self.publish_due(human_hourly_only=True)
 
     def close(self):
         self.postiz.close()

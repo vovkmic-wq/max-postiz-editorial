@@ -189,6 +189,7 @@ class ArticleQuality:
         context = {"instruction": self.translation_prompt,
                    "source_untrusted": {"title": title, "body": original, "url": url},
                    "numeric_tokens_must_match_exactly": sorted(numbers(source))}
+        immutable_candidates = getattr(self.translator, "immutable_candidates", False) is True
         rejected_candidates = {}
         for attempt in range(1, 4):
             self._emit("translation_started", attempt, context=context)
@@ -247,11 +248,16 @@ class ArticleQuality:
                 self._emit("review_returned", attempt, raw=raw_review)
                 reviewed = extract_object(raw_review)
             except AgentError as exc:
-                if exc.code != "INVALID_EDITOR_RESULT":
+                if exc.code != "INVALID_EDITOR_RESULT" or exc.status >= 500:
                     if exc.code != "ARTICLE_TRACE_FAILED":
                         self._emit("review_failed", attempt, error=exc.code)
                     raise
                 context["repair_feedback"] = "Independent review returned invalid JSON; approval was not granted."
+                if immutable_candidates:
+                    context["repair_feedback"] = {"code": exc.code,
+                        "raw_review_untrusted": raw_review,
+                        "advice": context["repair_feedback"]}
+                    rejected_candidates[text] = copy.deepcopy(context["repair_feedback"])
                 self._emit("review_invalid", attempt, error=exc.code, raw=raw_review)
                 self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
@@ -262,7 +268,9 @@ class ArticleQuality:
                     "review_untrusted": reviewed,
                     "advice": "Independent review schema invalid; approval was not granted. "
                               "Preserve any negative findings and correct the candidate against the source."}
-                if reviewed.get("approved") is False or reviewed.get("issues"):
+                if immutable_candidates:
+                    context["repair_feedback"]["raw_review_untrusted"] = raw_review
+                if immutable_candidates or reviewed.get("approved") is False or reviewed.get("issues"):
                     rejected_candidates[text] = copy.deepcopy(context["repair_feedback"])
                 self._emit("review_invalid", attempt, error="ARTICLE_REVIEW_SCHEMA_INVALID", review=reviewed)
                 self._emit("retry", attempt, feedback=context["repair_feedback"])
@@ -325,7 +333,7 @@ class ArticleQuality:
             self._emit("review_returned", 1, raw=raw_review)
             reviewed = extract_object(raw_review)
         except AgentError as exc:
-            if exc.code != "INVALID_EDITOR_RESULT":
+            if exc.code != "INVALID_EDITOR_RESULT" or exc.status >= 500:
                 if exc.code != "ARTICLE_TRACE_FAILED":
                     self._emit("review_failed", 1, error=exc.code)
                 raise

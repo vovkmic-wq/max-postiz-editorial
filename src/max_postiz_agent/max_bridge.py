@@ -226,6 +226,13 @@ class MaxBridge:
                 link = BridgePost(post_id=remote["id"], integration_id=remote["integration"]["id"],
                                   group_id=remote["group"], target_id=target.id, variant_id=v.id)
                 s.add(link)
+            if v.metadata_json.get("origin") == "hourly_article_test":
+                title = next((line.strip() for line in body.splitlines() if line.strip()), "")
+                if not title:
+                    raise AgentError("BODY_REQUIRED", 409)
+                if len(title) > 500:
+                    raise AgentError("ARTICLE_TITLE_TOO_LONG", 409)
+                v.title = title
             link.remote_hash, link.remote_state, link.due_at = remote_hash, remote["state"], due
             link.group_id = remote["group"]
             link.active, link.error, link.updated_at = True, None, now()
@@ -235,13 +242,14 @@ class MaxBridge:
             self.core.db.audit(s, "postiz_bridge", "bridge_import", v.id, post_id=link.post_id)
             return v.id
 
-    def sync(self, force=False):
+    def sync(self, force=False, *, target_id=None):
         if not self.enabled or (not force and now() < self.next_poll):
             return 0
         self.next_poll = now() + 15
         with self.core.db.session() as s:
             targets = {t.options.get("postiz_integration_id"): t for t in s.scalars(select(Target))
-                       if t.enabled and t.route == "max_browser" and t.options.get("postiz_integration_id")}
+                       if t.enabled and t.route == "max_browser" and t.options.get("postiz_integration_id")
+                       and (target_id is None or t.id == target_id)}
         if not targets:
             return 0
         integrations = {i["id"]: i for i in self.core.postiz.integrations()}
@@ -265,6 +273,8 @@ class MaxBridge:
                         link.error = exc.code
         with self.core.db.session.begin() as s:
             for link in s.scalars(select(BridgePost)):
+                if target_id is not None and link.target_id != target_id:
+                    continue
                 if link.post_id not in seen and link.active:
                     v = self.core._variant(s, link.variant_id, True)
                     try:
@@ -309,12 +319,15 @@ class MaxBridge:
         if not self.enabled or not link.active or link.error or link.mutation_owner:
             raise AgentError("BRIDGE_SEND_BLOCKED", 409)
         remote = self.core.postiz.get_post(link.post_id)
-        _, images, due, current = self.normalize(remote)
+        body, images, due, current = self.normalize(remote)
         integration = next((i for i in self.core.postiz.integrations() if i["id"] == link.integration_id), None)
         if (not integration or integration.get("disabled") or integration.get("refreshNeeded")
                 or integration.get("identifier") != PROVIDER or integration.get("accountId") != target.destination):
             raise AgentError("BRIDGE_INTEGRATION_UNAVAILABLE", 409)
         if current != dispatch.snapshot["metadata"].get("postiz_hash") or remote["state"] != "QUEUE" or abs(due - dispatch.due_at) > 0.001:
+            raise AgentError("BRIDGE_REMOTE_CHANGED", 409)
+        if (dispatch.snapshot["metadata"].get("origin") == "hourly_article_test"
+                and body != dispatch.snapshot["body"]):
             raise AgentError("BRIDGE_REMOTE_CHANGED", 409)
         if self._media(images, target) != dispatch.snapshot["media"]:
             raise AgentError("BRIDGE_REMOTE_MEDIA_CHANGED", 409)
@@ -334,12 +347,17 @@ class MaxBridge:
         return self.status(token, integration_id, post_id)
 
     def status(self, token, integration_id, post_id):
+        from .hub import ACTIVE
         t = self.channel(token)
         with self.core.db.session() as s:
             link = s.get(BridgePost, post_id)
             if not link or link.target_id != t.id or link.integration_id != integration_id:
                 raise AgentError("BRIDGE_POST_NOT_FOUND", 404)
-            d = s.scalar(select(Dispatch).where(Dispatch.variant_id == link.variant_id).order_by(Dispatch.due_at.desc()))
+            # A rescheduled dispatch may have an earlier date than its cancelled
+            # predecessor. Poll the active attempt, then confirmed history.
+            d = s.scalar(select(Dispatch).where(Dispatch.variant_id == link.variant_id)
+                         .order_by(Dispatch.state.in_(ACTIVE).desc(),
+                                   (Dispatch.state == "published").desc(), Dispatch.due_at.desc()))
             if d and d.state == "published" and d.verified:
                 return {"state": "published", "external_id": d.external_id, "permalink": d.permalink}
             if d and d.state == "published":

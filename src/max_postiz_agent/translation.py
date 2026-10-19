@@ -161,6 +161,8 @@ def translation_messages(model, text, prompt):
 class DedicatedTranslator:
     """Compatible with ArticleQuality's generate_text interface, without tool access."""
 
+    immutable_candidates = True
+
     def __init__(self, config, transport=None):
         if not isinstance(config, dict):
             raise AgentError("TRANSLATION_CONFIG_INVALID")

@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+from contextlib import ExitStack
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -34,7 +35,9 @@ class HourlyArticleCycle:
             policy = json.loads(path.read_text(encoding="utf-8-sig"))
             required = {"enabled", "target_id", "source_id", "allowed_hosts", "rights_evidence",
                         "owner_instruction", "min_gap_seconds", "max_per_day", "max_source_age_hours"}
-            if (set(policy) != required or type(policy["enabled"]) is not bool
+            if (set(policy) not in (required, required | {"approval_mode"})
+                    or policy.get("approval_mode", "legacy") not in {"legacy", "human"}
+                    or type(policy["enabled"]) is not bool
                     or not all(isinstance(policy[k], str) and policy[k].strip()
                                for k in ("target_id", "source_id", "rights_evidence", "owner_instruction"))
                     or not isinstance(policy["allowed_hosts"], list) or not policy["allowed_hosts"]
@@ -164,19 +167,35 @@ class HourlyArticleCycle:
 
         return write_event
 
-    def _quality(self, record_id=None):
+    def _quality(self, record_id=None, review_only=False):
         if self.quality_factory:
             return self.quality_factory()
         from .article_quality import ArticleQuality
-        from .translation import configured_translator
-        translator = configured_translator(self.core.settings)
-        if translator is None:
-            translator = OpenCode(self.core.settings)
-            translator.model = "proxmox/qwen35-9b"
-        reviewer = OpenCode(self.core.settings)
-        reviewer.model = "proxmox/qwen25-coder-7b"
-        return ArticleQuality(translator, reviewer, prompt_dir=self.core.settings.root / "prompts",
-                              trace=self._trace_writer(record_id) if record_id else None)
+        from .translation import DedicatedTranslator, configured_translator
+        with ExitStack() as cleanup:
+            if review_only:
+                from .human_review import CandidateOnlyTranslator
+                translator = CandidateOnlyTranslator()
+            else:
+                translator = configured_translator(self.core.settings)
+            if translator is not None:
+                cleanup.callback(translator.client.close)
+            policy_path = self.core.settings.root / "data/hourly-article-policy.local.json"
+            human_mode = policy_path.exists() and self._policy(enabled=False).get("approval_mode") == "human"
+            if (human_mode and not review_only and (not isinstance(translator, DedicatedTranslator)
+                                                  or translator.model != "hy-mt2-7b-q8")):
+                raise AgentError("HUMAN_HY_TRANSLATOR_REQUIRED", 409)
+            if translator is None:
+                translator = OpenCode(self.core.settings)
+                translator.model = "proxmox/qwen35-9b"
+                cleanup.callback(translator.client.close)
+            reviewer = OpenCode(self.core.settings)
+            cleanup.callback(reviewer.client.close)
+            reviewer.model = "proxmox/qwen25-coder-7b"
+            quality = ArticleQuality(translator, reviewer, prompt_dir=self.core.settings.root / "prompts",
+                                     trace=self._trace_writer(record_id) if record_id else None)
+            cleanup.pop_all()
+            return quality
 
     @staticmethod
     def _quality_provenance(quality, operator_candidate=False):
@@ -335,7 +354,11 @@ class HourlyArticleCycle:
                 if any(item["slot"] == slot for item in ledger["records"]):
                     raise AgentError("ARTICLE_SLOT_ALREADY_CLAIMED", 409)
             other_records = [item for item in ledger["records"] if item is not record]
-            if any(item["state"] not in {"published", "failed", "cancelled", "rejected"} for item in other_records):
+            if (policy.get("approval_mode") == "human"
+                    and sum(item["state"] == "awaiting_human_review" for item in other_records) >= 24):
+                raise AgentError("ARTICLE_HUMAN_REVIEW_BACKLOG", 409)
+            if any(item["state"] not in {"published", "failed", "cancelled", "rejected", "awaiting_human_review"}
+                   for item in other_records):
                 raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
             if any(item.get("url") == article["url"] or item.get("original_hash") == original_hash for item in other_records):
                 raise AgentError("ARTICLE_DUPLICATE_SOURCE", 409)
@@ -405,12 +428,19 @@ class HourlyArticleCycle:
                     session.flush()
                     session.add(DraftRevision(draft_id=draft.id, revision=1, payload=copy.deepcopy(payload),
                                              config_id=self.core.settings.hash))
+                    from .human_review import text_hash as machine_text_hash
                     variant = Variant(draft_id=draft.id, target_id=target.id, title=prepared["title"],
                         body=prepared["body"], sources=[{"id": material.id, "url": material.url, "source_id": source["id"]}],
                         media=[], source_revision=1, config_hash=self.core.settings.hash,
                         binding_hash=target.binding_hash, metadata_json={"origin": "hourly_article_test",
                             "record_id": record["id"], "rights_evidence": policy["rights_evidence"],
                             **self._quality_provenance(quality, operator_candidate=candidate is not None),
+                            "approval_mode": policy.get("approval_mode", "legacy"),
+                            "policy_hash": record["policy_hash"],
+                            "machine_text_hash": machine_text_hash(prepared["title"], prepared["body"]),
+                            "machine_source_hash": fingerprint({"title": article["title"],
+                                "body": article["original"], "url": article["url"]}),
+                            "machine_reviewed_at": now(),
                             "operator_correction_hash": attempt.get("candidate_hash"), "topic": prepared["topic"],
                             "translation_hash": translation_hash})
                     session.add(variant)
@@ -425,7 +455,19 @@ class HourlyArticleCycle:
                     self.core.db.audit(session, "article_quality", "hourly_article_prepared", variant.id,
                         source_hash=original_hash, policy_hash=record["policy_hash"],
                         candidate_hash=attempt.get("candidate_hash"), operator_correction=candidate is not None)
-                attempt.update(state="prepared", finished_at=now())
+                if policy.get("approval_mode") == "human":
+                    reviewed = self._snapshot(record)
+                    record["state"] = "staging_human_draft"
+                    self._save(ledger)
+                    external = self.core.stage_remote(record["variant_id"])
+                    fresh = self._snapshot(record)
+                    if (self._reviewed_fields(fresh) != self._reviewed_fields(reviewed)
+                            or fresh["revision"] != reviewed["revision"] + 1
+                            or fresh["metadata"].get("postiz_state") != "DRAFT"):
+                        raise AgentError("ARTICLE_REMOTE_CHANGED", 409)
+                    record.update(state="awaiting_human_review", postiz_id=external,
+                                  prepared_hash=fingerprint(fresh))
+                attempt.update(state=record["state"], finished_at=now())
                 record.pop("error", None)
                 self._save(ledger)
                 return self._view(record)
@@ -439,10 +481,8 @@ class HourlyArticleCycle:
                 raise
             finally:
                 if quality:
-                    quality.close()
-                    if not self.quality_factory:
-                        quality.translator.client.close()
-                        quality.reviewer.client.close()
+                    from .human_review import close_quality
+                    close_quality(quality, close_models=not self.quality_factory)
 
     def cancel_preparation(self, ident, reason="Operator reconciled and abandoned pre-draft preparation"):
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
@@ -545,8 +585,14 @@ class HourlyArticleCycle:
                     variant.revision += 1
                     variant.source_revision, variant.config_hash = draft.revision, draft.config_id
                     variant.binding_hash, variant.state, variant.updated_at = target.binding_hash, "review_pending", now()
-                    variant.metadata_json = {**variant.metadata_json, "translation_hash": translation_hash,
+                    metadata = {**variant.metadata_json, "translation_hash": translation_hash,
+                        "quality": "operator_ministral_languagetool",
                         "topic": checked["topic"], "editorial_correction_hash": attempt["candidate_hash"]}
+                    metadata.pop("translation_model", None)
+                    metadata.pop("review_model", None)
+                    from .human_review import text_hash as machine_text_hash
+                    metadata["machine_text_hash"] = machine_text_hash(variant.title, variant.body)
+                    variant.metadata_json = metadata
                     self.core._history(session, variant, target, "hourly_article_operator")
                     if record["slot"] != int(now() // 3600):
                         raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
@@ -572,79 +618,12 @@ class HourlyArticleCycle:
                 raise
             finally:
                 if quality:
-                    quality.close()
-                    if not self.quality_factory:
-                        quality.translator.client.close()
-                        quality.reviewer.client.close()
+                    from .human_review import close_quality
+                    close_quality(quality, close_models=not self.quality_factory)
 
     def publish(self, ident, reviewed_hash, due_at=None):
-        with profile_lock(self.directory / "cycle.lock"):
-            policy, ledger = self._policy(), self._load()
-            record = self._record(ledger, ident)
-            _, target = self._source_target(policy)
-            if (record["state"] != "prepared" or record.get("correction_blocked")
-                    or record["policy_hash"] != fingerprint(policy)):
-                raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
-            if record["slot"] != int(now() // 3600):
-                raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
-            if record["source_published_at"] < now() - policy["max_source_age_hours"] * 3600:
-                raise AgentError("STALE_SOURCE", 409)
-            reviewed = self._snapshot(record)
-            if reviewed_hash != record["prepared_hash"] or fingerprint(reviewed) != reviewed_hash:
-                raise AgentError("ARTICLE_REVIEW_HASH_MISMATCH", 409)
-            self._clear_outstanding(target.id)
-            earliest = self._cadence(policy, now(), check_gap=False)
-            preparation_time = now()
-            due = max(preparation_time + 120, earliest) if due_at is None else due_at
-            if (type(due) not in {int, float} or not math.isfinite(due) or due < preparation_time + 120
-                    or due >= (record["slot"] + 2) * 3600):
-                raise AgentError("ARTICLE_SCHEDULE_INVALID", 409)
-            self._cadence(policy, due)
-            with self.core.db.session() as session:
-                if session.get(RemoteDraft, record["variant_id"]):
-                    raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
-            record.update(state="staging", due_at=due)
-            self._save(ledger)
-            try:
-                external = self.core.stage_remote(record["variant_id"], due_at=due)
-                record.update(state="staged", postiz_id=external)
-                self._save(ledger)
-                self.core.bridge.sync(force=True)
-                fresh = self._snapshot(record)
-                metadata = fresh["metadata"]
-                if (self._reviewed_fields(fresh) != self._reviewed_fields(reviewed)
-                        or fresh["revision"] != reviewed["revision"] + 1
-                        or metadata.get("postiz_post_id") != external
-                        or metadata.get("postiz_state") != "QUEUE"
-                        or type(metadata.get("postiz_due_at")) not in {int, float}
-                        or abs(metadata["postiz_due_at"] - due) > 0.001
-                        or not isinstance(metadata.get("postiz_hash"), str)
-                        or len(metadata["postiz_hash"]) != 64):
-                    raise AgentError("ARTICLE_REMOTE_CHANGED", 409)
-                self._clear_outstanding(target.id)
-                self._cadence(policy, due)
-                record["state"] = "approving"
-                self._save(ledger)
-                self.core.pause_target(target.id, False, actor="hourly_article_policy")
-                dispatch = self.core.approve_variant(record["variant_id"], fresh["revision"],
-                    fingerprint(fresh), due, actor="hourly_article_policy")
-                record.update(state="pending", dispatch_id=dispatch)
-                with self.core.db.session.begin() as session:
-                    self.core.db.audit(session, "hourly_article_policy", "hourly_article_delegated_approval", dispatch,
-                        policy_hash=record["policy_hash"], owner_instruction=policy["owner_instruction"],
-                        reviewed_hash=reviewed_hash, approved_hash=fingerprint(fresh), due_at=due)
-                self._save(ledger)
-                return self._view(record)
-            except Exception as exc:
-                record.update(state="needs_attention", error=exc.code if isinstance(exc, AgentError) else "ARTICLE_PUBLICATION_INTERRUPTED")
-                self._save(ledger)
-                # Preserve an already approved dispatch and its immutable schedule on interruption.
-                with self.core.db.session() as session:
-                    active = session.scalar(select(Dispatch).join(Variant).where(
-                        Variant.target_id == target.id, Dispatch.state.in_(ACTIVE)))
-                if not active:
-                    self.core.pause_target(target.id, True, actor="hourly_article_policy")
-                raise
+        """Hourly automation never grants the final human's approval."""
+        raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
 
     def status(self, ident=None):
         with profile_lock(self.directory / "cycle.lock"):
@@ -656,7 +635,8 @@ class HourlyArticleCycle:
             if record.get("variant_id"):
                 with self.core.db.session() as session:
                     delivery = session.scalar(select(Dispatch).where(Dispatch.variant_id == record["variant_id"])
-                                              .order_by(Dispatch.due_at.desc()))
+                                              .order_by(Dispatch.state.in_(ACTIVE).desc(),
+                                                        (Dispatch.state == "published").desc(), Dispatch.due_at.desc()))
                     link = session.scalar(select(BridgePost).where(BridgePost.variant_id == record["variant_id"]))
                     if delivery:
                         record.update(dispatch_id=delivery.id, dispatch_state=delivery.state,
@@ -671,7 +651,9 @@ class HourlyArticleCycle:
                         elif delivery.state == "published":
                             record["state"] = "published_unverified"
                         elif delivery.state in {"failed", "cancelled"}:
-                            record["state"] = delivery.state
+                            variant = session.get(Variant, record["variant_id"])
+                            record["state"] = ("awaiting_human_review" if
+                                variant.metadata_json.get("approval_mode") == "human" else delivery.state)
                         elif record["state"] not in {"needs_attention", "approving"}:
                             record["state"] = delivery.state
                     if link:

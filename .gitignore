@@ -7,6 +7,7 @@ __pycache__/
 .coverage
 data/
 .test-state/
+.test-tmp/
 .env
 .env.local
 .env.*

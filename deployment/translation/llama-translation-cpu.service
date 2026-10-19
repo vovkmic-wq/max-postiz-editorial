@@ -11,7 +11,7 @@ EnvironmentFile=/etc/default/llama-translation
 Environment=TRANSLATION_EXTRA_ARGS=
 # CPU-only: the existing independent reviewer retains the K2200.
 Environment=CUDA_VISIBLE_DEVICES=-1
-ExecStart=/opt/llama.cpp/build-cuda-k2200/bin/llama-server --model ${TRANSLATION_MODEL_PATH} --alias ${TRANSLATION_MODEL_ID} --host 10.20.30.143 --port 8089 --device none --n-gpu-layers 0 --ctx-size 4096 --threads 4 --threads-batch 4 --batch-size 128 --ubatch-size 128 --parallel 1 --sleep-idle-seconds 120 --jinja $TRANSLATION_EXTRA_ARGS
+ExecStart=/opt/llama.cpp/build-cuda-k2200/bin/llama-server --model ${TRANSLATION_MODEL_PATH} --alias ${TRANSLATION_MODEL_ID} --host 10.20.30.143 --port 8089 --device none --n-gpu-layers 0 --ctx-size 4096 --threads 4 --threads-batch 4 --batch-size 128 --ubatch-size 128 --parallel 1 --sleep-idle-seconds 15 --jinja $TRANSLATION_EXTRA_ARGS
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=300

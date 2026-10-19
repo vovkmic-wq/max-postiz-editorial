@@ -8,6 +8,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 
 def command(*args: str, timeout: int = 15) -> tuple[bool, str]:
@@ -38,6 +39,34 @@ def tcp(host: str, port: int) -> tuple[bool, str]:
         return False, type(exc).__name__
 
 
+def postiz_api(root: Path) -> tuple[bool, str]:
+    """Exercise the configured authenticated read API without constructing the Hub/DB."""
+    safe_errors = {
+        "POSTIZ_NOT_CONFIGURED", "POSTIZ_PUBLIC_ORIGIN_INVALID", "POSTIZ_BASE_URL_INVALID",
+        "POSTIZ_HTTPS_REQUIRED", "POSTIZ_UNAVAILABLE", "POSTIZ_ACCESS_DENIED",
+        "POSTIZ_RATE_LIMIT", "POSTIZ_REJECTED", "POSTIZ_RESPONSE_INVALID",
+    }
+    try:
+        # Import lazily so a wrong interpreter or absent app is a failed readiness check.
+        from max_postiz_agent.cli import load_env
+        from max_postiz_agent.postiz import PostizClient
+
+        config = json.loads((root / "config/publishing.json").read_text(encoding="utf-8-sig"))
+        if not isinstance(config, dict) or not isinstance(config.get("postiz"), dict):
+            raise ValueError("Publishing configuration is missing Postiz options")
+        load_env(root)
+        client = PostizClient(config["postiz"])
+        try:
+            count = len(client.posts())
+        finally:
+            client.close()
+        return True, f"authenticated GET /posts posts={count}"
+    except Exception as exc:
+        # Never stringify exceptions: their text can contain credentials or private bodies.
+        code = getattr(exc, "code", None)
+        return False, code if isinstance(code, str) and code in safe_errors else type(exc).__name__
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deep", action="store_true",
@@ -52,7 +81,7 @@ def main() -> int:
         "docker.service", "nginx.service", "max-postiz-hub.service",
         "max-postiz-opencode.service", "max-postiz-spelling.service",
         "max-postiz-display.service", "max-postiz-vnc.service",
-        "max-postiz-novnc.service",
+        "max-postiz-novnc.service", "max-postiz-translation.service",
     ):
         enabled, enabled_value = command("systemctl", "is-enabled", unit)
         active, active_value = command("systemctl", "is-active", unit)
@@ -85,9 +114,13 @@ def main() -> int:
         ("spelling", "http://127.0.0.1:8010/v2/languages"),
         ("model_router", "http://10.20.30.95:8083/health"),
         ("ministral_backend", "http://10.20.30.143:8086/health"),
+        ("translation", "http://127.0.0.1:8094/health"),
     ):
         ok, detail, _ = http(url)
         record(f"http:{name}", ok, detail)
+
+    ok, detail = postiz_api(Path(__file__).resolve().parents[2])
+    record("api:postiz_posts", ok, detail)
 
     ok, detail, body = http("http://10.20.30.95:8083/v1/models")
     try:
