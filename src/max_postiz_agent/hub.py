@@ -336,6 +336,40 @@ class HubService(Service):
         from .automatic_policy import POLICY_ACTOR
         return self._approve_variant(ident, revision, body_hash, due_at, POLICY_ACTOR, automatic=True)
 
+    def _check_schedule_limits(self, session, variant, target, due_at, *, automatic_policy=None):
+        """Read-only shared limits for preflight and the final approval transaction."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        if automatic_policy is None:
+            publication = self.settings.channel(target.profile_id)["publication"]
+            min_gap = publication["min_gap_minutes"] * 60
+            max_per_day = publication["max_posts_per_day"]
+            tz = ZoneInfo(publication["timezone"])
+        else:
+            if (not isinstance(automatic_policy, dict)
+                    or automatic_policy.get("approval_mode") != "automatic"
+                    or automatic_policy.get("target_id") != target.id
+                    or automatic_policy.get("review_rubric") != "meaning-first-v1"
+                    or type(automatic_policy.get("min_gap_seconds")) is not int
+                    or automatic_policy["min_gap_seconds"] < 3600
+                    or type(automatic_policy.get("max_per_day")) is not int
+                    or not 1 <= automatic_policy["max_per_day"] <= 24):
+                raise AgentError("ARTICLE_POLICY_INVALID", 409)
+            min_gap = automatic_policy["min_gap_seconds"]
+            max_per_day = automatic_policy["max_per_day"]
+            tz = ZoneInfo("Europe/Moscow")
+        previous = list(session.scalars(select(Dispatch).join(Variant).where(
+            Variant.target_id == target.id,
+            Dispatch.state.in_(ACTIVE | {"published", "owner_attested"}))))
+        day = datetime.fromtimestamp(due_at, tz).date()
+        on_day = [dispatch for dispatch in previous
+                  if datetime.fromtimestamp(dispatch.due_at, tz).date() == day]
+        if len(on_day) >= max_per_day:
+            raise AgentError("DAILY_LIMIT_REACHED", 409)
+        if any(abs(dispatch.due_at - due_at) < min_gap for dispatch in previous):
+            raise AgentError("SCHEDULE_GAP_TOO_SHORT", 409)
+
     def _approve_variant(self, ident, revision, body_hash, due_at, actor, *, human_confirmed=False,
                          machine_exception_confirmed=False, machine_review_notes="", automatic=False):
         from .human_review import eligible, hourly
@@ -359,6 +393,12 @@ class HubService(Service):
             snapshot = self.snapshot(v, t)
             if revision != v.revision or body_hash != fingerprint(snapshot):
                 raise AgentError("REVISION_CONFLICT", 409)
+            if automatic and (s.scalar(select(TargetApproval).where(TargetApproval.variant_id == v.id))
+                    or s.scalar(select(Dispatch).where(Dispatch.variant_id == v.id))
+                    or s.scalar(select(Audit).where(Audit.entity == v.id, Audit.action == "target_approve"))):
+                # Preflight is advisory: even revoked/cancelled history inserted
+                # before this locked transaction makes automatic approval unsafe.
+                raise AgentError("ARTICLE_AUTOMATIC_NOT_READY", 409)
             self._quality(s, v, t)
             self.bridge.check_approval(s, v, due_at)
             human_hourly = hourly(v)
@@ -394,18 +434,8 @@ class HubService(Service):
                 raise AgentError("TARGET_PAUSED", 409)
             if s.scalar(select(Dispatch).where(Dispatch.variant_id == ident, Dispatch.state.in_(ACTIVE | {"published", "owner_attested"}))):
                 raise AgentError("DELIVERY_ALREADY_EXISTS", 409)
-            previous = list(s.scalars(select(Dispatch).join(Variant).where(Variant.target_id == t.id,
-                                  Dispatch.state.in_(ACTIVE | {"published", "owner_attested"}))))
-            min_gap = self.settings.channel(t.profile_id)["publication"]["min_gap_minutes"] * 60
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
-            tz = ZoneInfo(self.settings.channel(t.profile_id)["publication"]["timezone"])
-            day = datetime.fromtimestamp(due_at, tz).date()
-            on_day = [d for d in previous if datetime.fromtimestamp(d.due_at, tz).date() == day]
-            if len(on_day) >= self.settings.channel(t.profile_id)["publication"]["max_posts_per_day"]:
-                raise AgentError("DAILY_LIMIT_REACHED", 409)
-            if any(abs(d.due_at - due_at) < min_gap for d in previous):
-                raise AgentError("SCHEDULE_GAP_TOO_SHORT", 409)
+            self._check_schedule_limits(s, v, t, due_at,
+                                        automatic_policy=policy if human_hourly and automatic else None)
             if human_hourly:
                 t.paused = False
             # Snapshot plus schedule form one immutable approval.

@@ -1,16 +1,19 @@
 """Explicit automatic approvals; never impersonates a human editor."""
 import copy
 import hashlib
+import math
 import re
 import time
 from types import SimpleNamespace
+from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from .adapters import extract_object
-from .config import AgentError, fingerprint
+from .config import AgentError, fingerprint, inside
 from .db import Audit, Material, now
-from .hub_models import BridgePost, Dispatch, TargetApproval
+from .hub_models import BridgePost, Dispatch, RemoteDraft, Target, TargetApproval
 from .human_review import candidate_body, machine_current, source_data, text_hash
 
 POLICY_ACTOR = "hourly_article_policy"
@@ -92,6 +95,12 @@ def eligible(core, session, variant):
     from .article_cycle import HourlyArticleCycle
     cycle = HourlyArticleCycle(core)
     policy = cycle._policy()
+    record = next((value for value in cycle._load()["records"] if value.get("variant_id") == variant.id), None)
+    return _eligible_record(cycle, session, variant, policy, record)
+
+
+def _eligible_record(cycle, session, variant, policy, record):
+    core = cycle.core
     if (policy.get("approval_mode") != "automatic"
             or variant.metadata_json.get("approval_mode") != "automatic"
             or variant.metadata_json.get("origin") != "hourly_article_test"
@@ -101,7 +110,6 @@ def eligible(core, session, variant):
     cycle._source_target(policy)
     if variant.media:
         raise AgentError("ARTICLE_MEDIA_NOT_ALLOWED", 409)
-    record = next((value for value in cycle._load()["records"] if value.get("variant_id") == variant.id), None)
     if not record or record["state"] not in {"automatic_ready", "automatic_pending_approval", "pending", "sending", "awaiting_postiz"}:
         raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
     material = session.get(Material, variant.sources[0].get("id")) if len(variant.sources) == 1 else None
@@ -153,8 +161,8 @@ def publish(cycle, record, ledger, reviewed_hash, due_at):
         raise AgentError("ARTICLE_AUTOMATIC_DATE_INVALID", 409)
     cycle._cadence(policy, due)
     with core.db.session() as session:
-        variant = core._variant(session, record["variant_id"])
-        target = core._target(session, variant.target_id)
+        variant = core._variant(session, record["variant_id"], True)
+        target = session.scalar(select(Target).where(Target.id == variant.target_id).with_for_update())
         eligible(core, session, variant)
         before = copy.deepcopy(core.snapshot(variant, target))
         if reviewed_hash != fingerprint(before) or record["policy_hash"] != fingerprint(policy):
@@ -164,6 +172,7 @@ def publish(cycle, record, ledger, reviewed_hash, due_at):
                 or session.scalar(select(TargetApproval).where(TargetApproval.variant_id == variant.id))
                 or automatic_evidence(session, variant) is None):
             raise AgentError("ARTICLE_AUTOMATIC_NOT_READY", 409)
+        core._check_schedule_limits(session, variant, target, due, automatic_policy=policy)
         link = session.scalar(select(BridgePost).where(BridgePost.variant_id == variant.id))
         post_id = link.post_id if link else None
     record.update(state="automatic_scheduling", automatic_slot=slot, due_at=due)
@@ -205,4 +214,143 @@ def publish(cycle, record, ledger, reviewed_hash, due_at):
         # An ambiguous remote mutation retains its lease and is never retried.
         record.update(state="needs_attention", error=exc.code if isinstance(exc, AgentError) else "ARTICLE_APPROVAL_INTERRUPTED")
         cycle._save(ledger)
+        raise
+
+
+def _reconcile_capture(cycle, session, record, policy, reviewed_hash, due_at):
+    from .hub import ACTIVE
+    from .reddit import text_hash as original_hash
+    core = cycle.core
+    variant = core._variant(session, record["variant_id"], True)
+    target = session.scalar(select(Target).where(Target.id == variant.target_id).with_for_update())
+    if (not target or not target.paused or variant.state != "review_pending" or variant.media
+            or record.get("policy_hash") != fingerprint(policy)
+            or record.get("target_id") != policy["target_id"]
+            or record.get("source_id") != policy["source_id"]
+            or variant.metadata_json.get("record_id") != record["id"]
+            or variant.metadata_json.get("rights_evidence") != policy["rights_evidence"]
+            or session.scalar(select(Dispatch).where(Dispatch.variant_id == variant.id))
+            or session.scalar(select(TargetApproval).where(TargetApproval.variant_id == variant.id))
+            or session.scalar(select(Audit).where(Audit.entity == variant.id, Audit.action == "target_approve"))
+            or session.scalar(select(Dispatch).where(Dispatch.state.in_(ACTIVE)))
+            or session.scalar(select(BridgePost).where(BridgePost.mutation_owner.is_not(None)
+                | (BridgePost.mutation_until != 0) | BridgePost.mutation_until.is_(None)))):
+        raise AgentError("ARTICLE_APPROVAL_RECONCILE_NOT_SAFE", 409)
+    # The public eligibility gate still rejects needs_attention. Only this
+    # explicit, tightly checked recovery validates an ephemeral pending view.
+    _eligible_record(cycle, session, variant, policy, {**record, "state": "automatic_pending_approval"})
+    snapshot = copy.deepcopy(core.snapshot(variant, target))
+    if fingerprint(snapshot) != reviewed_hash or record.get("prepared_hash") != reviewed_hash:
+        raise AgentError("ARTICLE_REVIEW_HASH_MISMATCH", 409)
+    source = source_data(session, variant)
+    material = session.get(Material, variant.sources[0]["id"])
+    if (material.source_id != policy["source_id"] or material.published_at != record.get("source_published_at")
+            or source["url"] != record.get("url") or original_hash(source["body"]) != record.get("original_hash")):
+        raise AgentError("ARTICLE_SOURCE_CHANGED", 409)
+    configured_source, configured_target = cycle._source_target(policy)
+    cycle._article({"url": source["url"], "title": source["title"], "original": source["body"],
+                    "published_at": material.published_at}, policy, configured_source, configured_target)
+    link = session.scalar(select(BridgePost).where(BridgePost.variant_id == variant.id))
+    remote = session.get(RemoteDraft, variant.id)
+    if (not link or not remote or remote.state != "draft" or remote.external_id != record.get("postiz_id")
+            or link.post_id != record.get("postiz_id") or not link.active or link.error
+            or link.remote_state != "QUEUE" or link.integration_id != target.options.get("postiz_integration_id")
+            or snapshot["metadata"].get("postiz_post_id") != link.post_id
+            or snapshot["metadata"].get("postiz_hash") != link.remote_hash
+            or snapshot["metadata"].get("postiz_state") != "QUEUE"
+            or any(type(value) not in {int, float} or not math.isfinite(value) or abs(value - due_at) > 0.001
+                   for value in (record.get("due_at"), link.due_at, snapshot["metadata"].get("postiz_due_at")))):
+        raise AgentError("ARTICLE_REMOTE_CHANGED", 409)
+    evidence = automatic_evidence(session, variant)
+    trace = inside(core.settings.root, record.get("quality_trace", ""))
+    if (not trace.is_relative_to(cycle.directory) or not trace.name.startswith("quality-")
+            or hashlib.sha256(trace.read_bytes()).hexdigest() != variant.metadata_json["machine_review_evidence"]["trace_hash"]):
+        raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
+    core._quality(session, variant, target)
+    cycle._cadence(policy, due_at)
+    core._check_schedule_limits(session, variant, target, due_at, automatic_policy=policy)
+    return {"snapshot": snapshot, "postiz_id": link.post_id, "integration_id": link.integration_id,
+            "remote_hash": link.remote_hash, "evidence_hash": evidence["evidence_hash"],
+            "source_hash": fingerprint(source), "due_at": due_at}
+
+
+def _reconcile_remote(cycle, captured):
+    core = cycle.core
+    remote = core.postiz.get_post(captured["postiz_id"])
+    body, media, due, hashed = core.bridge.normalize(remote)
+    snapshot = captured["snapshot"]
+    integrations = [value for value in core.postiz.integrations() if value.get("id") == captured["integration_id"]]
+    if (len(integrations) != 1 or integrations[0].get("identifier") != "max-browser"
+            or integrations[0].get("accountId") != snapshot["destination"]
+            or integrations[0].get("disabled") or integrations[0].get("refreshNeeded")):
+        raise AgentError("BRIDGE_INTEGRATION_UNAVAILABLE", 409)
+    if (remote.get("id") != captured["postiz_id"] or remote.get("state") != "QUEUE"
+            or remote.get("integration", {}).get("id") != captured["integration_id"]
+            or body != snapshot["body"] or media or hashed != captured["remote_hash"]
+            or not math.isfinite(due) or abs(due - captured["due_at"]) > 0.001):
+        raise AgentError("ARTICLE_REMOTE_CHANGED", 409)
+
+
+def reconcile_approval(cycle, record, ledger, reviewed_hash, due_at, reason):
+    """Approve one proven scheduled post once; never repeat its remote mutation."""
+    if not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 2000:
+        raise AgentError("ARTICLE_APPROVAL_RECONCILE_REASON_REQUIRED", 409)
+    core, policy = cycle.core, cycle._policy()
+    if (policy.get("approval_mode") != "automatic" or record.get("state") != "needs_attention"
+            or record.get("error") != "SCHEDULE_GAP_TOO_SHORT" or not record.get("variant_id")
+            or not record.get("postiz_id") or record.get("dispatch_id") or "automatic_slot" not in record):
+        raise AgentError("ARTICLE_APPROVAL_RECONCILE_NOT_SAFE", 409)
+    if (type(due_at) not in {int, float} or not math.isfinite(due_at)
+            or not now() + 30 <= due_at <= now() + 3700):
+        raise AgentError("ARTICLE_AUTOMATIC_DATE_INVALID", 409)
+    if due_at != record.get("due_at"):
+        raise AgentError("ARTICLE_APPROVAL_RECONCILE_NOT_SAFE", 409)
+    claim_id = str(uuid5(NAMESPACE_URL, "max-postiz:approval-reconcile:" + record["id"]))
+    history = record.get("approval_reconciliations", [])
+    if not isinstance(history, list):
+        raise AgentError("ARTICLE_LEDGER_INVALID", 409)
+    with core.db.session() as session:
+        if history or session.get(Audit, claim_id) or session.scalar(select(Audit).where(
+                Audit.entity == record["id"], Audit.action == "hourly_article_approval_reconcile_started")):
+            raise AgentError("ARTICLE_APPROVAL_RECONCILE_ALREADY_ATTEMPTED", 409)
+        captured = _reconcile_capture(cycle, session, record, policy, reviewed_hash, due_at)
+    _reconcile_remote(cycle, captured)
+    claim = {"id": claim_id, "at": now(), "state": "started", "reason": reason.strip(),
+             "original_error": record["error"], "revision": captured["snapshot"]["revision"],
+             "content_hash": reviewed_hash, "due_at": due_at, "postiz_id": captured["postiz_id"],
+             "target_id": captured["snapshot"]["target_id"], "destination": captured["snapshot"]["destination"],
+             "policy_hash": fingerprint(policy), "evidence_hash": captured["evidence_hash"],
+             "source_hash": captured["source_hash"], "remote_hash": captured["remote_hash"]}
+    try:
+        with core.db.session.begin() as session:
+            fresh = _reconcile_capture(cycle, session, record, policy, reviewed_hash, due_at)
+            if fingerprint(fresh) != fingerprint(captured):
+                raise AgentError("ARTICLE_REMOTE_CHANGED", 409)
+            session.add(Audit(id=claim_id, actor=POLICY_ACTOR, action="hourly_article_approval_reconcile_started",
+                              entity=record["id"], details=copy.deepcopy(claim)))
+    except IntegrityError as exc:
+        raise AgentError("ARTICLE_APPROVAL_RECONCILE_ALREADY_ATTEMPTED", 409) from exc
+    try:
+        record["approval_reconciliations"] = [*history, claim]
+        record["state"] = "automatic_pending_approval"
+        cycle._save(ledger)
+        _reconcile_remote(cycle, captured)
+        if fingerprint(cycle._policy()) != fingerprint(policy) or due_at < now() + 30:
+            raise AgentError("ARTICLE_APPROVAL_RECONCILE_NOT_SAFE", 409)
+        dispatch_id = core.approve_hourly_policy(record["variant_id"], claim["revision"], reviewed_hash, due_at)
+        claim.update(state="completed", finished_at=now(), dispatch_id=dispatch_id)
+        record.update(state="pending", dispatch_id=dispatch_id)
+        record.pop("error", None)
+        cycle._save(ledger)
+        with core.db.session.begin() as session:
+            core.db.audit(session, POLICY_ACTOR, "hourly_article_approval_reconcile_completed", record["id"], **claim)
+        return cycle._view(record)
+    except Exception as exc:
+        claim.update(state="failed", finished_at=now(), error=exc.code if isinstance(exc, AgentError)
+                     else "ARTICLE_APPROVAL_RECONCILE_INTERRUPTED")
+        record.update(state="needs_attention", error=claim["error"])
+        core.pause_target(record["target_id"], True, actor=POLICY_ACTOR)
+        cycle._save(ledger)
+        with core.db.session.begin() as session:
+            core.db.audit(session, POLICY_ACTOR, "hourly_article_approval_reconcile_failed", record["id"], **claim)
         raise

@@ -28,6 +28,11 @@ def main():
     migrate = sub.add_parser("migrate-automatic")
     migrate.add_argument("record_id")
     migrate.add_argument("--reason", required=True)
+    reconcile = sub.add_parser("reconcile-approval")
+    reconcile.add_argument("record_id")
+    reconcile.add_argument("--reviewed-hash", required=True)
+    reconcile.add_argument("--due-at", type=float, required=True)
+    reconcile.add_argument("--reason", required=True)
     status = sub.add_parser("status")
     status.add_argument("record_id", nargs="?")
     cancel = sub.add_parser("cancel-preparation")
@@ -66,6 +71,8 @@ def main():
             result = cycle.publish(args.record_id, args.reviewed_hash, args.due_at)
         elif args.action == "migrate-automatic":
             result = cycle.migrate_automatic(args.record_id, args.reason)
+        elif args.action == "reconcile-approval":
+            result = cycle.reconcile_approval(args.record_id, args.reviewed_hash, args.due_at, args.reason)
         elif args.action == "cancel-preparation":
             result = cycle.cancel_preparation(args.record_id, args.reason)
         elif args.action == "abandon-prepared":

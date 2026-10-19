@@ -778,6 +778,12 @@ class HourlyArticleCycle:
         from .automatic_migration import migrate
         return migrate(self, ident, reason)
 
+    def reconcile_approval(self, ident, reviewed_hash, due_at, reason):
+        from .automatic_policy import reconcile_approval
+        with profile_lock(self.directory / "cycle.lock"):
+            ledger = self._load()
+            return reconcile_approval(self, self._record(ledger, ident), ledger, reviewed_hash, due_at, reason)
+
     def status(self, ident=None):
         with profile_lock(self.directory / "cycle.lock"):
             self._policy(enabled=False)
@@ -793,6 +799,13 @@ class HourlyArticleCycle:
                             Dispatch.state.in_({"sending", "unknown"}).desc(), Dispatch.due_at.asc()))
                     if active:
                         record = by_variant[active.variant_id]
+                    else:
+                        unfinished = {key for key, value in by_variant.items() if value["state"] in {
+                            "pending", "sending", "unknown", "awaiting_postiz", "automatic_pending_approval", "needs_attention"}}
+                        completed = session.scalar(select(Dispatch).where(Dispatch.variant_id.in_(unfinished))
+                            .order_by((Dispatch.state == "published").desc(), Dispatch.due_at.asc()))
+                        if completed:
+                            record = by_variant[completed.variant_id]
             if record.get("variant_id"):
                 with self.core.db.session() as session:
                     delivery = session.scalar(select(Dispatch).where(Dispatch.variant_id == record["variant_id"])
