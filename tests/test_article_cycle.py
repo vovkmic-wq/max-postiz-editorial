@@ -794,6 +794,97 @@ def test_substantive_candidate_refusal_is_durable_and_whitespace_cannot_resample
 
 
 @pytest.mark.parametrize("operation", ["prepare", "revise"])
+@pytest.mark.parametrize("first_markdown", [False, True])
+def test_canonical_markdown_and_plaintext_candidate_refusal_cannot_resample(cycle, operation, first_markdown):
+    from max_postiz_agent.article_quality import normalize_article_links
+    value, core, article, records, calls, _, _ = cycle
+    markdown = {"title": "Звёздный ветер", "body":
+        "Учёные исследовали [атмосферу](https://science.example.org/atmosphere/) далёкой звезды."}
+    plain = {key: normalize_article_links(text) for key, text in markdown.items()}
+    assert markdown != plain
+    supplied, equivalent = (markdown, plain) if first_markdown else (plain, markdown)
+    failed = candidate_failure(value, article, supplied, operation, "ARTICLE_QUALITY_REJECTED")
+    key = "preparation_attempts" if operation == "prepare" else "correction_attempts"
+    assert failed[key][-1]["candidate_hash"] == fingerprint(plain)
+    assert failed[key][-1]["candidate_raw_hash"] == fingerprint(supplied)
+
+    def forbidden_factory():
+        pytest.fail("An equivalent checked plaintext must not resample the reviewer")
+
+    restarted = HourlyArticleCycle(core, forbidden_factory)
+    with pytest.raises(AgentError, match="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"):
+        candidate_operation(restarted, article, failed, equivalent, operation)
+    assert restarted._load()["records"][0][key] == failed[key]
+    assert not records and not calls
+
+
+def legacy_markdown_refusal(cycle):
+    value, _, article, _, _, _, _ = cycle
+    markdown = {"title": "Звёздный ветер", "body":
+        "Учёные исследовали [атмосферу](https://science.example.org/atmosphere/) далёкой звезды."}
+    candidate_failure(value, article, markdown, "prepare", "ARTICLE_QUALITY_REJECTED")
+    ledger = value._load()
+    record = ledger["records"][0]
+    attempt = record["preparation_attempts"][-1]
+    attempt.pop("candidate_normalization")
+    attempt.update(candidate_hash=fingerprint(markdown), candidate_raw_hash=fingerprint(markdown))
+    value._save(ledger)
+    trace = value.core.settings.root / record["quality_trace"]
+    event = {"record_id": record["id"], "at": attempt["started_at"], "phase": "candidate_started",
+             "candidate": markdown, "source_untrusted": {"title": article["title"],
+             "body": article["original"], "url": article["url"]}}
+    trace.write_text(json.dumps(event, ensure_ascii=False) + "\n", encoding="utf-8")
+    return record, markdown, trace, event
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_legacy_raw_markdown_refusal_uses_trace_for_canonical_comparison(cycle, changed):
+    from max_postiz_agent.article_quality import normalize_article_links
+    value, core, article, records, calls, _, _ = cycle
+    failed, markdown, _, _ = legacy_markdown_refusal(cycle)
+    candidate = {key: normalize_article_links(text) for key, text in markdown.items()}
+    if changed:
+        candidate["body"] += " Обнаружен звёздный ветер."
+        result = HourlyArticleCycle(core, CandidateQuality).prepare(article,
+            retry_record=failed["id"], candidate=candidate)
+        assert result["state"] == "prepared"
+        assert result["preparation_attempts"][-2]["candidate_hash"] == fingerprint(markdown)
+    else:
+        def forbidden_factory():
+            pytest.fail("Historical canonical refusal must not resample")
+        with pytest.raises(AgentError, match="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"):
+            HourlyArticleCycle(core, forbidden_factory).prepare(article,
+                retry_record=failed["id"], candidate=candidate)
+    assert not records and not calls
+
+
+@pytest.mark.parametrize("corruption", ["missing", "source", "candidate", "malformed"])
+def test_unverifiable_legacy_candidate_refusal_fails_before_inference(cycle, corruption):
+    from max_postiz_agent.article_quality import normalize_article_links
+    value, core, article, records, calls, _, _ = cycle
+    failed, markdown, trace, event = legacy_markdown_refusal(cycle)
+    if corruption == "missing":
+        trace.unlink()
+    elif corruption == "malformed":
+        trace.write_text("not json", encoding="utf-8")
+    else:
+        if corruption == "source":
+            event["source_untrusted"]["body"] += " A different English source."
+        else:
+            event["candidate"]["body"] += " Другой русский текст."
+        trace.write_text(json.dumps(event, ensure_ascii=False) + "\n", encoding="utf-8")
+    candidate = {key: normalize_article_links(text) for key, text in markdown.items()}
+
+    def forbidden_factory():
+        pytest.fail("Missing historical evidence must not permit new inference")
+
+    with pytest.raises(AgentError, match="ARTICLE_REJECTED_CANDIDATE_TRACE_REQUIRED"):
+        HourlyArticleCycle(core, forbidden_factory).prepare(article, retry_record=failed["id"], candidate=candidate)
+    assert value._load()["records"][0]["preparation_attempts"] == failed["preparation_attempts"]
+    assert not records and not calls
+
+
+@pytest.mark.parametrize("operation", ["prepare", "revise"])
 @pytest.mark.parametrize("error", ["OPENCODE_GENERATION_FAILED", "ARTICLE_SPELLING_UNAVAILABLE", "ARTICLE_TRACE_FAILED"])
 def test_infrastructure_failure_does_not_blacklist_the_same_candidate(cycle, operation, error):
     value, core, article, records, calls, _, _ = cycle

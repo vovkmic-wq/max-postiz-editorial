@@ -28,6 +28,39 @@ MAX_REVIEW_ISSUE_CHARS = 1024
 LEGACY_REVIEW_RUBRIC = "legacy"
 MEANING_FIRST_REVIEW_RUBRIC = "meaning-first-v1"
 REVIEW_RUBRICS = {LEGACY_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC}
+_INLINE_ARTICLE_LINK = re.compile(r"(?<![!\\])\[([^\[\]\r\n]+)\]\((https?://)")
+
+
+def normalize_article_links(text):
+    """Keep inline link labels readable and put each literal URL on its own line.
+
+    MAX's plain-text paste does not interpret Markdown. Only explicit inline
+    links are changed; bare URLs, surrounding parentheses and images stay exact.
+    Balanced parentheses inside a destination remain part of the literal URL.
+    """
+    parts, destinations, cursor = [], [], 0
+    for match in _INLINE_ARTICLE_LINK.finditer(text):
+        if match.start() < cursor:
+            continue
+        depth, end = 0, match.end()
+        while end < len(text):
+            char = text[end]
+            if char.isspace() or char in '<>"[]\\':
+                break
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    parts.extend((text[cursor:match.start()], match.group(1)))
+                    destinations.append(text[match.start(2):end])
+                    cursor = end + 1
+                    break
+                depth -= 1
+            end += 1
+    if not destinations:
+        return text
+    parts.append(text[cursor:])
+    return "".join(parts).rstrip() + "\n\n" + "\n".join(destinations)
 
 
 def _normalize_review(value):
@@ -302,7 +335,8 @@ class ArticleQuality:
                            translation=translated)
                 self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
-            translated = {key: value.strip() for key, value in translated.items()}
+            translated = {key: normalize_article_links(value.strip())
+                          for key, value in translated.items()}
             self._emit("translation_parsed", attempt, translation=translated)
             text = translated["title"] + "\n\n" + translated["body"]
             full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
@@ -404,11 +438,14 @@ class ArticleQuality:
         if (not isinstance(title, str) or not title.strip()
                 or not isinstance(body, str) or not body.strip()):
             raise AgentError("ARTICLE_TRANSLATION_INVALID")
-        title, body = title.strip(), body.strip()
+        candidate_raw = {"title": title, "body": body}
+        title, body = normalize_article_links(title.strip()), normalize_article_links(body.strip())
         text = title + "\n\n" + body
         full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
         self._emit("candidate_started", 1, mode="candidate", candidate={"title": title, "body": body},
-                   source_untrusted={"title": original_title, "body": original, "url": url})
+                   source_untrusted={"title": original_title, "body": original, "url": url},
+                   **({"candidate_raw": candidate_raw}
+                      if candidate_raw != {"title": title, "body": body} else {}))
         try:
             rubric_translation_gate(source, text, self.review_rubric)
             if len(full) > 3500:

@@ -7,7 +7,7 @@ import json
 import httpx
 import pytest
 
-from max_postiz_agent.article_quality import ArticleQuality
+from max_postiz_agent.article_quality import ArticleQuality, normalize_article_links
 from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.reddit import text_hash
 from max_postiz_agent.rejected_trace import ERROR, recover_rejected
@@ -44,7 +44,8 @@ def encode(events):
     return ("\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n").encode()
 
 
-def fixture(review=None, matches=None):
+def fixture(review=None, matches=None, candidate=None):
+    candidate = candidate or CANDIDATE
     events = []
 
     def trace(event):
@@ -54,7 +55,7 @@ def fixture(review=None, matches=None):
         transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"matches": matches or []})))
     try:
         with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
-            quality.check_candidate(CANDIDATE["title"], CANDIDATE["body"],
+            quality.check_candidate(candidate["title"], candidate["body"],
                                     ARTICLE["title"], ARTICLE["original"], ARTICLE["url"])
     finally:
         quality.close()
@@ -64,8 +65,9 @@ def fixture(review=None, matches=None):
               "input_hash": fingerprint(ARTICLE), "original_hash": text_hash(ARTICLE["original"]),
               "preparation_attempts": [{"number": 1, "started_at": 1000.0, "finished_at": 1100.0,
                   "operator_correction": True, "state": "needs_attention",
-                  "error": "ARTICLE_QUALITY_REJECTED", "candidate_hash": fingerprint(CANDIDATE),
-                  "candidate_raw_hash": fingerprint(CANDIDATE)}]}
+                  "error": "ARTICLE_QUALITY_REJECTED", "candidate_hash": fingerprint({
+                      key: normalize_article_links(value.strip()) for key, value in candidate.items()}),
+                  "candidate_raw_hash": fingerprint(candidate)}]}
     return record, copy.deepcopy(ARTICLE), events
 
 
@@ -94,6 +96,34 @@ def test_recovers_actual_candidate_trace_without_network_or_mutating_history(mon
     assert proof["text_hash"] == fingerprint({"title": recovered["title"], "body": recovered["body"]})
     assert proof["source_hash"] == fingerprint({"title": article["title"],
                                                "body": article["original"], "url": article["url"]})
+
+
+def test_new_plaintext_refusal_retains_exact_raw_markdown_provenance():
+    raw_candidate = {"title": " " + CANDIDATE["title"] + " ", "body": CANDIDATE["body"] +
+                     " [Источник исследования](https://science.example.org/research/)"}
+    record, article, events = fixture(candidate=raw_candidate)
+    canonical = {key: normalize_article_links(value.strip()) for key, value in raw_candidate.items()}
+    assert events[0]["candidate_raw"] == raw_candidate and events[0]["candidate"] == canonical
+    recovered = recover_rejected(record, article, encode(events))
+    assert recovered["title"] == canonical["title"]
+    assert recovered["translation"] == canonical["title"] + "\n\n" + canonical["body"]
+    assert recovered["machine_review_status"] == "rejected"
+    events[0]["candidate_raw"]["body"] += " Подменённый исходный ввод."
+    invalid(record, article, events)
+
+
+def test_legacy_literal_markdown_trace_keeps_original_checked_text():
+    record, article, events = fixture()
+    candidate = {**CANDIDATE, "body": CANDIDATE["body"] +
+                 " [Источник исследования](https://science.example.org/research/)"}
+    events[0]["candidate"] = candidate
+    text = candidate["title"] + "\n\n" + candidate["body"]
+    events[1]["characters"] = len(text + "\n\nИсточник: " + article["url"] +
+                                  "\nПеревод и редактура с помощью нейросетей.")
+    events[2]["context"]["translation_untrusted"] = text
+    record["preparation_attempts"][-1].update(candidate_hash=fingerprint(candidate),
+                                               candidate_raw_hash=fingerprint(candidate))
+    assert recover_rejected(record, article, encode(events))["translation"] == text
 
 
 def test_final_outer_attempt_selects_only_its_own_inner_attempt_one():

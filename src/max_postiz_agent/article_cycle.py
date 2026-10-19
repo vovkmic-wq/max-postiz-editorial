@@ -14,7 +14,7 @@ from sqlalchemy import or_, select
 
 from .adapters import OpenCode
 from .browser_runtime import profile_lock
-from .config import AgentError, fingerprint, inside
+from .config import AgentError, fingerprint, inside, parse_json
 from .db import Draft, DraftRevision, Material, Story, now, uid
 from .hub import ACTIVE
 from .hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Target, TargetApproval, Variant
@@ -283,7 +283,48 @@ class HourlyArticleCycle:
 
     @staticmethod
     def _candidate_hash(candidate):
-        return fingerprint({key: candidate[key].strip() for key in ("title", "body")})
+        from .article_quality import normalize_article_links
+        return fingerprint({key: normalize_article_links(candidate[key].strip()) for key in ("title", "body")})
+
+    def _legacy_candidate_hashes(self, record, attempt, hashes):
+        """Read one old checked candidate; missing provenance cannot permit a retry."""
+        try:
+            expected = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
+            if record.get("quality_trace") != expected:
+                raise ValueError
+            raw = inside(self.core.settings.root, expected).read_bytes()
+            if not 0 < len(raw) <= 2 * 1024 * 1024:
+                raise ValueError
+            started, finished = attempt["started_at"], attempt["finished_at"]
+            if any(type(value) not in {int, float} or not math.isfinite(value) for value in (started, finished)) or started > finished:
+                raise ValueError
+            found = set()
+            for line in raw.decode("utf-8").splitlines():
+                event = parse_json(line)
+                if (not isinstance(event, dict) or event.get("record_id") != record["id"]
+                        or event.get("phase") != "candidate_started"
+                        or type(event.get("at")) not in {int, float}
+                        or not started <= event["at"] <= finished):
+                    continue
+                candidate, source = event.get("candidate"), event.get("source_untrusted", {})
+                if (not isinstance(candidate, dict) or set(candidate) != {"title", "body"}
+                        or any(not isinstance(value, str) or not value.strip() for value in candidate.values())):
+                    raise ValueError
+                supplied = event.get("candidate_raw", candidate)
+                if fingerprint(candidate) not in hashes and fingerprint(supplied) not in hashes:
+                    continue
+                if (not isinstance(supplied, dict) or set(supplied) != {"title", "body"}
+                        or any(not isinstance(value, str) or not value.strip() for value in supplied.values())
+                        or self._candidate_hash(supplied) != self._candidate_hash(candidate)
+                        or not isinstance(source, dict) or source.get("url") != record["url"]
+                        or not isinstance(source.get("body"), str) or text_hash(source["body"]) != record["original_hash"]):
+                    raise ValueError
+                found.add(self._candidate_hash(candidate))
+            if len(found) != 1:
+                raise ValueError
+            return found
+        except (OSError, ValueError, TypeError, KeyError, UnicodeError, AgentError) as exc:
+            raise AgentError("ARTICLE_REJECTED_CANDIDATE_TRACE_REQUIRED", 409) from exc
 
     def _guard_candidate_replay(self, ledger, record, candidate, operation):
         """A persisted substantive refusal cannot be replaced by a fresh model sample."""
@@ -311,6 +352,11 @@ class HourlyArticleCycle:
                     raise AgentError("ARTICLE_LEDGER_INVALID", 409)
                 if candidate_hash in hashes or supplied_hash in hashes:
                     rejected = True
+                normalization = attempt.get("candidate_normalization")
+                if normalization not in {None, "article-links-v1"}:
+                    raise AgentError("ARTICLE_LEDGER_INVALID", 409)
+                if normalization is None and not rejected:
+                    rejected = candidate_hash in self._legacy_candidate_hashes(record, attempt, hashes)
         if rejected:
             record.setdefault("preparation_actions", []).append({
                 "at": now(), "action": "rejected_candidate_replay_blocked", "operation": operation,
@@ -393,6 +439,7 @@ class HourlyArticleCycle:
                        "started_at": now(), "state": "preparing", "operator_retry": bool(retry_record)}
             if candidate is not None:
                 attempt.update(candidate_hash=self._candidate_hash(candidate), operator_correction=True,
+                               candidate_normalization="article-links-v1",
                                candidate_raw_hash=fingerprint(candidate))
             record["preparation_attempts"].append(attempt)
             record.update(state="preparing", input_hash=fingerprint(article))
@@ -647,6 +694,7 @@ class HourlyArticleCycle:
                 original_title, original = material.title, material.text
             self._guard_candidate_replay(ledger, record, correction, "revise_prepared")
             attempt = {"started_at": now(), "candidate_hash": self._candidate_hash(correction), "state": "checking",
+                       "candidate_normalization": "article-links-v1",
                        "candidate_raw_hash": fingerprint(correction)}
             record.setdefault("correction_attempts", []).append(attempt)
             record.update(state="revising", correction_blocked=True)

@@ -16,6 +16,7 @@ from .article_quality import (
     _validated_source,
     adjudicate_scientific_spelling,
     canonical_article_url,
+    normalize_article_links,
 )
 from .config import AgentError, fingerprint, parse_json
 from .editorial import translation_gate
@@ -107,7 +108,16 @@ def _recover(record, article, raw):
     _require(isinstance(candidate, dict) and set(candidate) == {"title", "body"})
     _require(all(isinstance(value, str) and value.strip() == value and value
                  for value in candidate.values()))
-    _require(fingerprint(candidate) == expected_raw == expected_candidate)
+    raw_candidate = first.get("candidate_raw")
+    if raw_candidate is None:
+        # Historical traces checked their literal, already stripped candidate.
+        _require(fingerprint(candidate) == expected_raw == expected_candidate)
+    else:
+        _require(isinstance(raw_candidate, dict) and set(raw_candidate) == {"title", "body"}
+                 and all(isinstance(value, str) and value.strip() for value in raw_candidate.values()))
+        _require(fingerprint(raw_candidate) == expected_raw
+                 and {key: normalize_article_links(raw_candidate[key].strip()) for key in ("title", "body")} == candidate
+                 and fingerprint(candidate) == expected_candidate)
     title, body = candidate["title"], candidate["body"]
     _require(len(title) <= 500 and "Источник:" not in body
              and "Перевод и редактура с помощью нейросетей." not in body)

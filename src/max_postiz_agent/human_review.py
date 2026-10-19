@@ -191,13 +191,23 @@ def details(core, ident):
 
 def candidate_body(variant, source):
     body = variant.body
-    prefix = variant.title + "\n\n"
-    if body.startswith(prefix):
-        body = body[len(prefix):]
-    footer = "\n\nИсточник: " + source["url"]
-    for suffix in (footer + "\nПеревод и редактура с помощью нейросетей.", footer):
-        if body.endswith(suffix):
+    # Postiz's plain-text extraction may turn a paragraph separator into one LF.
+    # Match only the exact staged title and our complete terminal attribution.
+    for separator in ("\n\n", "\n"):
+        prefix = variant.title + separator
+        if body.startswith(prefix) and body[len(prefix):] and not body[len(prefix):].startswith("\n"):
+            body = body[len(prefix):]
+            break
+    footer = "Источник: " + source["url"] + "\nПеревод и редактура с помощью нейросетей."
+    for separator in ("\n\n", "\n"):
+        suffix = separator + footer
+        if body.endswith(suffix) and not body[:-len(suffix)].endswith("\n"):
             return body[:-len(suffix)]
+    # Keep the pre-existing two-LF legacy attribution contract. A single-LF
+    # boundary is accepted only with the complete service disclosure above.
+    legacy_footer = "\n\nИсточник: " + source["url"]
+    if body.endswith(legacy_footer) and not body[:-len(legacy_footer)].endswith("\n"):
+        return body[:-len(legacy_footer)]
     return body
 
 
