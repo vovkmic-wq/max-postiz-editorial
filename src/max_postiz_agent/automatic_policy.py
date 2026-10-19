@@ -20,11 +20,13 @@ POLICY_ACTOR = "hourly_article_policy"
 
 
 def _validate(evidence, title, body, source):
-    from .article_quality import (MEANING_FIRST_REVIEW_RUBRIC, TOPICS, normalize_rubric_review,
-                                  rubric_spelling, rubric_translation_gate)
+    from .article_quality import (MAX_REVIEW_ISSUES, MEANING_FIRST_REVIEW_RUBRIC, TOPICS,
+                                  normalize_rubric_review, protocol_recovery_provenance,
+                                  review_parser_contract, rubric_spelling, rubric_translation_gate)
     required = {"review_raw", "review", "spelling_matches", "spelling_adjudicated", "spelling_unresolved",
                 "hard_gates_passed", "text_hash", "source_hash", "review_rubric", "review_prompt_hash", "trace_hash"}
-    if (not isinstance(evidence, dict) or set(evidence) != required
+    optional = {"parser_contract", "protocol_recovery"}
+    if (not isinstance(evidence, dict) or not required <= set(evidence) <= required | optional
             or evidence["review_rubric"] != MEANING_FIRST_REVIEW_RUBRIC
             or evidence["hard_gates_passed"] is not True
             or evidence["text_hash"] != text_hash(title, body)
@@ -37,6 +39,18 @@ def _validate(evidence, title, body, source):
     review = normalize_rubric_review(evidence["review"], rubric)
     if (normalize_rubric_review(extract_object(evidence["review_raw"]), rubric) != review
             or review["approved"] is not True or review["issues"] or review["topic"] not in TOPICS):
+        raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
+    if "parser_contract" in evidence:
+        if (not isinstance(evidence["parser_contract"], dict)
+                or fingerprint(evidence["parser_contract"]) != fingerprint(review_parser_contract(evidence["review_raw"]))):
+            raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
+    elif len(review["warnings"]) > MAX_REVIEW_ISSUES:
+        raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
+    if "protocol_recovery" in evidence and (
+            "parser_contract" not in evidence
+            or not isinstance(evidence["protocol_recovery"], dict)
+            or fingerprint(evidence["protocol_recovery"]) != fingerprint(protocol_recovery_provenance(
+                evidence["review_raw"], evidence["review_prompt_hash"]))):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     candidate = title + "\n\n" + candidate_body(SimpleNamespace(title=title, body=body), source)
     original = source["title"] + "\n\n" + source["body"]

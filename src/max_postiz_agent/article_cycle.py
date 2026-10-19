@@ -8,14 +8,16 @@ import re
 from contextlib import ExitStack
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
+from uuid import NAMESPACE_URL, uuid5
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 
 from .adapters import OpenCode
 from .browser_runtime import profile_lock
 from .config import AgentError, fingerprint, inside, parse_json
-from .db import Draft, DraftRevision, Material, Story, now, uid
+from .db import Audit, Draft, DraftRevision, Material, Story, now, uid
 from .hub import ACTIVE
 from .hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Target, TargetApproval, Variant
 from .reddit import text_hash
@@ -783,6 +785,218 @@ class HourlyArticleCycle:
         with profile_lock(self.directory / "cycle.lock"):
             ledger = self._load()
             return reconcile_approval(self, self._record(ledger, ident), ledger, reviewed_hash, due_at, reason)
+
+    def _saved_review_protocol(self, record, article, candidate, trace_sha256):
+        from .adapters import extract_object
+        from .article_quality import normalize_article_links, protocol_recovery_review
+        error = "ARTICLE_REVIEW_PROTOCOL_NOT_RECOVERABLE"
+        try:
+            expected = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
+            if record.get("quality_trace") != expected or not re.fullmatch(r"[a-f0-9]{64}", trace_sha256):
+                raise ValueError
+            raw = inside(self.core.settings.root, expected).read_bytes()
+            if not 0 < len(raw) <= 2 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != trace_sha256:
+                raise ValueError
+            attempts = record.get("preparation_attempts")
+            if not isinstance(attempts, list) or not attempts or not all(isinstance(item, dict) for item in attempts):
+                raise ValueError
+            attempt = attempts[-1]
+            if (type(attempt.get("number")) is not int or attempt["number"] != len(attempts)
+                    or attempt.get("operator_correction") is not True
+                    or attempt.get("error") != "ARTICLE_QUALITY_REJECTED"
+                    or attempt.get("state") not in {"needs_attention", "rejected", "failed"}
+                    or attempt.get("candidate_normalization") != "article-links-v1"
+                    or attempt.get("candidate_hash") != self._candidate_hash(candidate)
+                    or attempt.get("candidate_raw_hash") != fingerprint(candidate)):
+                raise ValueError
+            started, finished = attempt["started_at"], attempt["finished_at"]
+            if (any(type(value) not in {int, float} or not math.isfinite(value) for value in (started, finished))
+                    or not record["claimed_at"] <= started <= finished):
+                raise ValueError
+            events, previous = [], -1
+            for line in raw.decode("utf-8").splitlines():
+                event = parse_json(line)
+                if (not isinstance(event, dict) or event.get("record_id") != record["id"]
+                        or type(event.get("at")) not in {int, float} or not math.isfinite(event["at"])
+                        or not previous <= event["at"] <= finished):
+                    raise ValueError
+                previous = event["at"]
+                events.append(event)
+            segment = [event for event in events if event["at"] >= started]
+            phases = ["candidate_started", "gate_passed", "review_started", "review_returned", "review_invalid", "rejected"]
+            if ([event.get("phase") for event in segment] != phases
+                    or any(type(event.get("attempt")) is not int or event["attempt"] != 1 for event in segment)):
+                raise ValueError
+            canonical = {key: normalize_article_links(candidate[key].strip()) for key in ("title", "body")}
+            source = {"title": article["title"].strip(), "body": article["original"].strip(), "url": article["url"]}
+            first, gate, review_start, returned, invalid, rejected = segment
+            original = source["title"] + "\n\n" + source["body"]
+            translation = canonical["title"] + "\n\n" + canonical["body"]
+            prompt = (self.core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt").read_text(encoding="utf-8")
+            prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            context = review_start.get("context", {})
+            if not isinstance(context, dict):
+                raise ValueError
+            if (first.get("mode") != "candidate" or first.get("candidate") != canonical
+                    or first.get("candidate_raw", first.get("candidate")) != candidate
+                    or first.get("source_untrusted") != source
+                    or gate.get("characters") != len(translation + "\n\nИсточник: " + article["url"] +
+                                                       "\nПеревод и редактура с помощью нейросетей.")
+                    or context.get("instruction") != prompt or context.get("review_prompt_hash") != prompt_hash
+                    or context.get("review_rubric") != "meaning-first-v1"
+                    or context.get("source_untrusted") != original or context.get("translation_untrusted") != translation
+                    or invalid.get("error") != "ARTICLE_REVIEW_SCHEMA_INVALID"
+                    or rejected.get("mode") != "candidate" or rejected.get("error") != "ARTICLE_QUALITY_REJECTED"
+                    or rejected.get("feedback")):
+                raise ValueError
+            # Another verdict for this exact EN/RU pair is never upgraded by a
+            # protocol repair, including an earlier substantive refusal.
+            matching = [event for event in events if event.get("phase") == "review_started"
+                        and isinstance(event.get("context"), dict)
+                        and event.get("context", {}).get("source_untrusted") == original
+                        and event.get("context", {}).get("translation_untrusted") == translation]
+            if len(matching) != 1:
+                raise ValueError
+            current_hashes = {self._candidate_hash(candidate), fingerprint(candidate)}
+            corrections = record.get("correction_attempts", [])
+            if not isinstance(corrections, list) or any(not isinstance(item, dict) for item in corrections):
+                raise ValueError
+            prior = attempts[:-1] + corrections
+            if any(item.get("error") == "ARTICLE_QUALITY_REJECTED" and any(item.get(key) in current_hashes
+                   for key in ("candidate_hash", "candidate_raw_hash", "candidate_normalized_hash")) for item in prior):
+                raise ValueError
+            raw_review = returned["raw"]
+            reviewed = protocol_recovery_review(raw_review)
+            if fingerprint(invalid.get("review")) != fingerprint(extract_object(raw_review)):
+                raise ValueError
+            return {"raw": raw, "canonical": canonical, "raw_review": raw_review,
+                    "raw_review_sha256": hashlib.sha256(raw_review.encode("utf-8")).hexdigest(),
+                    "review_prompt_hash": prompt_hash, "review": reviewed, "trace": expected,
+                    "segment_hash": fingerprint(segment)}
+        except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError, AgentError) as exc:
+            raise AgentError(error, 409) from exc
+
+    def _protocol_pre_draft(self, record, target_id):
+        self._assert_pre_draft(record)
+        with self.core.db.session() as session:
+            target = self.core._target(session, target_id)
+            if (not target.paused or session.scalar(select(Dispatch).where(Dispatch.state.in_(ACTIVE)))
+                    or session.scalar(select(BridgePost).where(BridgePost.mutation_owner.is_not(None)
+                        | (BridgePost.mutation_until != 0) | BridgePost.mutation_until.is_(None)))):
+                raise AgentError("ARTICLE_REVIEW_PROTOCOL_NOT_RECOVERABLE", 409)
+
+    def _protocol_source_novel(self, record, ledger, article):
+        others = [item for item in ledger["records"] if item.get("id") != record["id"]]
+        if any(item["slot"] == record["slot"] or item.get("automatic_slot") == record["slot"] for item in others):
+            raise AgentError("ARTICLE_SLOT_ALREADY_CLAIMED", 409)
+        if sum(item["state"] in {"awaiting_human_review", "automatic_ready", "pending", "sending", "unknown", "awaiting_postiz"}
+               for item in others) >= 24:
+            raise AgentError("ARTICLE_AUTOMATIC_BACKLOG", 409)
+        if any(item["state"] not in {"published", "failed", "cancelled", "rejected", "awaiting_human_review"}
+               and not (item["state"] == "automatic_ready" and item.get("automatic_enrolled")) for item in others):
+            raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
+        if any(item.get("url") == article["url"] or item.get("original_hash") == record["original_hash"] for item in others):
+            raise AgentError("ARTICLE_DUPLICATE_SOURCE", 409)
+        material_hash = fingerprint(" ".join(article["original"].casefold().split()))
+        with self.core.db.session() as session:
+            if session.scalar(select(Material).where(or_(Material.url == article["url"],
+                    Material.text_hash.in_({record["original_hash"], material_hash})))):
+                raise AgentError("ARTICLE_DUPLICATE_SOURCE", 409)
+
+    def recover_review_protocol(self, ident, article, candidate, trace_sha256, reason):
+        from .article_quality import (MAX_REVIEW_ISSUES, MAX_REVIEW_ISSUE_CHARS, MAX_REVIEW_WARNINGS,
+            MAX_REVIEW_WARNINGS_BYTES, REVIEW_PROTOCOL_CONTRACT)
+        from .human_review import close_quality
+        if not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 2000:
+            raise AgentError("ARTICLE_REVIEW_PROTOCOL_REASON_REQUIRED", 409)
+        self._validate_correction(candidate)
+        with profile_lock(self.directory / "cycle.lock"):
+            policy, ledger = self._policy(), self._load()
+            record = self._record(ledger, ident)
+            if (policy.get("approval_mode") != "automatic" or record.get("state") != "needs_attention"
+                    or record.get("error") != "ARTICLE_QUALITY_REJECTED" or record["slot"] != int(now() // 3600)
+                    or record.get("policy_hash") != fingerprint(policy)):
+                raise AgentError("ARTICLE_REVIEW_PROTOCOL_NOT_RECOVERABLE", 409)
+            source, target = self._source_target(policy)
+            article = self._article(article, policy, source, target)
+            if (record.get("input_hash") != fingerprint(article) or record.get("url") != article["url"]
+                    or record.get("original_hash") != text_hash(article["original"])
+                    or record.get("source_published_at") != article["published_at"]
+                    or record.get("source_id") != source["id"] or record.get("target_id") != target.id):
+                raise AgentError("ARTICLE_RETRY_INPUT_MISMATCH", 409)
+            self._protocol_pre_draft(record, target.id)
+            self._protocol_source_novel(record, ledger, article)
+            saved = self._saved_review_protocol(record, article, candidate, trace_sha256)
+            claim_id = str(uuid5(NAMESPACE_URL, "max-postiz:review-protocol-recovery:" + ident))
+            history = record.get("review_protocol_recoveries", [])
+            if not isinstance(history, list):
+                raise AgentError("ARTICLE_LEDGER_INVALID", 409)
+            with self.core.db.session() as session:
+                if history or session.get(Audit, claim_id):
+                    raise AgentError("ARTICLE_REVIEW_PROTOCOL_ALREADY_ATTEMPTED", 409)
+            contract = {"id": REVIEW_PROTOCOL_CONTRACT, "issues_max": MAX_REVIEW_ISSUES,
+                        "warnings_max": MAX_REVIEW_WARNINGS, "item_chars_max": MAX_REVIEW_ISSUE_CHARS,
+                        "warnings_utf8_max": MAX_REVIEW_WARNINGS_BYTES}
+            trace_id = uid()
+            claim = {"id": claim_id, "at": now(), "state": "checking", "reason": reason.strip(),
+                     "original_error": record["error"], "old_trace": saved["trace"], "old_trace_sha256": trace_sha256,
+                     "old_segment_hash": saved["segment_hash"], "raw_review_sha256": saved["raw_review_sha256"],
+                     "candidate_hash": self._candidate_hash(candidate), "candidate_raw_hash": fingerprint(candidate),
+                     "source_hash": record["input_hash"], "policy_hash": fingerprint(policy),
+                     "review_prompt_hash": saved["review_prompt_hash"], "review_rubric": "meaning-first-v1",
+                     "parser_contract": contract, "parser_contract_hash": fingerprint(contract),
+                     "quality_trace": f"data/hourly-articles/quality-{trace_id}.local.jsonl", "operator_correction": True}
+            try:
+                with self.core.db.session.begin() as session:
+                    session.add(Audit(id=claim_id, actor="hourly_article_protocol_recovery",
+                        action="hourly_article_review_protocol_started", entity=ident, details=copy.deepcopy(claim)))
+            except IntegrityError as exc:
+                raise AgentError("ARTICLE_REVIEW_PROTOCOL_ALREADY_ATTEMPTED", 409) from exc
+            quality = None
+            try:
+                record["review_protocol_recoveries"] = [*history, claim]
+                record["state"] = "recovering_review_protocol"
+                self._save(ledger)
+                quality = self._quality(trace_id, review_only=True)
+                canonical = saved["canonical"]
+                prepared = quality.recover_review_protocol(canonical["title"], canonical["body"],
+                    article["title"].strip(), article["original"].strip(), article["url"], raw_review=saved["raw_review"],
+                    expected_review_prompt_hash=saved["review_prompt_hash"])
+                expected_record_hash = fingerprint(record)
+                ledger = self._load()
+                record = self._record(ledger, ident)
+                if fingerprint(record) != expected_record_hash:
+                    raise AgentError("ARTICLE_REVIEW_PROTOCOL_NOT_RECOVERABLE", 409)
+                claim = record["review_protocol_recoveries"][-1]
+                self._protocol_pre_draft(record, target.id)
+                if (fingerprint(self._policy()) != fingerprint(policy)
+                        or (self.core.settings.root / saved["trace"]).read_bytes() != saved["raw"]
+                        or prepared.get("title") != canonical["title"]
+                        or prepared.get("translation") != canonical["title"] + "\n\n" + canonical["body"]):
+                    raise AgentError("ARTICLE_REVIEW_PROTOCOL_NOT_RECOVERABLE", 409)
+                source, target = self._source_target(policy)
+                self._article(article, policy, source, target)
+                self._protocol_source_novel(record, ledger, article)
+                record["quality_trace"] = claim["quality_trace"]
+                result = self._store_prepared(article, prepared, record, ledger, policy, source, target,
+                    {"quality": "saved_ministral_protocol_recovery_fresh_languagetool",
+                     "review_protocol_recovery": copy.deepcopy(prepared["review_protocol_recovery"])}, claim)
+                with self.core.db.session.begin() as session:
+                    self.core.db.audit(session, "hourly_article_protocol_recovery",
+                        "hourly_article_review_protocol_completed", ident, **claim)
+                return result
+            except Exception as exc:
+                claim.update(state="failed", finished_at=now(), error=exc.code if isinstance(exc, AgentError)
+                             else "ARTICLE_REVIEW_PROTOCOL_INTERRUPTED")
+                record.update(state="needs_attention", protocol_recovery_error=claim["error"])
+                self._save(ledger)
+                with self.core.db.session.begin() as session:
+                    self.core.db.audit(session, "hourly_article_protocol_recovery",
+                        "hourly_article_review_protocol_failed", ident, **claim)
+                raise
+            finally:
+                if quality:
+                    close_quality(quality, close_models=not self.quality_factory)
 
     def status(self, ident=None):
         with profile_lock(self.directory / "cycle.lock"):

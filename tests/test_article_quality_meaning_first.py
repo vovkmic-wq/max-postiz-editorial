@@ -91,7 +91,7 @@ def test_new_prompt_is_selected_explicitly_and_legacy_stays_unchanged():
 @pytest.mark.parametrize("bad", [
     {key: PASS[key] for key in ("approved", "topic", "issues")},
     {**PASS, "approved": "true"}, {**PASS, "warnings": "just style"},
-    {**PASS, "warnings": [""]}, {**PASS, "warnings": ["a"] * 4},
+    {**PASS, "warnings": [""]}, {**PASS, "warnings": ["a"] * 9},
     {**PASS, "warnings": [{"issue": "not a plain string"}]},
     {**PASS, "warnings": ["a" * 1025]}, {**PASS, "extra": "cannot weaken the schema"},
 ])

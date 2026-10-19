@@ -25,6 +25,10 @@ TOPICS = {"science", "stories", "humor"}
 MAGELLANIC_EVIDENCE = "https://www.astronet.ru/db/msg/1167613/lmc.html"
 MAX_REVIEW_ISSUES = 3
 MAX_REVIEW_ISSUE_CHARS = 1024
+MAX_REVIEW_WARNINGS = 8
+MAX_REVIEW_WARNINGS_BYTES = 8192
+REVIEW_PROTOCOL_CONTRACT = "meaning-first-advisory-v2"
+MAX_PROTOCOL_REVIEW_BYTES = 65536
 LEGACY_REVIEW_RUBRIC = "legacy"
 MEANING_FIRST_REVIEW_RUBRIC = "meaning-first-v1"
 REVIEW_RUBRICS = {LEGACY_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC}
@@ -93,11 +97,56 @@ def normalize_rubric_review(value, rubric):
         raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
     normalized = _normalize_review({key: value[key] for key in ("approved", "topic", "issues")})
     warnings = value["warnings"]
-    if (not isinstance(warnings, list) or len(warnings) > MAX_REVIEW_ISSUES
+    if (not isinstance(warnings, list) or len(warnings) > MAX_REVIEW_WARNINGS
             or any(not isinstance(item, str) or not item.strip()
                    or len(item) > MAX_REVIEW_ISSUE_CHARS for item in warnings)):
         raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
+    try:
+        if sum(len(item.encode("utf-8")) for item in warnings) > MAX_REVIEW_WARNINGS_BYTES:
+            raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
+    except UnicodeError as exc:
+        raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID") from exc
     return {**normalized, "warnings": copy.deepcopy(warnings)}
+
+
+def protocol_recovery_review(raw_review):
+    """Classify only a typed positive whose old sole defect was advisory count."""
+    error = "ARTICLE_REVIEW_PROTOCOL_NOT_RECOVERABLE"
+    try:
+        if (not isinstance(raw_review, str) or not raw_review.strip()
+                or len(raw_review.encode("utf-8")) > MAX_PROTOCOL_REVIEW_BYTES):
+            raise AgentError(error, 409)
+        reviewed = normalize_rubric_review(extract_object(raw_review), MEANING_FIRST_REVIEW_RUBRIC)
+        if (reviewed["approved"] is not True or reviewed["topic"] not in TOPICS
+                or reviewed["issues"] or not MAX_REVIEW_ISSUES < len(reviewed["warnings"]) <= MAX_REVIEW_WARNINGS):
+            raise AgentError(error, 409)
+        return reviewed
+    except (AgentError, UnicodeError, TypeError, ValueError, RecursionError) as exc:
+        raise AgentError(error, 409) from exc
+
+
+def review_parser_contract(raw_review):
+    """Bind the exact raw response to the bounded advisory parser contract."""
+    limits = {"contract": REVIEW_PROTOCOL_CONTRACT, "max_issues": MAX_REVIEW_ISSUES,
+              "max_issue_chars": MAX_REVIEW_ISSUE_CHARS, "max_warnings": MAX_REVIEW_WARNINGS,
+              "max_warning_chars": MAX_REVIEW_ISSUE_CHARS,
+              "max_warnings_utf8_bytes": MAX_REVIEW_WARNINGS_BYTES}
+    return {**limits, "contract_hash": fingerprint(limits),
+            "raw_review_sha256": hashlib.sha256(raw_review.encode("utf-8")).hexdigest()}
+
+
+def protocol_recovery_provenance(raw_review, review_prompt_hash):
+    """Describe only a recognized positive count overflow, without changing it."""
+    reviewed = protocol_recovery_review(raw_review)
+    if not isinstance(review_prompt_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", review_prompt_hash):
+        raise AgentError("ARTICLE_REVIEW_PROTOCOL_NOT_RECOVERABLE", 409)
+    parser = review_parser_contract(raw_review)
+    return {"contract": REVIEW_PROTOCOL_CONTRACT, "parser_contract_hash": parser["contract_hash"],
+            "legacy_error": "ARTICLE_REVIEW_SCHEMA_INVALID", "reason": "ADVISORY_COUNT_ONLY_OVERFLOW",
+            "legacy_warning_limit": MAX_REVIEW_ISSUES, "warning_limit": MAX_REVIEW_WARNINGS,
+            "warnings_utf8_limit": MAX_REVIEW_WARNINGS_BYTES, "raw_utf8_limit": MAX_PROTOCOL_REVIEW_BYTES,
+            "warning_count": len(reviewed["warnings"]), "raw_review_sha256": parser["raw_review_sha256"],
+            "review_rubric": MEANING_FIRST_REVIEW_RUBRIC, "review_prompt_hash": review_prompt_hash}
 
 
 def article_reference_urls(text):
@@ -300,7 +349,8 @@ class ArticleQuality:
                                 review_prompt_hash=self.review_prompt_hash,
                                 warnings=copy.deepcopy(reviewed["warnings"]))
                 prepared["machine_review_evidence"].update(
-                    review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash)
+                    review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash,
+                    parser_contract=review_parser_contract(raw))
         return prepared
 
     def prepare(self, title, original, url):
@@ -506,6 +556,64 @@ class ArticleQuality:
         self._human_evidence(prepared, original_title, original, reviewed, raw_review, matches,
                              adjudicated, unresolved)
         self._emit("accepted" if passed else "rejected_for_human", 1, mode="candidate", result=prepared)
+        return prepared
+
+    def recover_review_protocol(self, title, body, original_title, original, url, *,
+                                raw_review, expected_review_prompt_hash):
+        """Revalidate one saved positive advisory overflow, never sample a model.
+
+        The caller must bind the old trace, exact inputs, policy and one durable
+        recovery claim. This method supplies fresh hard gates and LanguageTool;
+        it neither stages a draft nor grants publication approval.
+        """
+        error = "ARTICLE_REVIEW_PROTOCOL_NOT_RECOVERABLE"
+        if (self.review_rubric != MEANING_FIRST_REVIEW_RUBRIC
+                or expected_review_prompt_hash != self.review_prompt_hash):
+            raise AgentError(error, 409)
+        canonical_url = canonical_article_url(url)
+        en_title, en_body, source = _validated_source(original_title, original)
+        if (canonical_url != url or en_title != original_title or en_body != original
+                or not isinstance(title, str) or not title.strip()
+                or not isinstance(body, str) or not body.strip()
+                or title != normalize_article_links(title.strip())
+                or body != normalize_article_links(body.strip())):
+            raise AgentError(error, 409)
+        reviewed = protocol_recovery_review(raw_review)
+        protocol = protocol_recovery_provenance(raw_review, self.review_prompt_hash)
+        self._emit("protocol_recovery_started", 1, protocol=protocol, raw=raw_review,
+                   candidate={"title": title, "body": body},
+                   source_untrusted={"title": en_title, "body": en_body, "url": url})
+        self._emit("protocol_recovery_validated", 1, protocol=protocol, review=reviewed)
+        text = title + "\n\n" + body
+        full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
+        try:
+            rubric_translation_gate(source, text, self.review_rubric)
+            if len(full) > 3500:
+                raise AgentError("ARTICLE_POST_TOO_LONG")
+        except AgentError as exc:
+            self._emit("gate_rejected", 1, error=exc.code, characters=len(full))
+            self._emit("rejected", 1, mode="protocol_recovery", error=exc.code)
+            raise
+        self._emit("gate_passed", 1, characters=len(full))
+        self._emit("spelling_started", 1)
+        try:
+            matches = self._spelling_matches(text)
+        except AgentError as exc:
+            self._emit("spelling_failed", 1, error=exc.code)
+            raise
+        self._emit("spelling_returned", 1, matches=matches)
+        adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric)
+        self._emit("spelling_adjudicated", 1, adjudicated=adjudicated, unresolved=unresolved)
+        if unresolved:
+            self._emit("rejected", 1, mode="protocol_recovery", error="ARTICLE_QUALITY_REJECTED",
+                       feedback={"review_approved": True, "topic": reviewed["topic"],
+                                 "review_issues": [], "spelling_matches": unresolved[:20]})
+            raise AgentError("ARTICLE_QUALITY_REJECTED")
+        prepared = {"title": title, "body": full, "translation": text, "original": source,
+                    "url": url, "topic": reviewed["topic"], "review_protocol_recovery": protocol}
+        self._human_evidence(prepared, en_title, en_body, reviewed, raw_review, matches, adjudicated, unresolved)
+        prepared["machine_review_evidence"]["protocol_recovery"] = copy.deepcopy(protocol)
+        self._emit("accepted", 1, mode="protocol_recovery", result=prepared)
         return prepared
 
     def close(self):

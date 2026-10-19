@@ -1,6 +1,6 @@
 # Почасовой автоматический цикл MAX–Postiz
 
-Версия 0.6.18, 20 октября 2026, Europe/Moscow. После демонстрации ручного процесса
+Версия 0.6.19, 20 октября 2026, Europe/Moscow. После демонстрации ручного процесса
 владелец отменил обязательного редактора-человека для max_test и поручил вернуть
 автоматическую публикацию со смягчённой машинной проверкой. Режим human сохранён
 для истории и других явных сценариев, но новая политика использует automatic.
@@ -106,6 +106,28 @@ reviewed-hash, неизменной будущей датой и причино�
 Эта команда не заменяет publish и не применима к произвольным отказам. CURRENT_HASH
 берут из свежего status после сверки того же QUEUE; SAME_FUTURE_UNIX_TIMESTAMP
 должен совпадать с уже сохранённой датой. При existing claim команда останавливается.
+
+С 0.6.19 advisory warnings имеют отдельную ограниченную вместимость: до 8 строк,
+каждая до 1024 символов, суммарно до 8192 UTF-8 байт. Содержательные issues
+по-прежнему ограничены тремя; отрицательное решение и ошибки типов блокируют.
+Ни raw, ни замечания не усекаются. Семантический промпт и meaning-first-v1
+сохранены: желательная краткость ответа не меняет порог фактической точности.
+
+Для известного сбоя исключительно старого количества warnings (4..8) существует
+отдельный recover-review-protocol. Нужны последний полный trace с его SHA256,
+точный input/candidate/source/prompt/policy, положительный strict typed verdict
+без issues и отсутствие любых следов staging/approval/dispatch/lease. Старый
+review_invalid остаётся в истории; одноразовый durable claim не снимается.
+Операция не вызывает модели: исходный verdict и все warnings используются
+неизменными, затем выполняются hard gates и новый LanguageTool. Только новая
+полная checked evidence допускает один DRAFT; согласование отдельно. Иные
+ошибки схемы, отрицательный verdict или непустые issues восстановлению не подлежат.
+
+    .venv/bin/python scripts/hourly_article_test.py recover-review-protocol RECORD_ID data/article.local.json data/candidate.local.json --trace-sha256 EXACT_TRACE_SHA256 --reason "Restore only the verified advisory-count envelope; preserve raw verdict and recheck hard gates and LanguageTool"
+
+После восстановления status должен показать один automatic_ready того же record,
+без approval/dispatch. Не повторять неизвестный исход команды. Для отправки
+нужны обычный policy publish с актуальным reviewed-hash и будущая дата.
 
 Почасовой выбор/подготовку запускает Codex на компьютере владельца: он должен
 работать. Уже согласованную запись исполняет worker VM без открытой панели.
