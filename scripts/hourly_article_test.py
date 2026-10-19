@@ -16,6 +16,11 @@ def main():
     prepare.add_argument("article", help="Ignored project-local data/*.json with the real source text/date")
     prepare.add_argument("--retry-record", help="Explicit operator retry of this same failed pre-draft record")
     prepare.add_argument("--candidate", help="Ignored Russian title/body JSON for an existing failed pre-draft retry")
+    rejected = sub.add_parser("stage-rejected")
+    rejected.add_argument("record_id")
+    rejected.add_argument("article", help="The unchanged ignored article input for the completed rejected trace")
+    rejected.add_argument("--restore-cancelled", action="store_true")
+    rejected.add_argument("--reason", required=True)
     publish = sub.add_parser("publish")
     publish.add_argument("record_id")
     publish.add_argument("--reviewed-hash", required=True)
@@ -48,6 +53,12 @@ def main():
                     raise AgentError("ARTICLE_PRIVATE_INPUT_REQUIRED")
                 candidate = json.loads(candidate_path.read_text(encoding="utf-8-sig"))
             result = cycle.prepare(article, retry_record=args.retry_record, candidate=candidate)
+        elif args.action == "stage-rejected":
+            path = inside(root, args.article)
+            if not path.is_relative_to(root / "data") or path.suffix != ".json":
+                raise AgentError("ARTICLE_PRIVATE_INPUT_REQUIRED")
+            result = cycle.stage_rejected(args.record_id, json.loads(path.read_text(encoding="utf-8-sig")),
+                restore_cancelled=args.restore_cancelled, reason=args.reason)
         elif args.action == "publish":
             result = cycle.publish(args.record_id, args.reviewed_hash, args.due_at)
         elif args.action == "cancel-preparation":

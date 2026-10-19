@@ -3,7 +3,7 @@ from pathlib import Path
 
 from fastapi import Depends, File, Header, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
@@ -32,6 +32,8 @@ class ApprovalInput(Input):
     content_hash: str = Field(min_length=64, max_length=64)
     due_at: float = Field(ge=0, allow_inf_nan=False)
     human_review_confirmed: StrictBool = False
+    machine_exception_confirmed: StrictBool = False
+    machine_review_notes: StrictStr = Field(default="", max_length=4000)
 
 
 class PauseInput(Input):
@@ -265,8 +267,10 @@ def hub_app(service, run_worker=False, *, dispatch_only=False):
     @app.post("/api/hub/variants/{ident}/approve")
     def approve(ident: str, value: ApprovalInput, request: Request,
                 authorization: str | None = Header(default=None), role=Depends(editor)):
-        hourly = service.hourly_review_details(ident).get("hourly_article", False)
+        details = service.hourly_review_details(ident)
+        hourly = details.get("hourly_article", False)
         human_confirmed = False
+        exception = {}
         if hourly:
             # An API credential is sufficient for editing, never for attesting a
             # human review. Only the panel's same-origin signed session may do it.
@@ -277,8 +281,21 @@ def hub_app(service, run_worker=False, *, dispatch_only=False):
             if not value.human_review_confirmed:
                 raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 409)
             human_confirmed = True
+            machine_status = details.get("machine_review_status")
+            if (machine_status not in {"passed", "rejected"}
+                    or details.get("machine_review_current") is not True):
+                raise AgentError("ARTICLE_MACHINE_RECHECK_REQUIRED", 409)
+            if machine_status == "rejected":
+                if details.get("machine_exception_eligible") is not True:
+                    raise AgentError("ARTICLE_MACHINE_RECHECK_REQUIRED", 409)
+                if not value.machine_exception_confirmed or not value.machine_review_notes.strip():
+                    raise AgentError("ARTICLE_MACHINE_EXCEPTION_CONFIRMATION_REQUIRED", 409)
+            elif value.machine_exception_confirmed or value.machine_review_notes.strip():
+                raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOT_ALLOWED", 409)
+            exception = {"machine_exception_confirmed": value.machine_exception_confirmed,
+                         "machine_review_notes": value.machine_review_notes.strip()}
         return {"dispatch_id": service.approve_variant(ident, value.revision, value.content_hash,
-                    value.due_at, role, human_confirmed=human_confirmed)}
+                    value.due_at, role, human_confirmed=human_confirmed, **exception)}
 
     @app.get("/api/hub/variants/{ident}/article-review")
     def article_review(ident: str, role=Depends(auth)):

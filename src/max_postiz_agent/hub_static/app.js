@@ -47,35 +47,54 @@ async function renderVariant(v,state){
   if(meta.origin==='postiz_max_bridge'&&!v.sources.length&&state.role==='owner')button(card,'Подтвердить авторский текст',()=>api(`/api/hub/variants/${v.id}/attest-original`,{revision:v.revision,content_hash:v.content_hash}));
  }else if(hourly){date.readOnly=true;card.append(node('p','Сначала создайте DRAFT, затем выберите дату в Postiz и получите правки.'));}
  card.append(date);
- let confirmation=null,machineState=null,recheck=null;
+ let confirmation=null,machineState=null,recheck=null,exceptionConfirmation=null,exceptionNotes=null;
+ const machineStatus=details?.machine_review_status||(details?.machine_review_current?'passed':'unconfirmed');
+ const machineCurrent=details?.machine_review_current===true,machinePassed=machineCurrent&&machineStatus==='passed';
+ const machineRejected=machineCurrent&&machineStatus==='rejected';
+ const exceptionEligible=machineRejected&&details?.machine_exception_eligible===true;
+ const notesComplete=()=>{if(!exceptionNotes)return false;const text=exceptionNotes.value.trim(),words=text.toLocaleLowerCase('ru-RU').match(/\p{L}+/gu)||[];return text.length>=40&&text.length<=4000&&words.length>=6&&new Set(words).size>=4;};
  if(hourly){
   machineState=node('p');machineState.setAttribute('role','status');card.append(machineState);
-  const machineStatus=details.machine_review_status||(details.machine_review_current?'passed':'unconfirmed');
   card.append(node('p',`Статус машинной проверки: ${machineStatus}`));
-  if(!details.machine_review_current){const blocked=node('p','Машинная проверка отклонила/не подтверждена; отправка заблокирована.');blocked.className='error';blocked.setAttribute('role','alert');card.append(blocked);}
+  if(!machinePassed){const messages={rejected:exceptionEligible?'Ministral отклонил перевод. Отказ сохранён без изменения; человек может принять отдельное решение только после разбора каждого замечания.':'Машинный отказ не допускает исключение: нужны актуальные доказательства, пройденные обязательные проверки и полный результат LanguageTool.',unverified:'Ответ Ministral не подтверждён. Исключение недоступно; отправка заблокирована.',infrastructure_error:'Машинная проверка не завершена из-за ошибки инфраструктуры. Исключение недоступно; отправка заблокирована.',failed:'Машинная проверка завершилась ошибкой. Исключение недоступно; отправка заблокирована.',checking:'Машинная проверка ещё выполняется. Отправка заблокирована.'};const blocked=node('p',messages[machineStatus]||'Актуальная машинная проверка отсутствует. Исключение недоступно; отправка заблокирована.');blocked.className='error';blocked.setAttribute('role','alert');card.append(blocked);}
   const reviewIssues=Array.isArray(details.machine_review_issues)?details.machine_review_issues.filter(issue=>typeof issue==='string'):[];
   if(reviewIssues.length){const issues=node('ul');issues.className='error';issues.setAttribute('aria-label','Замечания машинной проверки');for(const issue of reviewIssues)issues.append(node('li',issue));card.append(issues);}
-  recheck=button(card,'Повторно проверить перевод: Ministral + LanguageTool',()=>{if(dirty())throw Error('Сначала сохраните изменения');return api(`/api/hub/variants/${v.id}/recheck-article`,{revision:v.revision,content_hash:v.content_hash});});
+  const evidence=details.machine_review_evidence;
+  if(evidence&&typeof evidence==='object'&&!Array.isArray(evidence)){
+   const evidencePanel=node('details');evidencePanel.className='machine-evidence';evidencePanel.open=machineStatus==='rejected';evidencePanel.append(node('summary','Исходный результат Ministral и полная проверка LanguageTool'));
+   evidencePanel.append(node('h4','Исходный ответ Ministral — без изменения'),node('pre',typeof evidence.review_raw==='string'?evidence.review_raw:JSON.stringify(evidence.review_raw??null,null,2)));
+   evidencePanel.append(node('h4','Результат Ministral в структурированном виде'),node('pre',JSON.stringify(evidence.review??null,null,2)));
+   const spelling=node('pre',JSON.stringify({spelling_matches:evidence.spelling_matches??null,spelling_adjudicated:evidence.spelling_adjudicated??null,spelling_unresolved:evidence.spelling_unresolved??null},null,2));spelling.setAttribute('aria-label','Полный результат LanguageTool');evidencePanel.append(node('h4','LanguageTool: все замечания и их разбор'),spelling);
+   const proof=node('pre',JSON.stringify(evidence,null,2));proof.setAttribute('aria-label','Полные доказательства машинной проверки');evidencePanel.append(node('h4','Полная запись проверки'),proof);card.append(evidencePanel);
+  }
+  recheck=button(card,'Повторно проверить перевод: Ministral + LanguageTool',()=>{if(dirty())throw Error('Сначала сохраните изменения');if(machineRejected)throw Error('Неизменённый отклонённый текст повторно не проверяется. Исправьте его в Postiz и получите новую версию.');return api(`/api/hub/variants/${v.id}/recheck-article`,{revision:v.revision,content_hash:v.content_hash});});
+  if(exceptionEligible){
+   const exception=node('section');exception.className='machine-exception';exception.append(node('h4','Отдельное решение человека при отказе Ministral'),node('p','Разберите каждое исходное замечание по английскому оригиналу. Объясните, почему допускаете публикацию этой версии; отказ Ministral останется в истории. Одного «согласен» недостаточно: не менее 40 символов, 6 слов и 4 различных слов.'));
+   exceptionNotes=node('textarea');exceptionNotes.setAttribute('aria-label','Разбор человеком замечаний Ministral');exceptionNotes.maxLength=4000;exceptionNotes.autocomplete='off';exceptionNotes.value='';exception.append(exceptionNotes);
+   const exceptionLabel=node('label');exceptionLabel.className='machine-exception-confirmation';exceptionConfirmation=node('input');exceptionConfirmation.type='checkbox';exceptionConfirmation.checked=false;exceptionConfirmation.autocomplete='off';exceptionLabel.append(exceptionConfirmation,document.createTextNode(' Я лично разобрал(а) все исходные замечания Ministral и принимаю решение об исключении для точной версии, адресата и даты.'));exception.append(exceptionLabel);card.append(exception);
+  }
   const label=node('label');label.className='human-review';confirmation=node('input');confirmation.type='checkbox';confirmation.checked=false;confirmation.autocomplete='off';
   label.append(confirmation,document.createTextNode(' Я лично сравнил(а) полный английский оригинал и русский текст этой версии, проверил(а) адресата и дату и согласую публикацию.'));card.append(label);
  }
  const approval=button(card,'Согласовать и поставить в план',()=>{
   if(dirty())throw Error('Сначала сохраните изменения');if(!date.value)throw Error('Выберите дату и время');
-  if(hourly&&(!details.machine_review_current||!confirmation.checked))throw Error('Нужны актуальная машинная проверка и личное согласование');
+  if(hourly&&(!(machinePassed||exceptionEligible)||!confirmation.checked))throw Error('Нужны актуальная машинная проверка и личное согласование');
+  if(hourly&&exceptionEligible&&(!exceptionConfirmation.checked||!notesComplete()))throw Error('Нужны отдельное подтверждение исключения и подробный разбор замечаний');
   if(hourly&&meta.postiz_state!=='QUEUE')throw Error('Выберите дату в календаре Postiz и получите состояние QUEUE');
-  return api(`/api/hub/variants/${v.id}/approve`,{revision:v.revision,content_hash:v.content_hash,due_at:new Date(date.value).getTime()/1000,...(hourly?{human_review_confirmed:confirmation.checked}:{})});
+  return api(`/api/hub/variants/${v.id}/approve`,{revision:v.revision,content_hash:v.content_hash,due_at:new Date(date.value).getTime()/1000,...(hourly?{human_review_confirmed:confirmation.checked,...(exceptionEligible?{machine_exception_confirmed:exceptionConfirmation.checked,machine_review_notes:exceptionNotes.value.trim()}:{})}:{})});
  });
  if(hourly){
   updateReviewControls=()=>{
-   const changed=dirty();if(changed)confirmation.checked=false;
-   confirmation.disabled=!editable||terminal||changed||!details.machine_review_current;
-   recheck.disabled=!editable||terminal||changed;
-   machineState.textContent=changed?'Правки ещё не сохранены. После сохранения повторите машинную проверку.':details.machine_review_current?'Ministral + LanguageTool: проверка относится к текущему тексту. Требуется решение человека.':postizTextCanonical?'Машинная проверка устарела или отсутствует. Получите правки Postiz и выполните повторную проверку.':'Машинная проверка устарела или отсутствует. Сохраните текст и выполните повторную проверку.';
-   machineState.className=details.machine_review_current&&!changed?'badge':'error';
-   approval.disabled=confirmation.disabled||!confirmation.checked||meta.postiz_state!=='QUEUE';
+   const changed=dirty();if(changed){confirmation.checked=false;if(exceptionConfirmation)exceptionConfirmation.checked=false;if(exceptionNotes)exceptionNotes.value='';}
+   confirmation.disabled=!editable||terminal||changed||!(machinePassed||exceptionEligible);
+   recheck.disabled=!editable||terminal||changed||machineRejected;
+   if(exceptionConfirmation){exceptionConfirmation.disabled=!editable||terminal||changed;exceptionNotes.disabled=exceptionConfirmation.disabled;}
+   machineState.textContent=changed?'Правки ещё не сохранены. После сохранения повторите машинную проверку.':machinePassed?'Ministral + LanguageTool: проверка относится к текущему тексту. Требуется решение человека.':exceptionEligible?'Отказ Ministral относится к текущему тексту. Требуются разбор замечаний, отдельное решение об исключении и личное согласование.':postizTextCanonical?'Машинная проверка устарела, отсутствует или заблокирована. Получите правки Postiz и выполните повторную проверку.':'Машинная проверка устарела, отсутствует или заблокирована. Сохраните текст и выполните повторную проверку.';
+   machineState.className=machinePassed&&!changed?'badge':'error';
+   approval.disabled=confirmation.disabled||!confirmation.checked||meta.postiz_state!=='QUEUE'||(exceptionEligible&&(!exceptionConfirmation.checked||!notesComplete()));
   };
   for(const input of [title,area,tags,community])input.addEventListener('input',updateReviewControls);
-  confirmation.addEventListener('change',updateReviewControls);updateReviewControls();
+  confirmation.addEventListener('change',updateReviewControls);if(exceptionConfirmation){exceptionConfirmation.addEventListener('change',updateReviewControls);exceptionNotes.addEventListener('input',updateReviewControls);}updateReviewControls();
  }else approval.disabled=!editable||terminal;
  if(target?.route==='postiz'||(target?.route==='max_browser'&&target.options?.postiz_integration_id)){
   if(!meta.postiz_post_id){const stage=button(card,'Создать DRAFT в Postiz',()=>api(`/api/hub/variants/${v.id}/postiz`,{}));stage.disabled=!editable||terminal;}

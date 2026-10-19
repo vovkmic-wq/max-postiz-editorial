@@ -2,12 +2,13 @@
 import hashlib
 import json
 import math
+import re
 
 from sqlalchemy import or_, select, update
 
 from .adapters import Delivery
 from .config import AgentError, fingerprint, inside, parse_json, validate_schema
-from .db import Cursor, Draft, DraftRevision, Job, Material, Story, now, serialize, uid
+from .db import Audit, Cursor, Draft, DraftRevision, Job, Material, Story, now, serialize, uid
 from .editorial import validate_draft
 from .hub_models import (Dispatch, DispatchAttempt, RecurringTask, RemoteDraft, Target,
                          TargetApproval, Variant, VariantRevision, SourceArchive)
@@ -17,6 +18,16 @@ from .service import Service
 
 ACTIVE = {"pending", "sending", "unknown", "scheduled", "awaiting_manual", "retry_wait"}
 FINAL = {"published", "owner_attested", "cancelled", "failed"}
+
+
+def _machine_exception_notes(value):
+    if not isinstance(value, str):
+        raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOTES_REQUIRED", 409)
+    notes = value.strip()
+    words = re.findall(r"[^\W\d_]+", notes.casefold())
+    if not 40 <= len(notes) <= 4000 or len(words) < 6 or len(set(words)) < 4:
+        raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOTES_REQUIRED", 409)
+    return notes
 
 
 class HubService(Service):
@@ -281,8 +292,42 @@ class HubService(Service):
         from .human_review import recheck
         return recheck(self, variant_id, revision, content_hash)
 
-    def approve_variant(self, ident, revision, body_hash, due_at, actor="editor", *, human_confirmed=False):
-        from .human_review import eligible, hourly, machine_current
+    @staticmethod
+    def _hourly_machine_exception(session, variant):
+        from .human_review import machine_current, rejected_evidence
+        if (machine_current(session, variant)
+                and variant.metadata_json.get("machine_review_status", "passed") == "passed"):
+            return None
+        evidence = rejected_evidence(session, variant)
+        if (not isinstance(evidence, dict) or not isinstance(evidence.get("evidence_hash"), str)
+                or not re.fullmatch(r"[a-f0-9]{64}", evidence["evidence_hash"])):
+            raise AgentError("ARTICLE_MACHINE_RECHECK_REQUIRED", 409)
+        return evidence
+
+    def _check_machine_exception_approval(self, session, variant, target, dispatch, approval, evidence):
+        records = list(session.scalars(select(Audit).where(
+            Audit.entity == approval.id, Audit.action == "hourly_article_machine_exception")))
+        if len(records) != 1 or records[0].actor != approval.actor:
+            raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOT_APPROVED", 409)
+        record = records[0].details
+        if not isinstance(record, dict):
+            raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOT_APPROVED", 409)
+        expected = {"approval_id": approval.id, "variant_id": variant.id, "revision": variant.revision,
+                    "content_hash": fingerprint(self.snapshot(variant, target)), "snapshot_hash": dispatch.snapshot_hash,
+                    "due_at": dispatch.due_at, "target_id": target.id, "destination": target.destination,
+                    "evidence_hash": evidence["evidence_hash"], "machine_exception_confirmed": True}
+        if fingerprint({key: record.get(key) for key in expected}) != fingerprint(expected):
+            raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOT_APPROVED", 409)
+        try:
+            notes = _machine_exception_notes(record.get("notes"))
+        except AgentError:
+            raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOT_APPROVED", 409) from None
+        if record.get("notes_hash") != fingerprint(notes):
+            raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOT_APPROVED", 409)
+
+    def approve_variant(self, ident, revision, body_hash, due_at, actor="editor", *, human_confirmed=False,
+                        machine_exception_confirmed=False, machine_review_notes=""):
+        from .human_review import eligible, hourly
         # Authorization must precede bridge synchronization or any other mutation.
         with self.db.session() as check:
             if hourly(self._variant(check, ident)) and (human_confirmed is not True or actor not in {"owner", "editor"}):
@@ -300,10 +345,16 @@ class HubService(Service):
             self._quality(s, v, t)
             self.bridge.check_approval(s, v, due_at)
             human_hourly = hourly(v)
+            exception_evidence, exception_notes = None, None
             if human_hourly:
                 policy = eligible(self, s, v)
-                if not machine_current(s, v):
-                    raise AgentError("ARTICLE_MACHINE_RECHECK_REQUIRED", 409)
+                exception_evidence = self._hourly_machine_exception(s, v)
+                if exception_evidence is not None:
+                    if machine_exception_confirmed is not True:
+                        raise AgentError("ARTICLE_MACHINE_EXCEPTION_CONFIRMATION_REQUIRED", 403)
+                    exception_notes = _machine_exception_notes(machine_review_notes)
+                elif machine_exception_confirmed is not False or machine_review_notes != "":
+                    raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOT_ALLOWED", 409)
                 if due_at < now():
                     raise AgentError("HUMAN_RESCHEDULE_REQUIRED", 409)
                 if s.scalar(select(Dispatch).join(Variant).where(Variant.target_id == t.id,
@@ -348,12 +399,21 @@ class HubService(Service):
             if human_hourly:
                 self.db.audit(s, actor, "hourly_article_human_review", v.id,
                               revision=v.revision, content_hash=body_hash, due_at=due_at,
-                              approval_id=a.id, machine_text_hash=v.metadata_json["machine_text_hash"])
+                              approval_id=a.id, machine_text_hash=v.metadata_json["machine_text_hash"],
+                              machine_review_status="rejected" if exception_evidence is not None else "passed")
+                if exception_evidence is not None:
+                    self.db.audit(s, actor, "hourly_article_machine_exception", a.id,
+                                  approval_id=a.id, variant_id=v.id, revision=v.revision,
+                                  content_hash=body_hash, snapshot_hash=h, due_at=due_at,
+                                  target_id=t.id, destination=t.destination,
+                                  evidence_hash=exception_evidence["evidence_hash"],
+                                  machine_exception_confirmed=True, notes=exception_notes,
+                                  notes_hash=fingerprint(exception_notes))
             s.flush()
             return d.id
 
     def _valid_dispatch(self, s, d):
-        from .human_review import HUMAN_ACTORS, eligible, hourly, machine_current
+        from .human_review import HUMAN_ACTORS, eligible, hourly
         v = self._variant(s, d.variant_id)
         self.bridge.check_approval(s, v, d.due_at)
         t = self._target(s, v.target_id)
@@ -365,8 +425,9 @@ class HubService(Service):
             if a.actor not in HUMAN_ACTORS:
                 raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
             policy = eligible(self, s, v)
-            if not machine_current(s, v):
-                raise AgentError("ARTICLE_MACHINE_RECHECK_REQUIRED", 409)
+            exception_evidence = self._hourly_machine_exception(s, v)
+            if exception_evidence is not None:
+                self._check_machine_exception_approval(s, v, t, d, a, exception_evidence)
             if now() - d.due_at > 3600:
                 raise AgentError("HUMAN_RESCHEDULE_REQUIRED", 409)
             if s.scalar(select(Dispatch).join(Variant).where(

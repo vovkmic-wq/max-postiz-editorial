@@ -15,7 +15,7 @@ import httpx
 
 from .adapters import extract_object
 from .collectors import detect_language
-from .config import AgentError
+from .config import AgentError, fingerprint
 from .editorial import numbers, translation_gate
 from .network import resemblances_ip
 
@@ -147,7 +147,7 @@ def _validated_source(title, original):
 
 class ArticleQuality:
     def __init__(self, translator, reviewer, spelling_url=SPELLING_URL, transport=None,
-                 prompt_dir=None, trace=None):
+                 prompt_dir=None, trace=None, allow_human_rejection=False):
         if (translator is reviewer or (
                 getattr(translator, "model", None) and getattr(reviewer, "model", None)
                 and translator.model == reviewer.model)):
@@ -158,6 +158,9 @@ class ArticleQuality:
             raise AgentError("ARTICLE_TRACE_INVALID")
         self.translator, self.reviewer = translator, reviewer
         self.trace = trace
+        if type(allow_human_rejection) is not bool:
+            raise AgentError("ARTICLE_REVIEW_MODE_INVALID")
+        self.allow_human_rejection = allow_human_rejection
         prompts = Path(prompt_dir) if prompt_dir else Path(__file__).resolve().parents[2] / "prompts"
         self.translation_prompt = (prompts / "ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8")
         self.review_prompt = (prompts / "ARTICLE_REVIEW.txt").read_text(encoding="utf-8")
@@ -182,6 +185,19 @@ class ArticleQuality:
             return matches
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
             raise AgentError("ARTICLE_SPELLING_UNAVAILABLE", 503) from exc
+
+    def _human_evidence(self, prepared, title, original, reviewed, raw, matches,
+                        adjudicated, unresolved):
+        if self.allow_human_rejection:
+            prepared["machine_review_status"] = "passed" if reviewed["approved"] else "rejected"
+            prepared["machine_review_evidence"] = {
+                "review_raw": raw, "review": copy.deepcopy(reviewed),
+                "spelling_matches": copy.deepcopy(matches),
+                "spelling_adjudicated": copy.deepcopy(adjudicated),
+                "spelling_unresolved": copy.deepcopy(unresolved), "hard_gates_passed": True,
+                "text_hash": fingerprint({"title": prepared["title"], "body": prepared["body"]}),
+                "source_hash": fingerprint({"title": title, "body": original, "url": prepared["url"]})}
+        return prepared
 
     def prepare(self, title, original, url):
         url = canonical_article_url(url)
@@ -288,11 +304,15 @@ class ArticleQuality:
             self._emit("spelling_returned", attempt, matches=matches)
             adjudicated, unresolved = adjudicate_scientific_spelling(source, text, matches)
             self._emit("spelling_adjudicated", attempt, adjudicated=adjudicated, unresolved=unresolved)
-            if (reviewed["approved"] and not reviewed["issues"]
-                    and reviewed["topic"] in TOPICS and not unresolved):
+            passed = reviewed["approved"] and not reviewed["issues"]
+            human_rejection = (self.allow_human_rejection and reviewed["approved"] is False
+                               and bool(reviewed["issues"]))
+            if ((passed or human_rejection) and reviewed["topic"] in TOPICS and not unresolved):
                 prepared = {"title": translated["title"], "body": full, "translation": text,
                             "original": source, "url": url, "topic": reviewed["topic"]}
-                self._emit("accepted", attempt, result=prepared)
+                self._human_evidence(prepared, title, original, reviewed, raw_review, matches,
+                                     adjudicated, unresolved)
+                self._emit("accepted" if passed else "rejected_for_human", attempt, result=prepared)
                 return prepared
             context["repair_feedback"] = {"review_approved": reviewed["approved"],
                 "topic": reviewed["topic"], "review_issues": reviewed["issues"],
@@ -359,15 +379,19 @@ class ArticleQuality:
         self._emit("spelling_returned", 1, matches=matches)
         adjudicated, unresolved = adjudicate_scientific_spelling(source, text, matches)
         self._emit("spelling_adjudicated", 1, adjudicated=adjudicated, unresolved=unresolved)
-        if not (reviewed["approved"] and not reviewed["issues"]
-                and reviewed["topic"] in TOPICS and not unresolved):
+        passed = reviewed["approved"] and not reviewed["issues"]
+        human_rejection = (self.allow_human_rejection and reviewed["approved"] is False
+                           and bool(reviewed["issues"]))
+        if not ((passed or human_rejection) and reviewed["topic"] in TOPICS and not unresolved):
             feedback = {"review_approved": reviewed["approved"], "topic": reviewed["topic"],
                         "review_issues": reviewed["issues"], "spelling_matches": unresolved[:20]}
             self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED", feedback=feedback)
             raise AgentError("ARTICLE_QUALITY_REJECTED")
         prepared = {"title": title, "body": full, "translation": text,
                     "original": source, "url": url, "topic": reviewed["topic"]}
-        self._emit("accepted", 1, mode="candidate", result=prepared)
+        self._human_evidence(prepared, original_title, original, reviewed, raw_review, matches,
+                             adjudicated, unresolved)
+        self._emit("accepted" if passed else "rejected_for_human", 1, mode="candidate", result=prepared)
         return prepared
 
     def close(self):

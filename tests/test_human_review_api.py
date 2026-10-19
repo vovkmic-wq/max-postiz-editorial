@@ -19,6 +19,7 @@ def review_api(hub, monkeypatch):
     details = {"hourly_article": True, "human_review_required": True,
                "source_title": "Independent source", "source_body": "English original.",
                "source_url": "https://example.org/source", "machine_review_current": True,
+               "machine_review_status": "passed", "machine_exception_eligible": False,
                "status": "awaiting_human_review", "revision": 1, "content_hash": "a" * 64}
     monkeypatch.setattr(hub, "hourly_review_details", lambda requested: details)
 
@@ -88,7 +89,8 @@ def test_only_checked_same_origin_owner_or_editor_session_attests(review_api, ro
     response = client.post(f"/api/hub/variants/{ident}/approve", headers=ORIGIN, json=body)
     assert response.status_code == 200
     assert calls == [((ident, body["revision"], body["content_hash"], body["due_at"], role),
-                      {"human_confirmed": True})]
+                      {"human_confirmed": True, "machine_exception_confirmed": False,
+                       "machine_review_notes": ""})]
 
 
 @pytest.mark.parametrize("field", [{}, {"human_review_confirmed": False}])
@@ -170,3 +172,109 @@ def test_general_route_keeps_api_approval_without_human_attestation(review_api, 
         headers={"Authorization": "Bearer hub-test-owner"}, json=body)
     assert response.status_code == 200
     assert calls[0][1] == {"human_confirmed": False}
+
+
+NOTES = "По английскому оригиналу разобраны все исходные замечания; указанные термины переданы верно и смысл сохранён."
+
+
+def rejected(details):
+    details.update(machine_review_current=True, machine_review_status="rejected",
+                   machine_exception_eligible=True,
+                   machine_review_issues=["An original independent finding."],
+                   machine_review_evidence={"review_raw": "original refusal",
+                       "review": {"approved": False, "issues": ["An original independent finding."]},
+                       "spelling_matches": [], "spelling_adjudicated": [], "spelling_unresolved": [],
+                       "hard_gates_passed": True}, machine_review_evidence_hash="e" * 64)
+
+
+@pytest.mark.parametrize("role", ["owner", "editor"])
+def test_rejected_exact_version_requires_separate_exception_and_forwards_human_notes(review_api, role):
+    _, client, ident, body, calls, details = review_api
+    rejected(details)
+    login(client, role)
+    response = client.post(f"/api/hub/variants/{ident}/approve", headers=ORIGIN,
+        json={**body, "machine_exception_confirmed": True, "machine_review_notes": "  " + NOTES + "  "})
+    assert response.status_code == 200
+    assert calls == [((ident, body["revision"], body["content_hash"], body["due_at"], role),
+                     {"human_confirmed": True, "machine_exception_confirmed": True,
+                      "machine_review_notes": NOTES})]
+    assert details["machine_review_evidence"]["review_raw"] == "original refusal"
+    assert details["machine_review_evidence"]["review"]["approved"] is False
+
+
+@pytest.mark.parametrize("extra", [
+    {}, {"machine_review_notes": NOTES}, {"machine_exception_confirmed": True},
+    {"machine_exception_confirmed": True, "machine_review_notes": " \n "},
+])
+def test_valid_machine_refusal_never_uses_ordinary_human_checkbox_alone(review_api, extra):
+    _, client, ident, body, calls, details = review_api
+    rejected(details)
+    login(client)
+    response = client.post(f"/api/hub/variants/{ident}/approve", headers=ORIGIN,
+                           json={**body, **extra})
+    assert response.status_code == 409
+    assert response.json()["code"] == "ARTICLE_MACHINE_EXCEPTION_CONFIRMATION_REQUIRED" and not calls
+
+
+@pytest.mark.parametrize("state", ["unverified", "infrastructure_error", "failed", "checking", "unconfirmed"])
+def test_unverified_or_infrastructure_result_cannot_be_overridden_even_with_exception_fields(review_api, state):
+    _, client, ident, body, calls, details = review_api
+    rejected(details)
+    details["machine_review_status"] = state
+    login(client)
+    response = client.post(f"/api/hub/variants/{ident}/approve", headers=ORIGIN,
+        json={**body, "machine_exception_confirmed": True, "machine_review_notes": NOTES})
+    assert response.status_code == 409
+    assert response.json()["code"] == "ARTICLE_MACHINE_RECHECK_REQUIRED" and not calls
+
+
+@pytest.mark.parametrize("field", ["machine_review_current", "machine_exception_eligible"])
+def test_stale_or_ineligible_refusal_cannot_receive_exception(review_api, field):
+    _, client, ident, body, calls, details = review_api
+    rejected(details)
+    details[field] = False
+    login(client)
+    response = client.post(f"/api/hub/variants/{ident}/approve", headers=ORIGIN,
+        json={**body, "machine_exception_confirmed": True, "machine_review_notes": NOTES})
+    assert response.status_code == 409
+    assert response.json()["code"] == "ARTICLE_MACHINE_RECHECK_REQUIRED" and not calls
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_exception_confirmation_is_strict_boolean(review_api, value):
+    _, client, ident, body, calls, details = review_api
+    rejected(details)
+    login(client)
+    response = client.post(f"/api/hub/variants/{ident}/approve", headers=ORIGIN,
+        json={**body, "machine_exception_confirmed": value, "machine_review_notes": NOTES})
+    assert response.status_code == 422 and not calls
+
+
+@pytest.mark.parametrize("notes", [42, None, "x" * 4001])
+def test_exception_notes_are_bounded_strict_text(review_api, notes):
+    _, client, ident, body, calls, details = review_api
+    rejected(details)
+    login(client)
+    response = client.post(f"/api/hub/variants/{ident}/approve", headers=ORIGIN,
+        json={**body, "machine_exception_confirmed": True, "machine_review_notes": notes})
+    assert response.status_code == 422 and not calls
+
+
+def test_passed_review_does_not_accept_unnecessary_exception_flags(review_api):
+    _, client, ident, body, calls, _ = review_api
+    login(client)
+    response = client.post(f"/api/hub/variants/{ident}/approve", headers=ORIGIN,
+        json={**body, "machine_exception_confirmed": True, "machine_review_notes": NOTES})
+    assert response.status_code == 409
+    assert response.json()["code"] == "ARTICLE_MACHINE_EXCEPTION_NOT_ALLOWED" and not calls
+
+
+def test_bearer_cannot_override_valid_machine_refusal_even_with_cookie_and_both_confirmations(review_api):
+    _, client, ident, body, calls, details = review_api
+    rejected(details)
+    login(client)
+    response = client.post(f"/api/hub/variants/{ident}/approve",
+        headers={**ORIGIN, "Authorization": "Bearer hub-test-owner"},
+        json={**body, "machine_exception_confirmed": True, "machine_review_notes": NOTES})
+    assert response.status_code == 403
+    assert response.json()["code"] == "HUMAN_REVIEW_SESSION_REQUIRED" and not calls
