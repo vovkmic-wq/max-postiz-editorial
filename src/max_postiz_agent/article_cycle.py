@@ -780,6 +780,10 @@ class HourlyArticleCycle:
         from .automatic_migration import migrate
         return migrate(self, ident, reason)
 
+    def correct_staged(self, ident, correction, reviewed_hash, reason):
+        from .automatic_correction import correct_staged
+        return correct_staged(self, ident, correction, reviewed_hash, reason)
+
     def reconcile_approval(self, ident, reviewed_hash, due_at, reason):
         from .automatic_policy import reconcile_approval
         with profile_lock(self.directory / "cycle.lock"):

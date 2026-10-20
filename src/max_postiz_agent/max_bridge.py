@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit, unquote
@@ -367,24 +368,57 @@ class MaxBridge:
                 return {"state": "cancelled", "error": "BRIDGE_REMOTE_DELETED"}
             return {"state": d.state if d else "review_pending", "paused": t.paused, "error": link.error or (d.error if d else None)}
 
-    def mutation(self, identifiers, release=None):
+    def mutation(self, identifiers, release=None, *, expected_hash=None, expected_post_id=None):
+        compare = expected_hash is not None or expected_post_id is not None
+        if compare and (release is not None or not isinstance(expected_hash, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
+                or not isinstance(expected_post_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", expected_post_id)
+                or identifiers != [expected_post_id]):
+            raise AgentError("BRIDGE_MUTATION_CAS_INVALID", 409)
         if not release:
             self.sync(force=True)
         owner = release or uid()
         with self.core.db.session.begin() as s:
             links = list(s.scalars(select(BridgePost).where((BridgePost.post_id.in_(identifiers)) | (BridgePost.group_id.in_(identifiers))).order_by(BridgePost.variant_id)))
+            if compare and (len(links) != 1 or links[0].post_id != expected_post_id):
+                raise AgentError("BRIDGE_MUTATION_CAS_INVALID", 409)
             for link in links:
                 self.core._variant(s, link.variant_id, True)
+                # Another native mutation may have committed while this call
+                # waited for the variant lock. Do not reuse its earlier owner.
+                s.refresh(link)
                 active = s.scalar(select(Dispatch).where(Dispatch.variant_id == link.variant_id, Dispatch.state.in_({"sending", "unknown", "published"})).with_for_update())
                 if not release and active:
                     raise AgentError("BRIDGE_DELIVERY_LOCKED", 409)
                 if not release and link.mutation_owner and link.mutation_owner != owner:
+                    raise AgentError("BRIDGE_EDIT_IN_PROGRESS", 409)
+                if not release and compare and link.mutation_until != 0:
                     raise AgentError("BRIDGE_EDIT_IN_PROGRESS", 409)
                 if release:
                     if link.mutation_owner == owner:
                         link.mutation_owner, link.mutation_until = None, 0
                 else:
                     link.mutation_owner, link.mutation_until = owner, now() + 300
+        if compare:
+            try:
+                # The native guard owns this one committed lease. The fresh
+                # read is deliberately after it, closing GET -> overwrite races.
+                remote = self.core.postiz.get_post(expected_post_id)
+                if (remote.get("id") != expected_post_id or remote.get("state") != "DRAFT"
+                        or self.normalize(remote)[3] != expected_hash):
+                    raise AgentError("BRIDGE_REMOTE_CHANGED", 409)
+                with self.core.db.session() as s:
+                    link = s.get(BridgePost, expected_post_id)
+                    if not link or link.mutation_owner != owner:
+                        raise AgentError("BRIDGE_EDIT_IN_PROGRESS", 409)
+            except Exception:
+                # The controller has not run: only a read happened. Release our
+                # own lease; a changed/unknown other owner remains untouched.
+                self.mutation([expected_post_id], release=owner)
+                raise
+            return {"owner": owner, "cas_verified": True,
+                    "expected_hash": expected_hash, "expected_post_id": expected_post_id}
         return {"owner": owner}
 
     def unlock(self, post_id, confirm_no_request_inflight):

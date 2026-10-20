@@ -71,6 +71,8 @@ class BridgePostInput(Input):
 class BridgeMutationInput(Input):
     identifiers: list[str] = Field(max_length=100)
     owner: str | None = Field(default=None, max_length=36)
+    expected_hash: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    expected_post_id: StrictStr | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class BridgeUnlockInput(Input):
@@ -204,12 +206,17 @@ def hub_app(service, run_worker=False, *, dispatch_only=False):
 
     @app.post("/api/max-bridge/mutation/start")
     def bridge_mutation_start(value: BridgeMutationInput, access=Depends(bridge_auth)):
-        return service.bridge.mutation(value.identifiers)
+        if value.owner is not None and (value.expected_hash is not None or value.expected_post_id is not None):
+            raise AgentError("BRIDGE_MUTATION_CAS_INVALID", 409)
+        return service.bridge.mutation(value.identifiers, expected_hash=value.expected_hash,
+                                       expected_post_id=value.expected_post_id)
 
     @app.post("/api/max-bridge/mutation/finish")
     def bridge_mutation_finish(value: BridgeMutationInput, access=Depends(bridge_auth)):
         if not value.owner:
             raise AgentError("BRIDGE_MUTATION_OWNER_REQUIRED")
+        if value.expected_hash is not None or value.expected_post_id is not None:
+            raise AgentError("BRIDGE_MUTATION_CAS_INVALID", 409)
         return service.bridge.mutation(value.identifiers, value.owner)
 
     @app.post("/api/hub/max-bridge/sync")

@@ -28,6 +28,11 @@ def main():
     migrate = sub.add_parser("migrate-automatic")
     migrate.add_argument("record_id")
     migrate.add_argument("--reason", required=True)
+    correct = sub.add_parser("correct-staged")
+    correct.add_argument("record_id")
+    correct.add_argument("candidate", help="Changed ignored Russian title/body JSON for the same exact DRAFT")
+    correct.add_argument("--reviewed-hash", required=True)
+    correct.add_argument("--reason", required=True)
     reconcile = sub.add_parser("reconcile-approval")
     reconcile.add_argument("record_id")
     reconcile.add_argument("--reviewed-hash", required=True)
@@ -77,6 +82,12 @@ def main():
             result = cycle.publish(args.record_id, args.reviewed_hash, args.due_at)
         elif args.action == "migrate-automatic":
             result = cycle.migrate_automatic(args.record_id, args.reason)
+        elif args.action == "correct-staged":
+            path = inside(root, args.candidate)
+            if not path.is_relative_to(root / "data") or path.suffix != ".json":
+                raise AgentError("ARTICLE_PRIVATE_INPUT_REQUIRED")
+            result = cycle.correct_staged(args.record_id, json.loads(path.read_text(encoding="utf-8-sig")),
+                                          args.reviewed_hash, args.reason)
         elif args.action == "reconcile-approval":
             result = cycle.reconcile_approval(args.record_id, args.reviewed_hash, args.due_at, args.reason)
         elif args.action == "recover-review-protocol":

@@ -1,6 +1,6 @@
 # Почасовой автоматический цикл MAX–Postiz
 
-Версия 0.6.20, 20 октября 2026, Europe/Moscow. После демонстрации ручного процесса
+Версия 0.6.21, 21 октября 2026, Europe/Moscow. После демонстрации ручного процесса
 владелец отменил обязательного редактора-человека для max_test и поручил вернуть
 автоматическую публикацию со смягчённой машинной проверкой. Режим human сохранён
 для истории и других явных сценариев, но новая политика использует automatic.
@@ -151,6 +151,38 @@ Hy и Ministral делят память узла 10.20.30.143; idle-sleep и mem
 
 История и фактические результаты: [CHANGELOG](../CHANGELOG.md).
 Актуальное поручение: [промпт](../prompts/HOURLY_ARTICLE_TESTS.md).
+
+## Исправление уже созданного автоматического черновика
+
+Одобрение модели не доказывает смысловую точность. Если после staging обнаружена
+реальная ошибка, прежнюю версию не отправляют. `correct-staged` принимает изменённые
+русские title/body без служебного footer, exact hash прежней версии и конкретную
+причину расхождения с английским оригиналом:
+
+    .venv/bin/python scripts/hourly_article_test.py correct-staged RECORD_ID data/candidate.local.json --reviewed-hash OLD_HASH --reason "Describe the verified factual correction against the English source"
+
+Разрешён только тот же automatic_ready Postiz DRAFT, текущий preparation slot,
+актуальные source/policy/hash и отсутствие любых прежних approvals/dispatches.
+Все адресаты должны быть paused, активных отправок и mutation leases нет.
+Старые EN/RU, metadata, raw/evidence и trace сохраняются приватно вместе с причиной.
+Durable claim блокирует повтор операции и прежнюю версию до обращения к моделям.
+Свежие Ministral, hard gates и LanguageTool проверяют изменённый кандидат.
+Только после полного успеха один native POST обновляет тот же Postiz ID как DRAFT,
+без scheduling/approval. Его прежняя дата и integration сохраняются; native Postiz
+может сменить group, поэтому новая группа аудируется и импортируется.
+После exact remote сверки импортируется новая ревизия, evidence и prepared hash.
+Ожидаемый remote hash передаётся native guard Postiz; Hub сначала получает одну
+штатную lease и только затем делает свежий GET и сравнение. Поэтому изменение
+поста между предварительным чтением и записью блокируется до controller.
+CAS ack обязателен. Образ Postiz 0.5.1 содержит этот guard; при обновлении
+используются pinned source/compiled хеши 0.5.0 и локальная сборка Dockerfile.cas.
+
+Неизвестный HTTP-исход, утраченный claim, конфликт версии, отказ или сбой оставляют
+needs_attention/correction_blocked. Не повторять POST или модели, не сбрасывать
+claim и не превращать этот путь в пересэмплирование неизменённого текста. Это не
+human recheck: cookie, роль editor и человеческие checkbox не используются.
+Успех исправления ещё не означает отправку: обычный policy publish отдельно
+проверяет новый hash, будущую дату и интервал не менее 3600 секунд.
 
 Проверка развёртывания 20 октября 2026, 00:25 МСК: 0.6.18 на рабочей VM,
 632 теста и 28/28 health checks прошли. После известного отказа интервала

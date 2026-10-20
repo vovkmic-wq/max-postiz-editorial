@@ -1,14 +1,14 @@
 # Applied after postiz/compose.yaml, its image lock, and compose.bridge.yaml.
 services:
   postiz:
-    image: max-postiz-linux:0.5.0
+    image: max-postiz-linux:0.5.1
     environment:
       MAIN_URL: ${POSTIZ_PUBLIC_ORIGIN:?Set the real LAN origin}
       FRONTEND_URL: ${POSTIZ_PUBLIC_ORIGIN}
       NEXT_PUBLIC_BACKEND_URL: ${POSTIZ_PUBLIC_ORIGIN}/api
       MAX_BRIDGE_URL: http://host.docker.internal:8091/api/max-bridge
       NODE_OPTIONS: --max-old-space-size=2048
-      # Only the owner-approved human MAX route is enabled; email/other routes stay paused.
+      # Only the owner-approved hourly MAX route is enabled; other routes stay paused.
       # RUN_CRON uses truthiness, so the string 'false' would still enable it.
       RUN_CRON: ''
       EXCLUDE_QUEUE: bluesky,devto,discord,dribbble,email,email-bulk,facebook,gmb,hashnode,instagram,kick,lemmy,linkedin,listmonk,mastodon,medium,mewe,moltbook,nostr,pinterest,reddit,skool,slack,telegram,threads,tiktok,tumblr,twitch,vk,whop,wordpress,wrapcast,x,youtube

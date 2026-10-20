@@ -24,7 +24,7 @@ class PostizClient:
                                    trust_env=False, follow_redirects=False, transport=transport)
         self.max_video = options.get("max_video_verified", False)
 
-    def request(self, method, path, **kwargs):
+    def request(self, method, path, *, expected_cas_hash=None, **kwargs):
         parsed = urlsplit(self.base)
         if not self.key or not self.base or parsed.scheme not in {"http", "https"}:
             raise AgentError("POSTIZ_NOT_CONFIGURED", 503)
@@ -32,9 +32,15 @@ class PostizClient:
             raise AgentError("POSTIZ_BASE_URL_INVALID")
         if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "postiz"}:
             raise AgentError("POSTIZ_HTTPS_REQUIRED")
+        headers = {"Authorization": self.key}
+        if expected_cas_hash is not None:
+            if (method != "POST" or path != "/posts" or not isinstance(expected_cas_hash, str)
+                    or not re.fullmatch(r"[a-f0-9]{64}", expected_cas_hash)):
+                raise AgentError("BRIDGE_EXPECTED_HASH_INVALID", 409)
+            headers["X-Max-Postiz-Expected-Hash"] = expected_cas_hash
         try:
             response = self.client.request(method, self.base + path,
-                                           headers={"Authorization": self.key}, **kwargs)
+                                           headers=headers, **kwargs)
         except httpx.HTTPError as exc:
             raise AgentError("POSTIZ_UNKNOWN" if method != "GET" else "POSTIZ_UNAVAILABLE", 503) from exc
         if response.status_code in {401, 403}:
@@ -45,6 +51,9 @@ class PostizClient:
             raise AgentError("POSTIZ_UNKNOWN" if method != "GET" else "POSTIZ_UNAVAILABLE", 503)
         if response.status_code >= 400:
             raise AgentError("POSTIZ_REJECTED")
+        if (expected_cas_hash is not None
+                and response.headers.get("X-Max-Postiz-CAS-Verified") != expected_cas_hash):
+            raise AgentError("POSTIZ_UNKNOWN", 503)
         if not response.content:
             return {}
         try:
@@ -119,6 +128,44 @@ class PostizClient:
                               "settings": settings, "value": [{"id": post_id,
                               "content": remote["content"], "image": []}]}]}
         result = self.request("POST", "/posts", json=payload)
+        if (not isinstance(result, list) or len(result) != 1
+                or not isinstance(result[0], dict) or result[0].get("postId") != post_id):
+            raise AgentError("POSTIZ_UNKNOWN", 503)
+        return post_id
+
+    def update_existing_draft(self, post_id, expected_body, corrected_body, *, expected_hash):
+        """Change one exact text DRAFT once, retaining its ID, integration and date."""
+        from html import escape
+        import json
+        from .max_bridge import MaxBridge
+
+        if (not isinstance(post_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", post_id)
+                or not isinstance(expected_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_hash)
+                or not isinstance(corrected_body, str) or not corrected_body.strip()
+                or corrected_body == expected_body):
+            raise AgentError("ARTICLE_CORRECTION_INVALID", 409)
+        remote = self.get_post(post_id)
+        body, images, _, hashed = MaxBridge.normalize(remote)
+        if (remote.get("id") != post_id or remote.get("state") != "DRAFT" or images
+                or body != expected_body or hashed != expected_hash):
+            raise AgentError("BRIDGE_REMOTE_CHANGED", 409)
+        settings = remote.get("settings") or {}
+        try:
+            if isinstance(settings, str):
+                settings = json.loads(settings)
+        except ValueError as exc:
+            raise AgentError("BRIDGE_REMOTE_INVALID", 409) from exc
+        if not isinstance(settings, dict) or settings.get("__type") != "max-browser":
+            raise AgentError("BRIDGE_REMOTE_INVALID", 409)
+        # Postiz stores HTML. Escape the exact plain text so literal angle
+        # brackets cannot become markup or silently disappear on bridge import.
+        payload = {"type": "draft", "date": remote["publishDate"],
+                   "shortLink": False, "tags": [], "republish": False,
+                   "posts": [{"integration": {"id": remote["integration"]["id"]},
+                              "group": remote["group"], "settings": settings,
+                              "value": [{"id": post_id, "content": escape(corrected_body, quote=False),
+                                         "image": []}]}]}
+        result = self.request("POST", "/posts", json=payload, expected_cas_hash=expected_hash)
         if (not isinstance(result, list) or len(result) != 1
                 or not isinstance(result[0], dict) or result[0].get("postId") != post_id):
             raise AgentError("POSTIZ_UNKNOWN", 503)
