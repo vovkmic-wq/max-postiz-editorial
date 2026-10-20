@@ -212,3 +212,11 @@ Typed positive raw с четырьмя warnings сохранён; его advisor
 назначен на 01:50, доставлен в 01:50:14 МСК: verified dispatch, PUBLISHED и exact
 MAX подтверждены. Одна попытка, интервал после SSHA 3660,42 секунды, все targets
 снова paused. VM 0.6.19: 730 тестов и 28/28 health checks; heartbeat ACTIVE.
+
+21 октября 2026: PACE опубликована в 00:02:09 МСК и точно проверена в MAX.
+Следующая NASA SVS 5600 прошла содержательное исправление того же DRAFT,
+сохранённый positive Ministral и свежую source-bound LT-проверку без resampling.
+Живой native CAS и exact Postiz body подтверждены, исходные отказы сохранены.
+Стадия automatic_ready ещё не является доставкой. Версия VM 0.6.22: 865 tests,
+28/28 health checks, heartbeat ACTIVE. Планирование 01:03 отдельно подтверждается
+policy approval/dispatch, а успех отправки — verified/PUBLISHED и фактическим MAX.
