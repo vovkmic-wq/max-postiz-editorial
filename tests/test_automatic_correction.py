@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from max_postiz_agent.article_quality import ArticleQuality
-from max_postiz_agent.automatic_correction import STARTED, correct_staged
+from max_postiz_agent.automatic_correction import STARTED, correct_staged, recover_staged_spelling
 from max_postiz_agent.automatic_policy import automatic_evidence, eligible
 from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.db import Audit, Draft, DraftRevision, Material
@@ -23,8 +23,12 @@ CORRECTION = {"title": "Необычный звёздный ветер",
 
 
 @pytest.fixture
-def correction_case(automatic_cycle, monkeypatch):
+def correction_case(automatic_cycle, monkeypatch, request):
     (cycle, core, article, records, writes, stamp, policy), review = automatic_cycle
+    if getattr(request, "param", None) == "scientific":
+        article.update(title="Sea Surface Temperature Analysis", original=(
+            "Sea Surface Temperature data are provided by the Multi-scale Ultra-high Resolution (MUR) Sea Surface Temperature Analysis. "
+            "Scientists use this analysis to study the ocean."))
     monkeypatch.setattr("max_postiz_agent.automatic_correction.now", lambda: stamp[0])
     prepared = cycle.prepare(article)
     before = cycle._snapshot(cycle._load()["records"][0])
@@ -438,4 +442,178 @@ def test_final_ledger_failure_does_not_reenable_delivery(correction_case, monkey
     with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_CORRECTION_ALREADY_ATTEMPTED"):
         run(case)
     assert len(case["updates"]) == len(case["review_calls"]) == 1
+    no_delivery(case)
+
+
+SCIENTIFIC_CORRECTION = {"title": "Анализ температуры поверхности моря",
+    "body": "Учёные используют данные многомасштабного анализа температуры поверхности моря сверхвысокого разрешения (MUR) для изучения океана."}
+
+
+@pytest.fixture
+def spelling_case(correction_case, monkeypatch):
+    from max_postiz_agent.article_quality import rubric_spelling
+    case = correction_case
+    text = SCIENTIFIC_CORRECTION["title"] + "\n\n" + SCIENTIFIC_CORRECTION["body"]
+    offset = len(text[:text.index("многомасштабного")].encode("utf-16-le")) // 2
+    match = {"offset": offset, "length": len("многомасштабного"), "type": {"typeName": "UnknownWord"},
+             "rule": {"id": "MORFOLOGIK_RULE_RU_RU", "issueType": "misspelling"}, "message": "Unknown scientific term."}
+    case["matches"] = [match]
+    # Reproduce the preceding release's exact sole LT false positive, then
+    # restore today's source-bound scientific adjudication for recovery.
+    monkeypatch.setattr("max_postiz_agent.article_quality.rubric_spelling",
+                        lambda *args: ([], [match]) if args[2] else rubric_spelling(*args))
+    with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+        run(case, SCIENTIFIC_CORRECTION)
+    monkeypatch.setattr("max_postiz_agent.article_quality.rubric_spelling", rubric_spelling)
+    saved = case["cycle"]._load()["records"][0]
+    case["failed_record"] = copy.deepcopy(saved)
+    case["failed_attempt"] = copy.deepcopy(saved["automatic_corrections"][0])
+    case["failed_path"] = case["core"].settings.root / case["failed_attempt"]["quality_trace"]
+    case["failed_bytes"] = case["failed_path"].read_bytes()
+    case["trace_sha"] = hashlib.sha256(case["failed_bytes"]).hexdigest()
+    case["pending_hash"] = fingerprint(case["cycle"]._snapshot(saved))
+    case["review_calls"].clear()
+    case["spelling_calls"].clear()
+    return case
+
+
+def recover(case, *, candidate=None, hashed=None, trace_hash=None):
+    return recover_staged_spelling(case["cycle"], case["prepared"]["id"], candidate or SCIENTIFIC_CORRECTION,
+        hashed or case["pending_hash"], trace_hash or case["trace_sha"], REASON)
+
+
+@pytest.mark.parametrize("correction_case", ["scientific"], indirect=True)
+def test_scientific_recovery_reuses_saved_review_once_and_preserves_failed_attempt(spelling_case):
+    case = spelling_case
+    result = recover(case)
+    saved = case["cycle"]._load()["records"][0]
+    assert result["state"] == "automatic_ready" and result["postiz_id"] == case["prepared"]["postiz_id"]
+    assert saved["automatic_corrections"] == case["failed_record"]["automatic_corrections"]
+    assert saved["automatic_spelling_recoveries"][0]["state"] == "completed"
+    assert case["failed_path"].read_bytes() == case["failed_bytes"] and case["old_trace"].read_bytes() == case["old_bytes"]
+    assert not case["review_calls"] and len(case["spelling_calls"]) == len(case["updates"]) == 1
+    with case["core"].db.session() as session:
+        variant = session.get(Variant, result["variant_id"])
+        assert automatic_evidence(session, variant) is not None
+        assert variant.metadata_json["quality"] == "saved_ministral_fresh_gates_languagetool_scientific_recovery"
+        assert variant.metadata_json["machine_review_evidence"]["spelling_adjudicated"]
+        assert session.scalar(select(Audit).where(Audit.action == STARTED))
+        assert session.scalar(select(Audit).where(Audit.action == "hourly_staged_spelling_recovery_started"))
+    with pytest.raises(AgentError, match="ARTICLE_SPELLING_RECOVERY_ALREADY_ATTEMPTED"):
+        recover(case)
+    with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_CORRECTION_ALREADY_ATTEMPTED"):
+        run(case, SCIENTIFIC_CORRECTION)
+    no_delivery(case)
+
+
+@pytest.mark.parametrize("correction_case", ["scientific"], indirect=True)
+@pytest.mark.parametrize("change", ["candidate", "old_hash", "trace_hash", "hour", "mutation", "failure", "backup"])
+def test_recovery_preconditions_are_exact_and_never_call_models(spelling_case, change):
+    case = spelling_case
+    if change in {"candidate", "old_hash", "trace_hash"}:
+        kwargs = {"candidate": {"candidate": {**SCIENTIFIC_CORRECTION, "body": SCIENTIFIC_CORRECTION["body"] + " Другая версия."}},
+                  "old_hash": {"hashed": case["prepared"]["content_hash"]}, "trace_hash": {"trace_hash": "0" * 64}}[change]
+    else:
+        kwargs = {}
+        ledger = case["cycle"]._load()
+        attempt = ledger["records"][0]["automatic_corrections"][0]
+        if change == "hour":
+            case["stamp"][0] += 3600
+        elif change == "mutation":
+            attempt["mutation_started_at"] = case["stamp"][0]
+        elif change == "failure":
+            attempt["error"] = "POSTIZ_UNKNOWN"
+        else:
+            path = case["core"].settings.root / attempt["previous_snapshot_backup"]
+            before = json.loads(path.read_text(encoding="utf-8"))
+            before["captured"]["snapshot"]["body"] += " Unrelated edit."
+            path.write_text(json.dumps(before), encoding="utf-8")
+        case["cycle"]._save(ledger)
+    with pytest.raises(AgentError):
+        recover(case, **kwargs)
+    assert not case["review_calls"] and not case["spelling_calls"] and not case["updates"]
+
+
+@pytest.mark.parametrize("correction_case", ["scientific"], indirect=True)
+@pytest.mark.parametrize("change", ["candidate", "source", "prompt", "raw_negative", "parsed", "lt_other", "gate_missing", "extra_phase"])
+def test_trace_shape_and_positive_review_cannot_be_substituted(spelling_case, change):
+    case = spelling_case
+    events = [json.loads(line) for line in case["failed_bytes"].decode("utf-8").splitlines()]
+    if change == "candidate":
+        events[0]["candidate"]["body"] += " Changed."
+    elif change == "source":
+        events[0]["source_untrusted"]["body"] += " Changed."
+    elif change == "prompt":
+        events[2]["context"]["instruction"] += " Changed."
+    elif change == "raw_negative":
+        events[3]["raw"] = json.dumps({"approved": False, "topic": "science", "issues": ["A changed fact."], "warnings": []})
+    elif change == "parsed":
+        events[4]["review"]["warnings"] = []
+    elif change == "lt_other":
+        events[6]["matches"][0]["rule"]["id"] = "OTHER_GRAMMAR_RULE"
+    elif change == "gate_missing":
+        events.pop(1)
+    else:
+        events.append({**events[-1], "phase": "accepted"})
+    case["failed_path"].write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+    changed_hash = hashlib.sha256(case["failed_path"].read_bytes()).hexdigest()
+    with pytest.raises(AgentError, match="ARTICLE_SPELLING_RECOVERY_TRACE_INVALID"):
+        recover(case, trace_hash=changed_hash)
+    assert not case["review_calls"] and not case["spelling_calls"] and not case["updates"]
+
+
+@pytest.mark.parametrize("correction_case", ["scientific"], indirect=True)
+def test_recovery_fresh_lt_failure_consumes_recovery_claim_without_model(spelling_case):
+    case = spelling_case
+    case["matches"] = [{"offset": 0, "length": 4, "message": "A real error.",
+                        "rule": {"id": "OTHER_GRAMMAR_RULE", "issueType": "grammar"}}]
+    with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+        recover(case)
+    with pytest.raises(AgentError, match="ARTICLE_SPELLING_RECOVERY_ALREADY_ATTEMPTED"):
+        recover(case)
+    saved = case["cycle"]._load()["records"][0]
+    assert saved["state"] == "needs_attention" and saved["automatic_corrections"] == case["failed_record"]["automatic_corrections"]
+    assert not case["review_calls"] and len(case["spelling_calls"]) == 1 and not case["updates"]
+    no_delivery(case)
+
+
+@pytest.mark.parametrize("correction_case", ["scientific"], indirect=True)
+def test_recovery_unknown_mutation_keeps_both_claims_and_native_lease(spelling_case):
+    case = spelling_case
+
+    def unknown():
+        raise AgentError("POSTIZ_UNKNOWN", 503)
+
+    case["after_mutation"] = unknown
+    with pytest.raises(AgentError, match="POSTIZ_UNKNOWN"):
+        recover(case)
+    with pytest.raises(AgentError, match="ARTICLE_SPELLING_RECOVERY_ALREADY_ATTEMPTED"):
+        recover(case)
+    with case["core"].db.session() as session:
+        assert session.get(BridgePost, case["prepared"]["postiz_id"]).mutation_owner
+    assert not case["review_calls"] and len(case["updates"]) == 1
+    no_delivery(case)
+
+
+@pytest.mark.parametrize("correction_case", ["scientific"], indirect=True)
+def test_saved_failed_trace_tampering_during_fresh_lt_blocks_before_post(spelling_case, monkeypatch):
+    case = spelling_case
+    original_quality = case["cycle"]._quality
+
+    def quality(*args, **kwargs):
+        result = original_quality(*args, **kwargs)
+        check = result._spelling_matches
+
+        def changed(text):
+            value = check(text)
+            case["failed_path"].write_text("Changed failed trace", encoding="utf-8")
+            return value
+
+        result._spelling_matches = changed
+        return result
+
+    monkeypatch.setattr(case["cycle"], "_quality", quality)
+    with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_CORRECTION_INPUT_CHANGED"):
+        recover(case)
+    assert not case["review_calls"] and len(case["spelling_calls"]) == 1 and not case["updates"]
     no_delivery(case)

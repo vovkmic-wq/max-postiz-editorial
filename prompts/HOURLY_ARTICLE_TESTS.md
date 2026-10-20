@@ -1,6 +1,6 @@
 # Почасовой автоматический цикл: Hy → Ministral → LanguageTool → MAX
 
-Версия 0.6.21, новое прямое поручение владельца от 19 октября 2026 после
+Версия 0.6.22, новое прямое поручение владельца от 19 октября 2026 после
 демонстрации человеческого согласования: обязательная проверка человеком отменена.
 Для max_test используй approval_mode=automatic и review_rubric=meaning-first-v1.
 Не имитируй человека: не заполняй human notes/checkbox, не используй cookie/API
@@ -121,3 +121,16 @@ warnings и raw; прежние review_invalid/rejected остаются ист�
 потерянный claim не разрешают повтор: needs_attention остаётся заблокированным.
 Только новый exact automatic_ready после сверки EN/RU разрешает отдельный publish
 с будущей датой и обычными ограничениями интервала. Человеческий API не применять.
+
+Единственный source-bound unknown-word «многомасштабного анализа» при точном
+английском Multi-scale Ultra-high Resolution/MUR не является опечаткой: написание
+подтверждено первичной научной публикацией в docs/HOURLY_ARTICLE_TESTS.md.
+Только после известного LT-only отказа staged correction ДО любой remote mutation
+допустим отдельный recover-staged-spelling с неизменённым кандидатом, полным
+failed trace SHA256 и exact pending snapshot hash. Он сохраняет failed claim и
+исходные замечания, фиксирует отдельный одноразовый recovery claim и использует
+тот же положительный raw Ministral без нового опроса. Новые hard gates и LT
+обязательны; допуск только точного научного термина/правила/UTF-16 позиции.
+Иные LT-ошибки, отрицательный/невалидный verdict, changed input/source/prompt,
+unknown и начатая remote mutation этим путём не снимаются. После успеха сверяй
+exact EN/RU и только затем обычный отдельный policy publish нового hash.

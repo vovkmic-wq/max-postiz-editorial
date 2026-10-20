@@ -23,6 +23,9 @@ from .network import resemblances_ip
 SPELLING_URL = "http://127.0.0.1:8010/v2/check"
 TOPICS = {"science", "stories", "humor"}
 MAGELLANIC_EVIDENCE = "https://www.astronet.ru/db/msg/1167613/lmc.html"
+MULTISCALE_EVIDENCE = "https://www.mathnet.ru/php/archive.phtml?jrnid=vmp&option_lang=rus&paperid=623&wshow=paper"
+MULTISCALE_SOURCE_TERM = "Multi-scale Ultra-high Resolution (MUR) Sea Surface Temperature Analysis"
+MULTISCALE_PHRASE = "многомасштабного анализа"
 MAX_REVIEW_ISSUES = 3
 MAX_REVIEW_ISSUE_CHARS = 1024
 MAX_REVIEW_WARNINGS = 8
@@ -185,13 +188,51 @@ def _numeric_feedback(original, translated):
                       "Do not merely add the source notation beside a localized copy."}
 
 
+def multiscale_spelling_evidence(original, translated, match):
+    """Resolve one exact source-bound MUR term, never a word-prefix allowlist."""
+    rule, kind = match.get("rule"), match.get("type")
+    offset, length = match.get("offset"), match.get("length")
+    if (not isinstance(rule, dict) or rule.get("id") != "MORFOLOGIK_RULE_RU_RU"
+            or rule.get("issueType") != "misspelling"
+            or not isinstance(kind, dict) or kind.get("typeName") != "UnknownWord"
+            or type(offset) is not int or offset < 0 or type(length) is not int
+            or length != len("многомасштабного")
+            or not re.search(r"(?<![A-Za-z])" + re.escape(MULTISCALE_SOURCE_TERM) + r"(?![A-Za-z])", original)):
+        return None
+    for phrase in re.finditer(r"(?<![\w-])" + MULTISCALE_PHRASE + r"(?![\w-])", translated):
+        try:
+            expected = len(translated[:phrase.start()].encode("utf-16-le")) // 2
+        except UnicodeError:
+            continue
+        if offset == expected:
+            return {"match": copy.deepcopy(match), "word": "многомасштабного", "phrase": phrase.group(),
+                    "source_term": MULTISCALE_SOURCE_TERM, "evidence_url": MULTISCALE_EVIDENCE,
+                    "reason": "SOURCE_BOUND_VERIFIED_SCIENTIFIC_TERM"}
+    return None
+
+
+def scientific_spelling_review(raw_review):
+    """Require a typed positive saved verdict; provenance is bound by the caller."""
+    error = "ARTICLE_SCIENTIFIC_SPELLING_NOT_RECOVERABLE"
+    try:
+        if (not isinstance(raw_review, str) or not raw_review.strip()
+                or len(raw_review.encode("utf-8")) > MAX_PROTOCOL_REVIEW_BYTES):
+            raise AgentError(error, 409)
+        reviewed = normalize_rubric_review(extract_object(raw_review), MEANING_FIRST_REVIEW_RUBRIC)
+        if reviewed["approved"] is not True or reviewed["issues"] or reviewed["topic"] not in TOPICS:
+            raise AgentError(error, 409)
+        return reviewed
+    except (AgentError, UnicodeError, TypeError, ValueError, RecursionError) as exc:
+        raise AgentError(error, 409) from exc
+
+
 def adjudicate_scientific_spelling(original, translated, matches):
-    """Resolve one documented scientific name; retain every other LT finding."""
+    """Resolve documented exact scientific terms; retain every other LT finding."""
     adjudicated, unresolved = [], []
     for match in matches:
         rule, kind = match.get("rule"), match.get("type")
         offset, length = match.get("offset"), match.get("length")
-        evidence = None
+        evidence = multiscale_spelling_evidence(original, translated, match)
         if (isinstance(rule, dict) and rule.get("id") == "MORFOLOGIK_RULE_RU_RU"
                 and rule.get("issueType") == "misspelling"
                 and isinstance(kind, dict) and kind.get("typeName") == "UnknownWord"
@@ -614,6 +655,64 @@ class ArticleQuality:
         self._human_evidence(prepared, en_title, en_body, reviewed, raw_review, matches, adjudicated, unresolved)
         prepared["machine_review_evidence"]["protocol_recovery"] = copy.deepcopy(protocol)
         self._emit("accepted", 1, mode="protocol_recovery", result=prepared)
+        return prepared
+
+    def recover_scientific_spelling(self, title, body, original_title, original, url, *,
+                                    raw_review, expected_review_prompt_hash):
+        """Reuse an exactly bound positive review with fresh hard gates and LT.
+
+        The caller must verify the full failed trace and claim this recovery
+        once. This method neither samples a model nor stages/approves anything.
+        """
+        error = "ARTICLE_SCIENTIFIC_SPELLING_NOT_RECOVERABLE"
+        if (self.review_rubric != MEANING_FIRST_REVIEW_RUBRIC
+                or expected_review_prompt_hash != self.review_prompt_hash):
+            raise AgentError(error, 409)
+        canonical_url = canonical_article_url(url)
+        en_title, en_body, source = _validated_source(original_title, original)
+        if (canonical_url != url or en_title != original_title or en_body != original
+                or not isinstance(title, str) or not title.strip()
+                or not isinstance(body, str) or not body.strip()
+                or title != normalize_article_links(title.strip())
+                or body != normalize_article_links(body.strip())
+                or not re.search(r"(?<![\w-])" + MULTISCALE_PHRASE + r"(?![\w-])", body)
+                or not re.search(r"(?<![A-Za-z])" + re.escape(MULTISCALE_SOURCE_TERM) + r"(?![A-Za-z])", source)):
+            raise AgentError(error, 409)
+        reviewed = scientific_spelling_review(raw_review)
+        self._emit("saved_review_recovery_started", 1, kind="scientific_spelling", raw=raw_review,
+                   candidate={"title": title, "body": body},
+                   source_untrusted={"title": en_title, "body": en_body, "url": url},
+                   review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash)
+        self._emit("saved_review_recovery_validated", 1, kind="scientific_spelling", review=reviewed)
+        text = title + "\n\n" + body
+        full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
+        try:
+            rubric_translation_gate(source, text, self.review_rubric)
+            if len(full) > 3500:
+                raise AgentError("ARTICLE_POST_TOO_LONG")
+        except AgentError as exc:
+            self._emit("gate_rejected", 1, error=exc.code, characters=len(full))
+            self._emit("rejected", 1, mode="scientific_spelling_recovery", error=exc.code)
+            raise
+        self._emit("gate_passed", 1, characters=len(full))
+        self._emit("spelling_started", 1)
+        try:
+            matches = self._spelling_matches(text)
+        except AgentError as exc:
+            self._emit("spelling_failed", 1, error=exc.code)
+            raise
+        self._emit("spelling_returned", 1, matches=matches)
+        adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric)
+        self._emit("spelling_adjudicated", 1, adjudicated=adjudicated, unresolved=unresolved)
+        if unresolved:
+            self._emit("rejected", 1, mode="scientific_spelling_recovery", error="ARTICLE_QUALITY_REJECTED",
+                       feedback={"review_approved": True, "topic": reviewed["topic"],
+                                 "review_issues": [], "spelling_matches": unresolved[:20]})
+            raise AgentError("ARTICLE_QUALITY_REJECTED")
+        prepared = {"title": title, "body": full, "translation": text, "original": source,
+                    "url": url, "topic": reviewed["topic"]}
+        self._human_evidence(prepared, en_title, en_body, reviewed, raw_review, matches, adjudicated, unresolved)
+        self._emit("accepted", 1, mode="scientific_spelling_recovery", result=prepared)
         return prepared
 
     def close(self):

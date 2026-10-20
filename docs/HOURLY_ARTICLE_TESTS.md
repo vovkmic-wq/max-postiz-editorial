@@ -1,6 +1,6 @@
 # Почасовой автоматический цикл MAX–Postiz
 
-Версия 0.6.21, 21 октября 2026, Europe/Moscow. После демонстрации ручного процесса
+Версия 0.6.22, 21 октября 2026, Europe/Moscow. После демонстрации ручного процесса
 владелец отменил обязательного редактора-человека для max_test и поручил вернуть
 автоматическую публикацию со смягчённой машинной проверкой. Режим human сохранён
 для истории и других явных сценариев, но новая политика использует automatic.
@@ -183,6 +183,20 @@ claim и не превращать этот путь в пересэмплиро
 human recheck: cookie, роль editor и человеческие checkbox не используются.
 Успех исправления ещё не означает отправку: обычный policy publish отдельно
 проверяет новый hash, будущую дату и интервал не менее 3600 секунд.
+
+Ложное unknown-word для «многомасштабного анализа» разрешается только точным
+source-bound правилом при наличии английского Multi-scale Ultra-high Resolution
+и MUR. Написание подтверждает [первичная научная публикация](https://www.mathnet.ru/php/archive.phtml?jrnid=vmp&option_lang=rus&paperid=623&wshow=paper).
+Другие слова, позиции, правила LT и реальные грамматические ошибки блокируют.
+Если штатная коррекция завершилась только таким замечанием до любой записи
+Postiz, допустим отдельный recover-staged-spelling с unchanged candidate,
+текущим pending snapshot hash и SHA256 полного failed trace. Он сохраняет
+первоначальный claim/отказ, делает отдельный durable recovery claim и повторяет
+hard gates и LanguageTool. Positive Ministral берётся из точного старого trace,
+с новыми моделями связи нет. Negative, иной отказ, неизвестный исход или
+любая попытка remote mutation этим путём не восстанавливаются.
+
+    .venv/bin/python scripts/hourly_article_test.py recover-staged-spelling RECORD_ID data/candidate.local.json --reviewed-hash CURRENT_PENDING_HASH --trace-sha256 FAILED_TRACE_SHA256 --reason "Recheck only the verified source-bound scientific spelling false positive; preserve the original refusal and raw review"
 
 Проверка развёртывания 20 октября 2026, 00:25 МСК: 0.6.18 на рабочей VM,
 632 теста и 28/28 health checks прошли. После известного отказа интервала

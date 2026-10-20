@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -178,16 +179,33 @@ def _correct(cycle, ident, correction, reviewed_hash, reason):
             raise AgentError("ARTICLE_AUTOMATIC_CORRECTION_ALREADY_ATTEMPTED", 409) from exc
     record.update(state="automatic_correcting", correction_blocked=True, automatic_corrections=[attempt])
     cycle._save(ledger)
+    return _finish_correction(cycle, ledger, record, policy, captured, claimed, attempt,
+                              correction, old_path, old_bytes, reviewed_hash, reason)
+
+
+def _finish_correction(cycle, ledger, record, policy, captured, claimed, attempt,
+                       correction, old_path, old_bytes, reviewed_hash, reason, *, saved_review=None):
+    core = cycle.core
+    snapshot, source = captured["snapshot"], captured["source"]
+    operation, trace = attempt["id"], attempt["quality_trace"]
+    ident, claim_id = record["id"], attempt["claim_id"]
     try:
         remote_before = _remote(cycle, captured, snapshot["body"])
         prompt = core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt"
         prompt_hash = hashlib.sha256(prompt.read_text(encoding="utf-8").encode()).hexdigest()
+        if saved_review is not None and prompt_hash != attempt["review_prompt_hash"]:
+            raise AgentError("ARTICLE_AUTOMATIC_CORRECTION_INPUT_CHANGED", 409)
         quality = cycle._quality(operation, review_only=True)
         try:
             if quality.review_rubric != RUBRIC or quality.review_prompt_hash != prompt_hash:
                 raise AgentError("ARTICLE_AUTOMATIC_RUBRIC_REQUIRED", 409)
-            checked = quality.check_candidate(correction["title"], correction["body"],
-                                               source["title"], source["body"], source["url"])
+            if saved_review is None:
+                checked = quality.check_candidate(correction["title"], correction["body"],
+                                                   source["title"], source["body"], source["url"])
+            else:
+                checked = quality.recover_scientific_spelling(correction["title"], correction["body"],
+                    source["title"].strip(), source["body"].strip(), source["url"], raw_review=saved_review,
+                    expected_review_prompt_hash=prompt_hash)
         finally:
             close_quality(quality, close_models=not cycle.quality_factory)
         if (checked.get("machine_review_status") != "passed" or checked.get("title") != correction["title"]
@@ -201,6 +219,8 @@ def _correct(cycle, ident, correction, reviewed_hash, reason):
             raise AgentError("ARTICLE_AUTOMATIC_CORRECTION_INPUT_CHANGED", 409)
         if (fingerprint(cycle._policy()) != fingerprint(policy) or old_path.read_bytes() != old_bytes
                 or hashlib.sha256(prompt.read_text(encoding="utf-8").encode()).hexdigest() != prompt_hash):
+            raise AgentError("ARTICLE_AUTOMATIC_CORRECTION_INPUT_CHANGED", 409)
+        if saved_review is not None and not _recovery_trace_current(cycle, attempt):
             raise AgentError("ARTICLE_AUTOMATIC_CORRECTION_INPUT_CHANGED", 409)
         with core.db.session() as session:
             if fingerprint(_capture(cycle, session, record, policy, "automatic_correcting")) != fingerprint(claimed):
@@ -240,6 +260,7 @@ def _correct(cycle, ident, correction, reviewed_hash, reason):
             expected.update(title=checked["title"], body=checked["body"])
             if (record["slot"] != int(now() // 3600) or fingerprint(cycle._policy()) != fingerprint(policy)
                     or old_path.read_bytes() != old_bytes or source_data(session, variant) != source
+                    or saved_review is not None and not _recovery_trace_current(cycle, attempt)
                     or fresh["revision"] != claimed["snapshot"]["revision"] + 1
                     or cycle._reviewed_fields(fresh) != expected
                     or fresh["metadata"].get("postiz_state") != "DRAFT"
@@ -262,7 +283,8 @@ def _correct(cycle, ident, correction, reviewed_hash, reason):
                 "approval_mode": "automatic", "correction_blocked": False,
                 "machine_text_hash": text_hash(checked["title"], checked["body"]),
                 "machine_source_hash": fingerprint(source), "machine_reviewed_at": now(),
-                "translation_hash": translated_hash, "quality": "explicit_correction_ministral_languagetool",
+                "translation_hash": translated_hash, "quality": ("explicit_correction_ministral_languagetool" if saved_review is None
+                            else "saved_ministral_fresh_gates_languagetool_scientific_recovery"),
                 "automatic_correction_history": history}
             variant.metadata_json.pop("translation_model", None)
             variant.revision += 1
@@ -290,3 +312,167 @@ def _correct(cycle, ident, correction, reviewed_hash, reason):
         if isinstance(exc, AgentError):
             raise
         raise AgentError(code, 503) from None
+
+
+def _recovery_trace_current(cycle, attempt):
+    raw = inside(cycle.core.settings.root, attempt["previous_trace"]).read_bytes()
+    return (hashlib.sha256(raw).hexdigest() == attempt["previous_trace_hash"]
+            and raw == inside(cycle.core.settings.root, attempt["previous_trace_backup"]).read_bytes())
+
+
+def _saved_spelling_review(cycle, attempt, correction, source, expected_sha):
+    """Read one complete failed candidate trace, never a detached positive reply."""
+    from .article_quality import multiscale_spelling_evidence, rubric_spelling, scientific_spelling_review
+    error = "ARTICLE_SPELLING_RECOVERY_TRACE_INVALID"
+    path = attempt.get("quality_trace")
+    if path != f"data/hourly-articles/quality-{attempt['id']}.local.jsonl":
+        raise AgentError(error, 409)
+    raw = inside(cycle.core.settings.root, path).read_bytes()
+    if not 0 < len(raw) <= 2 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != expected_sha:
+        raise AgentError(error, 409)
+    try:
+        events = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
+        phases = ["candidate_started", "gate_passed", "review_started", "review_returned", "review_parsed",
+                  "spelling_started", "spelling_returned", "spelling_adjudicated", "rejected"]
+        if ([event.get("phase") for event in events] != phases
+                or any(event.get("record_id") != attempt["id"] or event.get("attempt") != 1 for event in events)
+                or any(type(event.get("at")) not in {int, float} or not math.isfinite(event["at"]) for event in events)
+                or [event["at"] for event in events] != sorted(event["at"] for event in events)
+                or any(type(attempt.get(key)) not in {int, float} or not math.isfinite(attempt[key])
+                       for key in ("started_at", "finished_at"))
+                or not attempt["started_at"] <= events[0]["at"] <= events[-1]["at"] <= attempt["finished_at"]):
+            raise ValueError
+        canonical_source = {**source, "title": source["title"].strip(), "body": source["body"].strip()}
+        source_text = canonical_source["title"] + "\n\n" + canonical_source["body"]
+        text = correction["title"] + "\n\n" + correction["body"]
+        instruction = (cycle.core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt").read_text(encoding="utf-8")
+        prompt_hash = hashlib.sha256(instruction.encode()).hexdigest()
+        if (events[0].get("mode") != "candidate" or events[0].get("candidate") != correction
+                or events[0].get("candidate_raw", correction) != correction
+                or events[0].get("source_untrusted") != canonical_source
+                or events[1].get("characters") != len(text + "\n\nИсточник: " + source["url"]
+                                                        + "\nПеревод и редактура с помощью нейросетей.")
+                or events[2].get("context") != {"instruction": instruction, "source_untrusted": source_text,
+                    "translation_untrusted": text, "review_rubric": RUBRIC, "review_prompt_hash": prompt_hash}):
+            raise ValueError
+        raw_review = events[3]["raw"]
+        review = scientific_spelling_review(raw_review)
+        if review != events[4].get("review"):
+            raise ValueError
+        matches = events[6]["matches"]
+        if (not isinstance(matches, list) or len(matches) != 1
+                or events[7].get("adjudicated") != [] or events[7].get("unresolved") != matches
+                or events[8].get("mode") != "candidate" or events[8].get("error") != "ARTICLE_QUALITY_REJECTED"
+                or events[8].get("feedback") != {"review_approved": True, "topic": review["topic"],
+                                                   "review_issues": [], "spelling_matches": matches}):
+            raise ValueError
+        match = matches[0]
+        offset, length = match["offset"], match["length"]
+        if (type(offset) is not int or type(length) is not int or offset < 0
+                or text.encode("utf-16-le")[offset * 2:(offset + length) * 2].decode("utf-16-le") != "многомасштабного"
+                or match.get("type", {}).get("typeName") != "UnknownWord"
+                or match.get("rule", {}).get("id") != "MORFOLOGIK_RULE_RU_RU"
+                or match.get("rule", {}).get("issueType") != "misspelling"):
+            raise ValueError
+        if multiscale_spelling_evidence(source_text, text, match) is None:
+            raise ValueError
+        adjudicated, unresolved = rubric_spelling(source_text, text, matches, RUBRIC)
+        if unresolved or len(adjudicated) != 1:
+            raise ValueError
+        return raw_review, raw, prompt_hash
+    except (AgentError, ValueError, TypeError, KeyError, AttributeError, UnicodeError) as exc:
+        raise AgentError(error, 409) from exc
+
+
+def recover_staged_spelling(cycle, ident, correction, reviewed_hash, trace_sha256, reason):
+    """One source-bound spelling adjudication; preserve the original refusal claim."""
+    cycle._validate_correction(correction)
+    error = "ARTICLE_SPELLING_RECOVERY_NOT_ELIGIBLE"
+    if (not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9-]{36}", ident)
+            or any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value)
+                   for value in (reviewed_hash, trace_sha256))
+            or not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 2000):
+        raise AgentError(error, 409)
+    correction = {key: value.strip() for key, value in correction.items()}
+    with profile_lock(cycle.directory / "cycle.lock"):
+        core, policy = cycle.core, cycle._policy()
+        ledger = cycle._load()
+        record = cycle._record(ledger, ident)
+        claim = str(uuid5(NAMESPACE_URL, "max-postiz:staged-spelling-recovery:" + ident))
+        with core.db.session() as session:
+            if record.get("automatic_spelling_recoveries") or session.get(Audit, claim):
+                raise AgentError("ARTICLE_SPELLING_RECOVERY_ALREADY_ATTEMPTED", 409)
+            attempts = record.get("automatic_corrections", [])
+            if (policy.get("approval_mode") != "automatic" or policy.get("review_rubric") != RUBRIC
+                    or record.get("state") != "needs_attention" or record.get("error") != "ARTICLE_QUALITY_REJECTED"
+                    or record.get("correction_blocked") is not True or not isinstance(attempts, list) or len(attempts) != 1):
+                raise AgentError(error, 409)
+            failed = attempts[0]
+            if (failed.get("state") != "failed" or failed.get("error") != "ARTICLE_QUALITY_REJECTED"
+                    or failed.get("mutation_started_at") is not None or failed.get("candidate_hash") != cycle._candidate_hash(correction)):
+                raise AgentError(error, 409)
+            captured = _capture(cycle, session, record, policy, "needs_attention")
+            snapshot, source = captured["snapshot"], captured["source"]
+            original_claim = str(uuid5(NAMESPACE_URL, "max-postiz:staged-automatic-correction:" + ident))
+            audit = session.get(Audit, original_claim)
+            if (reviewed_hash != fingerprint(snapshot) or failed.get("claim_id") != original_claim
+                    or not audit or audit.actor != ACTOR or audit.action != STARTED or audit.entity != ident
+                    or any(audit.details.get(key) != failed.get(key) for key in (
+                        "id", "claim_id", "candidate_hash", "previous_content_hash", "previous_trace",
+                        "previous_trace_hash", "previous_snapshot_backup", "previous_trace_backup", "quality_trace", "policy_hash", "postiz_id"))):
+                raise AgentError(error, 409)
+        try:
+            before_path = inside(core.settings.root, failed["previous_snapshot_backup"])
+            before = json.loads(before_path.read_text(encoding="utf-8"))
+            previous = before["captured"]["snapshot"]
+            expected = copy.deepcopy(previous)
+            expected["revision"] += 1
+            expected["metadata"].update(approval_mode="automatic_correction_pending",
+                                        automatic_correction_claim=original_claim, correction_blocked=True)
+            if (expected != snapshot or fingerprint(previous) != failed["previous_content_hash"]
+                    or record.get("prepared_hash") != fingerprint(previous)
+                    or before["record"].get("id") != ident or before["captured"]["source"] != source
+                    or failed["policy_hash"] != fingerprint(policy) or failed["postiz_id"] != captured["post_id"]):
+                raise ValueError
+            old_path = inside(core.settings.root, failed["previous_trace"])
+            old_bytes = old_path.read_bytes()
+            if (hashlib.sha256(old_bytes).hexdigest() != failed["previous_trace_hash"]
+                    or old_bytes != inside(core.settings.root, failed["previous_trace_backup"]).read_bytes()
+                    or previous["metadata"]["machine_review_evidence"]["trace_hash"] != failed["previous_trace_hash"]):
+                raise ValueError
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            raise AgentError(error, 409) from exc
+        saved_review, failed_bytes, prompt_hash = _saved_spelling_review(cycle, failed, correction, source, trace_sha256)
+        _remote(cycle, captured, snapshot["body"])
+        operation = uid()
+        trace = f"data/hourly-articles/quality-{operation}.local.jsonl"
+        backup = cycle.directory / f"spelling-recovery-{operation}.before.local.json"
+        raw_backup = cycle.directory / f"spelling-recovery-{operation}.failed.local.jsonl"
+        _save_private(backup, json.dumps({"record": copy.deepcopy(record), "captured": captured}, ensure_ascii=False).encode("utf-8"))
+        _save_private(raw_backup, failed_bytes)
+        recovery = {"id": operation, "claim_id": claim, "started_at": now(), "state": "checking",
+            "reason": reason.strip(), "candidate_hash": cycle._candidate_hash(correction),
+            "previous_content_hash": reviewed_hash, "previous_trace": failed["quality_trace"],
+            "previous_trace_hash": trace_sha256, "previous_snapshot_backup": backup.relative_to(core.settings.root).as_posix(),
+            "previous_trace_backup": raw_backup.relative_to(core.settings.root).as_posix(),
+            "quality_trace": trace, "policy_hash": fingerprint(policy), "postiz_id": captured["post_id"],
+            "review_prompt_hash": prompt_hash, "original_correction_claim": original_claim,
+            "no_model_call": True, "kind": "source_bound_scientific_spelling"}
+        with core.db.session.begin() as session:
+            if fingerprint(_capture(cycle, session, record, policy, "needs_attention")) != fingerprint(captured):
+                raise AgentError("REVISION_CONFLICT", 409)
+            try:
+                session.add(Audit(id=claim, actor=ACTOR, action="hourly_staged_spelling_recovery_started", entity=ident,
+                                  details=copy.deepcopy(recovery)))
+                variant = core._variant(session, snapshot["variant_id"], True)
+                variant.metadata_json = {**variant.metadata_json, "automatic_spelling_recovery_claim": claim}
+                variant.revision += 1
+                core._history(session, variant, session.get(Target, variant.target_id), ACTOR)
+                session.flush()
+                claimed = {**captured, "snapshot": copy.deepcopy(core.snapshot(variant, session.get(Target, variant.target_id)))}
+            except IntegrityError as exc:
+                raise AgentError("ARTICLE_SPELLING_RECOVERY_ALREADY_ATTEMPTED", 409) from exc
+        record.update(state="automatic_correcting", automatic_spelling_recoveries=[recovery])
+        cycle._save(ledger)
+        return _finish_correction(cycle, ledger, record, policy, captured, claimed, recovery,
+                                  correction, old_path, old_bytes, reviewed_hash, reason.strip(), saved_review=saved_review)
