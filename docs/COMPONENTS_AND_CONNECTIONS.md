@@ -1,5 +1,20 @@
 # Паспорт компонентов и подключений MAX–Postiz
 
+**Живая проверка 21 октября 2026, 03:43 МСК:** VM source/import/distribution
+0.6.23, Postiz 0.5.1 без новой сборки, один прежний dispatch-only worker.
+На VM прошли 185 адресных тестов и 28/28 эксплуатационных checks; до этого
+на Windows — 313 quality, 463 chain и 26 новых recovery checks. NISAR доставлена
+в 03:05:12: verified dispatch, PUBLISHED и точный текст MAX подтверждены.
+Для NASA SVS 5685 исправлена привязка трёхмесячного среднего к центральному
+месяцу; ложное LT unknown-word для правильного «Ниньо» устранено отдельным
+source-bound правилом с подтверждением ВМО. Прежние отказ/claim/raw сохранены,
+Ministral повторно не опрашивался, свежие hard gates/LT и same-DRAFT native CAS
+проверены вживую. Новый exact automatic_ready — ещё не отправка: на этой
+стадии approvals/dispatches нет, все пять адресатов paused. Будущие 04:06
+прошли preflight с интервалом 3647,24 секунды; назначение и доставка отдельно.
+Heartbeat ACTIVE с точным промптом 0.6.23; зависимость подготовки от desktop
+Codex сохраняется. Секреты, исходники статей и runtime-доказательства — в ignored data.
+
 **Живая проверка 21 октября 2026, 00:46 МСК:** VM source/import/distribution
 0.6.22, Postiz 0.5.1, один прежний dispatch-only worker. После проверки на VM
 865 tests и 28/28 эксплуатационных checks успешны. PACE опубликована в 00:02:09,

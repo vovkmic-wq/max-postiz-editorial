@@ -221,6 +221,14 @@ remote mutation, прежние approvals/dispatches, active sends/leases, из�
 
     .venv/bin/python scripts/hourly_article_test.py recover-staged-roni-spelling RECORD_ID data/candidate.local.json --reviewed-hash CURRENT_PENDING_HASH --trace-sha256 FAILED_TRACE_SHA256 --reason "Resolve only the verified RONI proper-name dictionary false positive; preserve the exact saved positive review and failed claim"
 
+Живая проверка 21 октября 2026, 03:43 МСК: 0.6.23 развёрнута на VM, 185
+адресных тестов и 28/28 эксплуатационных checks прошли. Для NASA SVS 5685
+один recovery сохранил failed correction/raw и два warnings, без нового Ministral
+выполнил hard gates и свежий LT, затем native CAS того же DRAFT. Exact EN/RU,
+новый hash и evidence сверены. Это automatic_ready без approvals/dispatches;
+все адресаты paused. Будущие 04:06 прошли preflight с интервалом 3647,24 секунды
+после фактической NISAR. Назначение и доставку это доказательство не подтверждает.
+
 Проверка развёртывания 20 октября 2026, 00:25 МСК: 0.6.18 на рабочей VM,
 632 теста и 28/28 health checks прошли. После известного отказа интервала
 адресно восстановлено одно согласование того же SSHA QUEUE на прежние 00:49 МСК.
