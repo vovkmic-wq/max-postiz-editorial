@@ -788,6 +788,10 @@ class HourlyArticleCycle:
         from .automatic_correction import recover_staged_spelling
         return recover_staged_spelling(self, ident, correction, reviewed_hash, trace_sha256, reason)
 
+    def recover_staged_roni_spelling(self, ident, correction, reviewed_hash, trace_sha256, reason):
+        from .automatic_correction import recover_staged_roni_spelling
+        return recover_staged_roni_spelling(self, ident, correction, reviewed_hash, trace_sha256, reason)
+
     def reconcile_approval(self, ident, reviewed_hash, due_at, reason):
         from .automatic_policy import reconcile_approval
         with profile_lock(self.directory / "cycle.lock"):

@@ -1,6 +1,6 @@
 # Почасовой автоматический цикл MAX–Postiz
 
-Версия 0.6.22, 21 октября 2026, Europe/Moscow. После демонстрации ручного процесса
+Версия 0.6.23, 21 октября 2026, Europe/Moscow. После демонстрации ручного процесса
 владелец отменил обязательного редактора-человека для max_test и поручил вернуть
 автоматическую публикацию со смягчённой машинной проверкой. Режим human сохранён
 для истории и других явных сценариев, но новая политика использует automatic.
@@ -197,6 +197,29 @@ hard gates и LanguageTool. Positive Ministral берётся из точног�
 любая попытка remote mutation этим путём не восстанавливаются.
 
     .venv/bin/python scripts/hourly_article_test.py recover-staged-spelling RECORD_ID data/candidate.local.json --reviewed-hash CURRENT_PENDING_HASH --trace-sha256 FAILED_TRACE_SHA256 --reason "Recheck only the verified source-bound scientific spelling false positive; preserve the original refusal and raw review"
+
+С версии 0.6.23 отдельно квалифицируется точное «Ниньо» в названии RONI:
+«относительного океанического индекса Ниньо (RONI)» в заголовке или
+«относительный океанический индекс Ниньо (RONI)» в тексте. Источник должен
+содержать точное Relative Oceanic Niño Index (RONI). Написание подтверждает
+[ВМО, раздел «Измерения»](https://public.wmo.int/ru/temy/yavleniya-el-nino-i-la-ninya).
+Разрешено только исходное MORFOLOGIK_RULE_RU_RU/misspelling/UnknownWord на
+точной UTF-16 позиции слова; другие слова, контексты и грамматика блокируют.
+
+Для уже завершённого LT-only отказа коррекции NASA SVS 5685 предусмотрен
+отдельный recover-staged-roni-spelling. Он требует ровно двух таких замечаний:
+одно в заголовке и одно в тексте, полного неизменённого failed trace, strict
+positive raw Ministral с пустыми issues, точных input/source/prompt/policy,
+неизменённого кандидата и текущего pending snapshot hash. Старый MUR-путь
+по-прежнему принимает только свой единственный термин. RONI recovery имеет
+собственные durable claim, audit и history; старый failed claim и raw остаются.
+До любого native CAS повторяются hard gates и свежий LT без нового Ministral.
+Успех обновляет тот же DRAFT без назначения даты, approval или dispatch. Unknown, начатая
+remote mutation, прежние approvals/dispatches, active sends/leases, изменение
+источника/кандидата/промпта или утраченный claim не разрешают повтор. Затем
+требуются обычная сверка EN/RU и отдельный publish точного нового hash.
+
+    .venv/bin/python scripts/hourly_article_test.py recover-staged-roni-spelling RECORD_ID data/candidate.local.json --reviewed-hash CURRENT_PENDING_HASH --trace-sha256 FAILED_TRACE_SHA256 --reason "Resolve only the verified RONI proper-name dictionary false positive; preserve the exact saved positive review and failed claim"
 
 Проверка развёртывания 20 октября 2026, 00:25 МСК: 0.6.18 на рабочей VM,
 632 теста и 28/28 health checks прошли. После известного отказа интервала

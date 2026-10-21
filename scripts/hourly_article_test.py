@@ -39,6 +39,12 @@ def main():
     spelling.add_argument("--reviewed-hash", required=True)
     spelling.add_argument("--trace-sha256", required=True)
     spelling.add_argument("--reason", required=True)
+    roni = sub.add_parser("recover-staged-roni-spelling")
+    roni.add_argument("record_id")
+    roni.add_argument("candidate", help="Unchanged ignored RONI candidate from its exact two-hit LT-only failed trace")
+    roni.add_argument("--reviewed-hash", required=True)
+    roni.add_argument("--trace-sha256", required=True)
+    roni.add_argument("--reason", required=True)
     reconcile = sub.add_parser("reconcile-approval")
     reconcile.add_argument("record_id")
     reconcile.add_argument("--reviewed-hash", required=True)
@@ -94,11 +100,13 @@ def main():
                 raise AgentError("ARTICLE_PRIVATE_INPUT_REQUIRED")
             result = cycle.correct_staged(args.record_id, json.loads(path.read_text(encoding="utf-8-sig")),
                                           args.reviewed_hash, args.reason)
-        elif args.action == "recover-staged-spelling":
+        elif args.action in {"recover-staged-spelling", "recover-staged-roni-spelling"}:
             path = inside(root, args.candidate)
             if not path.is_relative_to(root / "data") or path.suffix != ".json":
                 raise AgentError("ARTICLE_PRIVATE_INPUT_REQUIRED")
-            result = cycle.recover_staged_spelling(args.record_id,
+            recover = (cycle.recover_staged_roni_spelling if args.action == "recover-staged-roni-spelling"
+                       else cycle.recover_staged_spelling)
+            result = recover(args.record_id,
                 json.loads(path.read_text(encoding="utf-8-sig")), args.reviewed_hash,
                 args.trace_sha256, args.reason)
         elif args.action == "reconcile-approval":

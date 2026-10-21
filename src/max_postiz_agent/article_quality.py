@@ -26,6 +26,10 @@ MAGELLANIC_EVIDENCE = "https://www.astronet.ru/db/msg/1167613/lmc.html"
 MULTISCALE_EVIDENCE = "https://www.mathnet.ru/php/archive.phtml?jrnid=vmp&option_lang=rus&paperid=623&wshow=paper"
 MULTISCALE_SOURCE_TERM = "Multi-scale Ultra-high Resolution (MUR) Sea Surface Temperature Analysis"
 MULTISCALE_PHRASE = "многомасштабного анализа"
+RONI_EVIDENCE = "https://public.wmo.int/ru/temy/yavleniya-el-nino-i-la-ninya"
+RONI_SOURCE_TERM = "Relative Oceanic Niño Index (RONI)"
+_RONI_PHRASE = re.compile(r"(?<![\w-])(?:[Оо]тносительного океанического индекса|"
+                          r"[Оо]тносительный океанический индекс) (?P<word>Ниньо) \(RONI\)(?![\w-])")
 MAX_REVIEW_ISSUES = 3
 MAX_REVIEW_ISSUE_CHARS = 1024
 MAX_REVIEW_WARNINGS = 8
@@ -226,13 +230,38 @@ def scientific_spelling_review(raw_review):
         raise AgentError(error, 409) from exc
 
 
+def roni_spelling_evidence(original, translated, match):
+    """Recognize only the documented Niño token inside the full RONI term."""
+    if not isinstance(original, str) or not isinstance(translated, str) or not isinstance(match, dict):
+        return None
+    rule, kind = match.get("rule"), match.get("type")
+    offset, length = match.get("offset"), match.get("length")
+    if (not isinstance(rule, dict) or rule.get("id") != "MORFOLOGIK_RULE_RU_RU"
+            or rule.get("issueType") != "misspelling"
+            or not isinstance(kind, dict) or kind.get("typeName") != "UnknownWord"
+            or type(offset) is not int or offset < 0 or type(length) is not int or length != len("Ниньо")
+            or not re.search(r"(?<![\w-])" + re.escape(RONI_SOURCE_TERM) + r"(?![\w-])", original)):
+        return None
+    for phrase in _RONI_PHRASE.finditer(translated):
+        try:
+            expected = len(translated[:phrase.start("word")].encode("utf-16-le")) // 2
+        except UnicodeError:
+            continue
+        if offset == expected:
+            return {"match": copy.deepcopy(match), "word": "Ниньо", "phrase": phrase.group(),
+                    "source_term": RONI_SOURCE_TERM, "evidence_url": RONI_EVIDENCE,
+                    "reason": "SOURCE_BOUND_VERIFIED_SCIENTIFIC_TERM"}
+    return None
+
+
 def adjudicate_scientific_spelling(original, translated, matches):
     """Resolve documented exact scientific terms; retain every other LT finding."""
     adjudicated, unresolved = [], []
     for match in matches:
         rule, kind = match.get("rule"), match.get("type")
         offset, length = match.get("offset"), match.get("length")
-        evidence = multiscale_spelling_evidence(original, translated, match)
+        evidence = (multiscale_spelling_evidence(original, translated, match)
+                    or roni_spelling_evidence(original, translated, match))
         if (isinstance(rule, dict) and rule.get("id") == "MORFOLOGIK_RULE_RU_RU"
                 and rule.get("issueType") == "misspelling"
                 and isinstance(kind, dict) and kind.get("typeName") == "UnknownWord"
@@ -713,6 +742,69 @@ class ArticleQuality:
                     "url": url, "topic": reviewed["topic"]}
         self._human_evidence(prepared, en_title, en_body, reviewed, raw_review, matches, adjudicated, unresolved)
         self._emit("accepted", 1, mode="scientific_spelling_recovery", result=prepared)
+        return prepared
+
+    def recover_roni_spelling(self, title, body, original_title, original, url, *,
+                              raw_review, expected_review_prompt_hash):
+        """Check a caller-bound positive RONI review with fresh gates and LT only."""
+        error = "ARTICLE_RONI_SPELLING_NOT_RECOVERABLE"
+        if (self.review_rubric != MEANING_FIRST_REVIEW_RUBRIC
+                or expected_review_prompt_hash != self.review_prompt_hash):
+            raise AgentError(error, 409)
+        canonical_url = canonical_article_url(url)
+        en_title, en_body, source = _validated_source(original_title, original)
+        if (canonical_url != url or url != "https://svs.gsfc.nasa.gov/5685/"
+                or en_title != original_title or en_body != original
+                or not isinstance(title, str) or not title.strip()
+                or not isinstance(body, str) or not body.strip()
+                or title != normalize_article_links(title.strip())
+                or body != normalize_article_links(body.strip())
+                or not _RONI_PHRASE.search(title + "\n\n" + body)
+                or not re.search(r"(?<![\w-])" + re.escape(RONI_SOURCE_TERM) + r"(?![\w-])", source)):
+            raise AgentError(error, 409)
+        reviewed = scientific_spelling_review(raw_review)
+        self._emit("saved_review_recovery_started", 1, kind="roni_spelling", raw=raw_review,
+                   candidate={"title": title, "body": body},
+                   source_untrusted={"title": en_title, "body": en_body, "url": url},
+                   review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash)
+        self._emit("saved_review_recovery_validated", 1, kind="roni_spelling", review=reviewed)
+        text = title + "\n\n" + body
+        full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
+        try:
+            rubric_translation_gate(source, text, self.review_rubric)
+            if len(full) > 3500:
+                raise AgentError("ARTICLE_POST_TOO_LONG")
+        except AgentError as exc:
+            self._emit("gate_rejected", 1, error=exc.code, characters=len(full))
+            self._emit("rejected", 1, mode="roni_spelling_recovery", error=exc.code)
+            raise
+        self._emit("gate_passed", 1, characters=len(full))
+        self._emit("spelling_started", 1)
+        try:
+            matches = self._spelling_matches(text)
+        except AgentError as exc:
+            self._emit("spelling_failed", 1, error=exc.code)
+            raise
+        self._emit("spelling_returned", 1, matches=matches)
+        adjudicated, unresolved, seen = [], [], set()
+        for match in matches:
+            evidence = roni_spelling_evidence(source, text, match)
+            position = (match.get("offset"), match.get("length"))
+            if evidence and len(matches) <= 2 and position not in seen:
+                adjudicated.append(evidence)
+                seen.add(position)
+            else:
+                unresolved.append(match)
+        self._emit("spelling_adjudicated", 1, adjudicated=adjudicated, unresolved=unresolved)
+        if unresolved:
+            self._emit("rejected", 1, mode="roni_spelling_recovery", error="ARTICLE_QUALITY_REJECTED",
+                       feedback={"review_approved": True, "topic": reviewed["topic"],
+                                 "review_issues": [], "spelling_matches": unresolved[:20]})
+            raise AgentError("ARTICLE_QUALITY_REJECTED")
+        prepared = {"title": title, "body": full, "translation": text, "original": source,
+                    "url": url, "topic": reviewed["topic"]}
+        self._human_evidence(prepared, en_title, en_body, reviewed, raw_review, matches, adjudicated, unresolved)
+        self._emit("accepted", 1, mode="roni_spelling_recovery", result=prepared)
         return prepared
 
     def close(self):

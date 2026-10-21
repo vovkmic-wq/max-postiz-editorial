@@ -184,7 +184,8 @@ def _correct(cycle, ident, correction, reviewed_hash, reason):
 
 
 def _finish_correction(cycle, ledger, record, policy, captured, claimed, attempt,
-                       correction, old_path, old_bytes, reviewed_hash, reason, *, saved_review=None):
+                       correction, old_path, old_bytes, reviewed_hash, reason, *, saved_review=None,
+                       recovery_profile="mur"):
     core = cycle.core
     snapshot, source = captured["snapshot"], captured["source"]
     operation, trace = attempt["id"], attempt["quality_trace"]
@@ -203,7 +204,9 @@ def _finish_correction(cycle, ledger, record, policy, captured, claimed, attempt
                 checked = quality.check_candidate(correction["title"], correction["body"],
                                                    source["title"], source["body"], source["url"])
             else:
-                checked = quality.recover_scientific_spelling(correction["title"], correction["body"],
+                recover = (quality.recover_roni_spelling if recovery_profile == "roni"
+                           else quality.recover_scientific_spelling)
+                checked = recover(correction["title"], correction["body"],
                     source["title"].strip(), source["body"].strip(), source["url"], raw_review=saved_review,
                     expected_review_prompt_hash=prompt_hash)
         finally:
@@ -284,6 +287,7 @@ def _finish_correction(cycle, ledger, record, policy, captured, claimed, attempt
                 "machine_text_hash": text_hash(checked["title"], checked["body"]),
                 "machine_source_hash": fingerprint(source), "machine_reviewed_at": now(),
                 "translation_hash": translated_hash, "quality": ("explicit_correction_ministral_languagetool" if saved_review is None
+                            else "saved_ministral_fresh_gates_languagetool_roni_recovery" if recovery_profile == "roni"
                             else "saved_ministral_fresh_gates_languagetool_scientific_recovery"),
                 "automatic_correction_history": history}
             variant.metadata_json.pop("translation_model", None)
@@ -320,10 +324,10 @@ def _recovery_trace_current(cycle, attempt):
             and raw == inside(cycle.core.settings.root, attempt["previous_trace_backup"]).read_bytes())
 
 
-def _saved_spelling_review(cycle, attempt, correction, source, expected_sha):
+def _saved_spelling_review(cycle, attempt, correction, source, expected_sha, *, profile="mur"):
     """Read one complete failed candidate trace, never a detached positive reply."""
     from .article_quality import multiscale_spelling_evidence, rubric_spelling, scientific_spelling_review
-    error = "ARTICLE_SPELLING_RECOVERY_TRACE_INVALID"
+    error = "ARTICLE_RONI_SPELLING_RECOVERY_TRACE_INVALID" if profile == "roni" else "ARTICLE_SPELLING_RECOVERY_TRACE_INVALID"
     path = attempt.get("quality_trace")
     if path != f"data/hourly-articles/quality-{attempt['id']}.local.jsonl":
         raise AgentError(error, 409)
@@ -345,6 +349,12 @@ def _saved_spelling_review(cycle, attempt, correction, source, expected_sha):
         canonical_source = {**source, "title": source["title"].strip(), "body": source["body"].strip()}
         source_text = canonical_source["title"] + "\n\n" + canonical_source["body"]
         text = correction["title"] + "\n\n" + correction["body"]
+        expected_count, expected_word = (2, "Ниньо") if profile == "roni" else (1, "многомасштабного")
+        if profile == "roni":
+            from .article_quality import RONI_SOURCE_TERM, roni_spelling_evidence
+            if (source["url"] != "https://svs.gsfc.nasa.gov/5685/"
+                    or not re.search(r"(?<![A-Za-z])" + re.escape(RONI_SOURCE_TERM) + r"(?![A-Za-z])", source_text)):
+                raise ValueError
         instruction = (cycle.core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt").read_text(encoding="utf-8")
         prompt_hash = hashlib.sha256(instruction.encode()).hexdigest()
         if (events[0].get("mode") != "candidate" or events[0].get("candidate") != correction
@@ -360,24 +370,35 @@ def _saved_spelling_review(cycle, attempt, correction, source, expected_sha):
         if review != events[4].get("review"):
             raise ValueError
         matches = events[6]["matches"]
-        if (not isinstance(matches, list) or len(matches) != 1
+        if (not isinstance(matches, list) or len(matches) != expected_count
                 or events[7].get("adjudicated") != [] or events[7].get("unresolved") != matches
                 or events[8].get("mode") != "candidate" or events[8].get("error") != "ARTICLE_QUALITY_REJECTED"
                 or events[8].get("feedback") != {"review_approved": True, "topic": review["topic"],
                                                    "review_issues": [], "spelling_matches": matches}):
             raise ValueError
-        match = matches[0]
-        offset, length = match["offset"], match["length"]
-        if (type(offset) is not int or type(length) is not int or offset < 0
-                or text.encode("utf-16-le")[offset * 2:(offset + length) * 2].decode("utf-16-le") != "многомасштабного"
-                or match.get("type", {}).get("typeName") != "UnknownWord"
-                or match.get("rule", {}).get("id") != "MORFOLOGIK_RULE_RU_RU"
-                or match.get("rule", {}).get("issueType") != "misspelling"):
-            raise ValueError
-        if multiscale_spelling_evidence(source_text, text, match) is None:
-            raise ValueError
+        positions = []
+        for match in matches:
+            offset, length = match["offset"], match["length"]
+            if (type(offset) is not int or type(length) is not int or offset < 0
+                    or length != len(expected_word)
+                    or text.encode("utf-16-le")[offset * 2:(offset + length) * 2].decode("utf-16-le") != expected_word
+                    or match.get("type", {}).get("typeName") != "UnknownWord"
+                    or match.get("rule", {}).get("id") != "MORFOLOGIK_RULE_RU_RU"
+                    or match.get("rule", {}).get("issueType") != "misspelling"):
+                raise ValueError
+            resolved = (roni_spelling_evidence(source_text, text, match) if profile == "roni"
+                        else multiscale_spelling_evidence(source_text, text, match))
+            if resolved is None:
+                raise ValueError
+            positions.append(offset)
+        if profile == "roni":
+            title_end = len(correction["title"].encode("utf-16-le")) // 2
+            body_start = len((correction["title"] + "\n\n").encode("utf-16-le")) // 2
+            if (len(set(positions)) != 2 or sum(position < title_end for position in positions) != 1
+                    or sum(position >= body_start for position in positions) != 1):
+                raise ValueError
         adjudicated, unresolved = rubric_spelling(source_text, text, matches, RUBRIC)
-        if unresolved or len(adjudicated) != 1:
+        if unresolved or len(adjudicated) != expected_count:
             raise ValueError
         return raw_review, raw, prompt_hash
     except (AgentError, ValueError, TypeError, KeyError, AttributeError, UnicodeError) as exc:
@@ -385,9 +406,23 @@ def _saved_spelling_review(cycle, attempt, correction, source, expected_sha):
 
 
 def recover_staged_spelling(cycle, ident, correction, reviewed_hash, trace_sha256, reason):
-    """One source-bound spelling adjudication; preserve the original refusal claim."""
+    """The original MUR-only recovery remains separate and unchanged."""
+    return _recover_staged_spelling(cycle, ident, correction, reviewed_hash, trace_sha256, reason)
+
+
+def recover_staged_roni_spelling(cycle, ident, correction, reviewed_hash, trace_sha256, reason):
+    """One separately claimed recovery for exact title/body RONI findings only."""
+    return _recover_staged_spelling(cycle, ident, correction, reviewed_hash, trace_sha256, reason, profile="roni")
+
+
+def _recover_staged_spelling(cycle, ident, correction, reviewed_hash, trace_sha256, reason, *, profile="mur"):
     cycle._validate_correction(correction)
-    error = "ARTICLE_SPELLING_RECOVERY_NOT_ELIGIBLE"
+    roni = profile == "roni"
+    error = "ARTICLE_RONI_SPELLING_RECOVERY_NOT_ELIGIBLE" if roni else "ARTICLE_SPELLING_RECOVERY_NOT_ELIGIBLE"
+    ledger_key = "automatic_roni_spelling_recoveries" if roni else "automatic_spelling_recoveries"
+    namespace = "max-postiz:staged-roni-spelling-recovery:" if roni else "max-postiz:staged-spelling-recovery:"
+    claim_field = "automatic_roni_spelling_recovery_claim" if roni else "automatic_spelling_recovery_claim"
+    audit_action = "hourly_staged_roni_spelling_recovery_started" if roni else "hourly_staged_spelling_recovery_started"
     if (not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9-]{36}", ident)
             or any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value)
                    for value in (reviewed_hash, trace_sha256))
@@ -398,9 +433,9 @@ def recover_staged_spelling(cycle, ident, correction, reviewed_hash, trace_sha25
         core, policy = cycle.core, cycle._policy()
         ledger = cycle._load()
         record = cycle._record(ledger, ident)
-        claim = str(uuid5(NAMESPACE_URL, "max-postiz:staged-spelling-recovery:" + ident))
+        claim = str(uuid5(NAMESPACE_URL, namespace + ident))
         with core.db.session() as session:
-            if record.get("automatic_spelling_recoveries") or session.get(Audit, claim):
+            if record.get(ledger_key) or session.get(Audit, claim):
                 raise AgentError("ARTICLE_SPELLING_RECOVERY_ALREADY_ATTEMPTED", 409)
             attempts = record.get("automatic_corrections", [])
             if (policy.get("approval_mode") != "automatic" or policy.get("review_rubric") != RUBRIC
@@ -442,12 +477,14 @@ def recover_staged_spelling(cycle, ident, correction, reviewed_hash, trace_sha25
                 raise ValueError
         except (ValueError, TypeError, KeyError, OSError) as exc:
             raise AgentError(error, 409) from exc
-        saved_review, failed_bytes, prompt_hash = _saved_spelling_review(cycle, failed, correction, source, trace_sha256)
+        saved_review, failed_bytes, prompt_hash = _saved_spelling_review(cycle, failed, correction, source, trace_sha256,
+                                                                       profile=profile)
         _remote(cycle, captured, snapshot["body"])
         operation = uid()
         trace = f"data/hourly-articles/quality-{operation}.local.jsonl"
-        backup = cycle.directory / f"spelling-recovery-{operation}.before.local.json"
-        raw_backup = cycle.directory / f"spelling-recovery-{operation}.failed.local.jsonl"
+        prefix = "roni-spelling-recovery" if roni else "spelling-recovery"
+        backup = cycle.directory / f"{prefix}-{operation}.before.local.json"
+        raw_backup = cycle.directory / f"{prefix}-{operation}.failed.local.jsonl"
         _save_private(backup, json.dumps({"record": copy.deepcopy(record), "captured": captured}, ensure_ascii=False).encode("utf-8"))
         _save_private(raw_backup, failed_bytes)
         recovery = {"id": operation, "claim_id": claim, "started_at": now(), "state": "checking",
@@ -457,22 +494,23 @@ def recover_staged_spelling(cycle, ident, correction, reviewed_hash, trace_sha25
             "previous_trace_backup": raw_backup.relative_to(core.settings.root).as_posix(),
             "quality_trace": trace, "policy_hash": fingerprint(policy), "postiz_id": captured["post_id"],
             "review_prompt_hash": prompt_hash, "original_correction_claim": original_claim,
-            "no_model_call": True, "kind": "source_bound_scientific_spelling"}
+            "no_model_call": True, "kind": "source_bound_roni_spelling" if roni else "source_bound_scientific_spelling"}
         with core.db.session.begin() as session:
             if fingerprint(_capture(cycle, session, record, policy, "needs_attention")) != fingerprint(captured):
                 raise AgentError("REVISION_CONFLICT", 409)
             try:
-                session.add(Audit(id=claim, actor=ACTOR, action="hourly_staged_spelling_recovery_started", entity=ident,
+                session.add(Audit(id=claim, actor=ACTOR, action=audit_action, entity=ident,
                                   details=copy.deepcopy(recovery)))
                 variant = core._variant(session, snapshot["variant_id"], True)
-                variant.metadata_json = {**variant.metadata_json, "automatic_spelling_recovery_claim": claim}
+                variant.metadata_json = {**variant.metadata_json, claim_field: claim}
                 variant.revision += 1
                 core._history(session, variant, session.get(Target, variant.target_id), ACTOR)
                 session.flush()
                 claimed = {**captured, "snapshot": copy.deepcopy(core.snapshot(variant, session.get(Target, variant.target_id)))}
             except IntegrityError as exc:
                 raise AgentError("ARTICLE_SPELLING_RECOVERY_ALREADY_ATTEMPTED", 409) from exc
-        record.update(state="automatic_correcting", automatic_spelling_recoveries=[recovery])
+        record.update(state="automatic_correcting", **{ledger_key: [recovery]})
         cycle._save(ledger)
         return _finish_correction(cycle, ledger, record, policy, captured, claimed, recovery,
-                                  correction, old_path, old_bytes, reviewed_hash, reason.strip(), saved_review=saved_review)
+                                  correction, old_path, old_bytes, reviewed_hash, reason.strip(), saved_review=saved_review,
+                                  recovery_profile=profile)
