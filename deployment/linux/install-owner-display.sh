@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+# Прежний Hub auth proxy нельзя устанавливать поверх новой панели Postiz.
+python3 "$(dirname -- "${BASH_SOURCE[0]}")/legacy_guard.py"
 cd /opt/max-postiz
 install -m 0644 deployment/linux/max-postiz-{display,vnc,novnc,login}.service /etc/systemd/system/
 install -m 0644 deployment/linux/owner-browser.nginx.conf /etc/nginx/snippets/editorial-owner-browser.conf

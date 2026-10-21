@@ -113,6 +113,7 @@ def test_free_hour_claim_precedes_one_prepare_and_exact_publish(server):
     assert [c[0] for c in server.calls] == ["prepare", "snapshot", "publish"]
     assert server.calls[-1][2] == fingerprint(server.snapshot)
     assert server.calls[-1][3] >= server.stamp[0] + 120
+    assert server.state.value["runtime"]["next_run_at"] == server.calls[-1][3]
 
 
 def test_ready_has_priority_and_never_selects_another_source(server):
@@ -134,6 +135,7 @@ def test_only_one_of_multiple_ready_is_selected(server):
 def test_used_hour_is_not_caught_up(server, state):
     server.ledger["records"].append({**server.record, "state": state})
     assert server.controller.run_once()["phase"] == "hour_used"
+    assert server.state.value["runtime"]["next_run_at"] == (int(server.stamp[0] // 3600) + 1) * 3600
     assert server.calls == []
 
 
@@ -141,6 +143,7 @@ def test_no_source_is_a_durable_single_attempt_for_the_hour(server):
     seen = []
     server.controller.selector = lambda *_a, **_k: seen.append(True)
     assert server.controller.run_once()["phase"] == "no_source"
+    assert server.state.value["runtime"]["next_run_at"] == (int(server.stamp[0] // 3600) + 1) * 3600
     assert server.controller.run_once()["phase"] == "hour_used"
     assert seen == [True]
     server.stamp[0] += 3600 * 5
@@ -156,10 +159,12 @@ def test_global_active_other_target_blocks_new_preparation(server, state):
 
 
 def test_existing_pending_only_observes_same_record_without_publish(server):
-    server.ledger["records"].append({**server.record, "state": "pending"})
+    due = server.stamp[0] + 120
+    server.ledger["records"].append({**server.record, "state": "pending", "due_at": due})
     server.controller._inventory = lambda: ([{"id": "existing", "variant_id": server.record["variant_id"], "state": "pending"}], False)
     server.controller._resume_pending = lambda *_: False
     assert server.controller.run_once()["phase"] == "waiting_dispatch"
+    assert server.state.value["runtime"]["next_run_at"] == due
     assert server.calls == [("status", server.record["id"])]
 
 
@@ -315,13 +320,31 @@ def test_configured_interval_uses_actual_delivery_time_and_waits_until_schedule_
 
     monkeypatch.setattr(server.core.db, "session", Session)
     server.controller._inventory = lambda: ([], False)
-    assert server.controller.run_once()["phase"] == "waiting_interval"
+    result = server.controller.run_once()
+    assert result["phase"] == "waiting_interval"
+    assert server.state.value["runtime"]["next_run_at"] == result["earliest_due_at"] == actual + 7201
     assert not any(c[0] == "publish" for c in server.calls)
     server.record["slot"] -= 1
     server.stamp[0] += 4000
     assert server.controller.run_once()["phase"] == "waiting_dispatch"
     due = next(c[3] for c in server.calls if c[0] == "publish")
     assert due >= actual + 7201
+    assert server.state.value["runtime"]["next_run_at"] == due
+
+
+@pytest.mark.parametrize("phase", ["preparing", "selecting", "scheduling", "reconciling", "blocked"])
+def test_active_or_blocked_phase_clears_stale_next_run_without_actions(server, phase):
+    server.state.value["runtime"]["next_run_at"] = server.stamp[0] + 60
+    server.controller._phase(phase)
+    assert server.state.value["runtime"]["next_run_at"] is None
+    assert server.calls == []
+
+
+@pytest.mark.parametrize("due", [True, "tomorrow", float("nan"), float("inf"), -1])
+def test_invalid_display_date_is_not_saved_as_next_run(server, due):
+    server.controller._phase("waiting_dispatch", result={"due_at": due})
+    assert server.state.value["runtime"]["next_run_at"] is None
+    assert server.calls == []
 
 
 def pending(server, monkeypatch, *, expired=False):

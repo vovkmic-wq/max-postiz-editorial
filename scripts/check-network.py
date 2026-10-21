@@ -19,7 +19,7 @@ TARGETS = (
     {"service": "proxmox_ssh", "host": "10.20.30.142", "port": 22, "core": True},
     {"service": "proxmox_api", "host": "10.20.30.142", "port": 8006, "core": True},
     {"service": "editorial_ssh", "host": "10.20.30.45", "port": 22, "core": True},
-    {"service": "hub", "host": "10.20.30.45", "port": 8090, "core": True},
+    # После миграции единственная внешняя панель — Postiz; старый Hub закрыт.
     {"service": "postiz", "host": "10.20.30.45", "port": 4007, "core": True},
     {"service": "llm_router", "host": "10.20.30.95", "port": 8083, "core": True},
     {"service": "gpu_ssh", "host": "10.20.30.143", "port": 22, "core": True},
@@ -95,7 +95,7 @@ def classify(checks):
     core = [item for item in checks if item["core"]]
     core_ok = bool(core) and all(item["reachable"] for item in core)
     proxmox = any(states.get(name, False) for name in ("proxmox_ssh", "proxmox_api"))
-    guests = any(states.get(name, False) for name in ("editorial_ssh", "hub", "postiz", "llm_router"))
+    guests = any(states.get(name, False) for name in ("editorial_ssh", "postiz", "llm_router"))
     gpu = any(states.get(name, False) for name in ("gpu_ssh", "gpu_model"))
     if core_ok:
         observation = "core_services_reachable"

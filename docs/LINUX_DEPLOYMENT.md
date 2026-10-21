@@ -1,5 +1,44 @@
 # Эксплуатация редакции в Linux VM
 
+## Действующая установка 0.7.0
+
+Основная инструкция запуска, управления и восстановления —
+[автономная редакция Postiz на VM](VM_EDITORIAL.md).
+Проект работает в `/opt/max-postiz`, VM 112, `10.20.30.45`.
+Пользовательская панель одна:
+[Postiz → «Редакция»](http://10.20.30.45:4007/editorial).
+`max-postiz-editorial.service` запускает `editorial-agent` и одного обработчика
+с PostgreSQL fencing. Старый `max-postiz-hub.service` и внешний 8090 сняты;
+desktop heartbeat не является планировщиком.
+
+| Назначение | Действующий доступ |
+|---|---|
+| Панель, настройки, пауза, история | http://10.20.30.45:4007/editorial, сессия владельца Postiz |
+| Повторный вход в MAX | Кнопка «Вход в MAX» в Postiz, тот же закрытый origin |
+| Внутренний health редакции | `http://127.0.0.1:8092/health` на VM; отдельной панели нет |
+| Проверка компонентов | `.venv/bin/python deployment/linux/check-stack.py` из корня VM |
+
+Внутренний API 8092 не открывают как пользовательскую панель. BFF Postiz
+проверяет cookie и закреплённого владельца; машинный ключ остаётся на сервере.
+Доступ к Postiz — из LAN/VPN. Секреты и приватные SSH-настройки хранятся
+в игнорируемых файлах, отдельно от исходников.
+
+Штатный запуск подготовленного сервиса — через systemd; общая пауза и настройки
+сохраняются в PostgreSQL. Не запускать параллельно старый Hub, desktop worker
+или второй `editorial-agent serve`. Журнал, отмены, hashes и старые результаты
+доставок сохранены; их наличие не доказывает новую публикацию после переключения.
+
+Порядок миграции, backup и отката приведён в основной инструкции. Старый JSON
+после переноса журнала не возвращают как авторитетное состояние. Проверка
+инфраструктуры и inference не заменяет exact MAX, verified dispatch и PUBLISHED.
+
+<details>
+<summary>История переноса 14–17 октября: прежние адреса Hub и Windows-снимок</summary>
+
+Ниже сохранён датированный отчёт старой установки. Его команды и адреса не
+являются текущим способом развёртывания и не выполняются на действующей VM
+по умолчанию. Для новой установки используется инструкция 0.7.0 выше.
+
 14 октября 2026, Europe/Moscow. Проект 0.5.0 перенесён в VM 112 на
 Proxmox. Существующая LLM продолжает работать на прежнем сервере.
 Reddit OAuth и полностью автоматическая публикация пока не включены.
@@ -140,3 +179,5 @@ MAX adapter не подтверждено. Режим десяти отдель�
 - [Next.js serverExternalPackages](https://nextjs.org/docs/app/api-reference/config/next-config-js/serverExternalPackages)
 - [Chromium и AppArmor](https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md)
 - [HTTP server LanguageTool](https://dev.languagetool.org/http-server)
+
+</details>

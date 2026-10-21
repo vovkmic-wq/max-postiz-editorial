@@ -197,6 +197,19 @@ test('native React records escape titles, reject unsafe URLs, loading page has R
   }
   assert.notEqual(ui.readableTime(1761080400), '—'); assert.equal(ui.readableTime(undefined), '—');
 });
+test('MAX login link supplies the exact root-relative noVNC WebSocket proxy path', () => {
+  const React = require(path.join(tooling, 'react'));
+  const ui = loadModule('editorial-panel.tsx', { react: React, 'react/jsx-runtime': require(path.join(tooling, 'react/jsx-runtime')),
+    './editorial-form': formApi, './editorial.module.css': new Proxy({}, { get: (_, key) => String(key) }) });
+  const url = new URL(ui.OWNER_BROWSER_URL, 'http://postiz.test:4007');
+  assert.equal(url.pathname, '/owner-browser/vnc.html');
+  assert.equal(url.searchParams.get('autoconnect'), '1'); assert.equal(url.searchParams.get('resize'), 'scale');
+  assert.equal(url.searchParams.get('path'), 'owner-browser/websockify');
+  // Установленный noVNC добавляет '/' перед path, а не перед каталогом vnc.html.
+  assert.equal(new URL('/' + url.searchParams.get('path'), url.origin).pathname, '/owner-browser/websockify');
+  const source = fs.readFileSync(path.join(__dirname, 'editorial-panel.tsx'), 'utf8');
+  assert.ok(source.includes('path=owner-browser/websockify')); assert.ok(source.includes('href={OWNER_BROWSER_URL}'));
+});
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'postiz-editorial-'));
   const api = `import { Module } from '@nestjs/common';\nimport { ExistingController } from '@gitroom/backend/api/routes/existing.controller';\nconst authenticatedController = [ExistingController];\nexport class ApiModule { configure(consumer: any) { consumer.apply('AuthMiddleware').forRoutes(...authenticatedController); } }`;

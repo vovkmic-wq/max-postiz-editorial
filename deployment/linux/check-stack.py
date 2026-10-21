@@ -39,6 +39,22 @@ def tcp(host: str, port: int) -> tuple[bool, str]:
         return False, type(exc).__name__
 
 
+def editorial_health() -> tuple[bool, str]:
+    """HTTP 200 у временного API-only не доказывает работу автономного процесса."""
+    ok, detail, raw = http("http://127.0.0.1:8092/health")
+    if not ok:
+        return False, detail
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return False, "EDITORIAL_HEALTH_INVALID"
+    if (not isinstance(value, dict) or value.get("status") != "ready"
+            or value.get("interface") != "postiz_only"
+            or value.get("worker_mode") != "autonomous"):
+        return False, "EDITORIAL_AUTONOMOUS_REQUIRED"
+    return True, "ready postiz_only autonomous"
+
+
 def postiz_api(root: Path) -> tuple[bool, str]:
     """Exercise the configured authenticated read API without constructing the Hub/DB."""
     safe_errors = {
@@ -78,7 +94,7 @@ def main() -> int:
         report[name] = {"ok": ok, "detail": detail}
 
     for unit in (
-        "docker.service", "nginx.service", "max-postiz-hub.service",
+        "docker.service", "nginx.service", "max-postiz-editorial.service",
         "max-postiz-opencode.service", "max-postiz-spelling.service",
         "max-postiz-display.service", "max-postiz-vnc.service",
         "max-postiz-novnc.service", "max-postiz-translation.service",
@@ -88,6 +104,13 @@ def main() -> int:
         record(f"service:{unit}", enabled and enabled_value == "enabled"
                and active and active_value == "active",
                f"enabled={enabled_value or '?'} active={active_value or '?'}")
+
+    # Старый Hub не должен самозапуститься рядом с единственным новым worker.
+    _, old_enabled = command("systemctl", "is-enabled", "max-postiz-hub.service")
+    _, old_active = command("systemctl", "is-active", "max-postiz-hub.service")
+    record("retired:max-postiz-hub.service",
+           old_enabled in {"disabled", "masked", "not-found"} and old_active in {"inactive", "unknown"},
+           f"enabled={old_enabled or '?'} active={old_active or '?'}")
 
     expected_containers = (
         "max-postiz-hub-postgres-1", "max-postiz-postiz-postgres-1",
@@ -108,7 +131,6 @@ def main() -> int:
             record(f"container:{name}", False, "Docker state unavailable")
 
     for name, url in (
-        ("hub", "http://10.20.30.45:8090/hub"),
         ("postiz", "http://10.20.30.45:4007/auth/login"),
         ("opencode", "http://127.0.0.1:4108/global/health"),
         ("spelling", "http://127.0.0.1:8010/v2/languages"),
@@ -118,6 +140,9 @@ def main() -> int:
     ):
         ok, detail, _ = http(url)
         record(f"http:{name}", ok, detail)
+
+    ok, detail = editorial_health()
+    record("http:editorial", ok, detail)
 
     ok, detail = postiz_api(Path(__file__).resolve().parents[2])
     record("api:postiz_posts", ok, detail)

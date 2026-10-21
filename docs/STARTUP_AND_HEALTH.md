@@ -1,5 +1,53 @@
 # Автозапуск редакции и проверка после загрузки сервера
 
+## Действующий профиль: Postiz-only, 0.7.0
+
+Основная инструкция — [автономная редакция на VM](VM_EDITORIAL.md).
+Пользователь открывает [Postiz → «Редакция»](http://10.20.30.45:4007/editorial),
+где доступны запуск, общая пауза, настройки, ошибки и история.
+`max-postiz-editorial.service` запускает один `editorial-agent` с обработчиком;
+`max-postiz-hub.service` отключён, старый внешний 8090 снят. Desktop heartbeat
+и отдельный Hub worker не запускаются параллельно.
+
+На VM после загрузки:
+
+```sh
+cd /opt/max-postiz
+systemctl status max-postiz-editorial.service --no-pager
+.venv/bin/python deployment/linux/check-stack.py
+.venv/bin/editorial-agent status
+```
+
+С Windows из корня проекта:
+
+```powershell
+.\scripts\check-startup.ps1
+```
+
+Обновлённый [check-stack.py](../deployment/linux/check-stack.py) по умолчанию
+выполняет только проверки служб, Docker, TCP и GET. Он требует активный новый
+сервис, отключённый Hub и `/health` на 8092 со значениями `status=ready`,
+`interface=postiz_only`, `worker_mode=autonomous`. Режим `api_only` годится
+для проверки подключения при миграции, но не считается готовым автономным циклом.
+Сохраняются authenticated GET Postiz и проверки доступности моделей.
+
+`--deep` на VM или `-Deep` в PowerShell дополнительно выполняет inference.
+Не включайте его по умолчанию во время подготовки статьи. Ни один healthcheck
+не доказывает доставку: нужны точный текст в MAX, verified dispatch и Postiz
+PUBLISHED. Не повторять `sending/unknown` из-за перезапуска или зелёного health.
+
+Общая пауза хранится в PostgreSQL и сохраняется после перезапуска сервиса.
+Проверки и запуск systemd не заменяют управление циклом в Postiz. При сбое
+сначала сверить журнал и leases; историю и очереди не удалять. Приватные
+результаты диагностики сохранять только в игнорируемом `data/`.
+
+<details>
+<summary>История 15–19 октября: прежние профили Hub, human approval и проверки</summary>
+
+Ниже сохранены результаты и инструкции прошлых версий. Они не описывают
+действующий Postiz-only профиль и не являются командами запуска по умолчанию.
+Изменение текущей политики и восстановление выполняются по инструкции 0.7.0.
+
 Обновление **19 октября 2026, 22:37 МСК**: на VM подтверждён пакет 0.6.15,
 412 offline тестов и 28/28 проверок компонентов. Один dispatch-only worker,
 те же модели/очереди/контейнеры, все адресаты paused. Новый путь передаёт валидный
@@ -176,3 +224,5 @@ Postiz, OpenCode, LanguageTool, model-router и backend Ministral, наличи�
 в `/root/109.conf.before-editorial-autostart-*` и
 `/root/112.conf.before-editorial-autostart-*`. Секреты, cookies и runtime
 отчёты не входят в исходный архив.
+
+</details>

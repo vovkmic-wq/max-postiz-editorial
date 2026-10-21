@@ -39,6 +39,24 @@ def test_gateway_http_is_diagnostic_only_not_an_application_readiness_requiremen
         "core_services_unreachable_gateway_http_reachable")
 
 
+@pytest.mark.parametrize("postiz_reachable", [False, True])
+def test_retired_hub_is_never_probed_but_public_postiz_remains_required(postiz_reachable):
+    contacted = []
+
+    def probe(target, *_):
+        contacted.append((target["host"], target["port"]))
+        # Закрытые старые Hub-порты не должны превращать исправную сеть в сбой.
+        assert target["port"] not in {8090, 8091}
+        reachable = postiz_reachable if target["service"] == "postiz" else True
+        return {**target, "reachable": reachable, "error": None, "elapsed_ms": 0}
+
+    report = network.diagnose(probe=probe)
+    assert report["ok"] is postiz_reachable
+    assert ("10.20.30.45", 4007) in contacted
+    assert ("10.20.30.45", 22) in contacted
+    assert all(item["service"] != "hub" for item in report["paths"]["default"]["checks"])
+
+
 class Socket:
     def __init__(self, failure=None, phase="connect"):
         self.calls, self.failure, self.phase = [], failure, phase
@@ -124,10 +142,10 @@ def test_forced_diagnosis_retains_default_failures_and_separately_proves_selecte
     assert report["ok"] is True and report["selected_path"] == "forced_interface"
     assert not report["paths"]["default"]["summary"]["core_reachable"]
     assert report["paths"]["forced_interface"]["summary"]["core_reachable"]
-    assert len(calls) == 18
+    assert len(calls) == 16
     assert {(item[0], item[1]) for item in calls} == {
         ("10.20.30.142", 22), ("10.20.30.142", 8006), ("10.20.30.45", 22),
-        ("10.20.30.45", 8090), ("10.20.30.45", 4007), ("10.20.30.95", 8083),
+        ("10.20.30.45", 4007), ("10.20.30.95", 8083),
         ("10.20.30.143", 22), ("10.20.30.143", 8086), ("10.20.30.254", 80)}
 
 

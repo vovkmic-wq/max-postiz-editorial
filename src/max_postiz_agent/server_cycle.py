@@ -28,6 +28,22 @@ class ServerCycle:
         self.clock = clock or now
 
     def _phase(self, phase, **details):
+        # Это подсказка панели, а не новый таймер или резервирование часа.
+        next_run = None
+        if phase in {"hour_used", "no_source", "selection_slot_expired", "rejected"}:
+            slot = details.get("slot")
+            if type(slot) is int and slot >= 0:
+                next_run = (slot + 1) * 3600
+        elif phase == "waiting_interval":
+            next_run = details.get("earliest_due_at")
+        elif phase == "waiting_dispatch":
+            result = details.get("result")
+            next_run = result.get("due_at") if isinstance(result, dict) else None
+            if next_run is None:
+                next_run = details.get("due_at")
+        if type(next_run) not in {int, float} or not math.isfinite(next_run) or next_run < 0:
+            next_run = None
+        details["next_run_at"] = next_run
         self.state.phase(phase, **details)
         return {"phase": phase, **details}
 
@@ -77,7 +93,7 @@ class ServerCycle:
         self.state.assert_running()
         self._phase("scheduling", record_id=record["id"], reviewed_hash=hashed, due_at=due)
         result = self.cycle.publish(record["id"], hashed, due_at=due)
-        return self._phase("waiting_dispatch", record_id=record["id"], result=result)
+        return self._phase("waiting_dispatch", record_id=record["id"], result=result, due_at=due)
 
     def _resume_pending(self, record, dispatch_id, settings, policy):
         """Возобновить только прежнюю точную отправку после общей паузы."""
@@ -206,7 +222,8 @@ class ServerCycle:
                 if len(active) == len(exact) == 1 and exact[0]["state"] == "pending":
                     self._resume_pending(match, exact[0]["id"], settings, policy)
                 result = self.cycle.status(match["id"])
-                return self._phase("waiting_dispatch", record_id=match["id"], result=result)
+                return self._phase("waiting_dispatch", record_id=match["id"], result=result,
+                                   due_at=match.get("due_at"))
             return self._phase("blocked", last_error={"code": "ARTICLE_OUTSTANDING_DELIVERY"})
         # Сначала сверяем прежний исход. status не вызывает новую отправку.
         unfinished = [r for r in ledger["records"] if r["state"] not in TERMINAL | {"automatic_ready"}]

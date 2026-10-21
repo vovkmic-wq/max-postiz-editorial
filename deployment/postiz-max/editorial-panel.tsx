@@ -4,6 +4,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { EditorialForm, EditorialSettings, formFromSettings, safeSourceUrl, settingsFromForm } from './editorial-form';
 import styles from './editorial.module.css';
 
+// noVNC строит WebSocket URL от корня origin; префикс закрытого прокси задаём явно.
+export const OWNER_BROWSER_URL = '/owner-browser/vnc.html?autoconnect=1&resize=scale&path=owner-browser/websockify';
+
 type Recent = { id: string; title?: string; source?: string; state?: string; updated_at?: string | number; url?: string; error?: string };
 type State = {
   revision: number; paused: boolean; phase?: string; updated_at?: string | number; next_run_at?: string | number;
@@ -137,7 +140,7 @@ export function EditorialPanel() {
         <button className={`${styles.button} ${styles.primary}`} disabled={pending || !state || !state.paused || dirty} onClick={() => control('start')}>Запустить цикл</button>
         <button className={`${styles.button} ${styles.danger}`} disabled={pending || !state || state.paused} onClick={() => control('pause')}>Поставить на паузу</button>
         <button className={styles.button} disabled={pending} onClick={() => perform(() => Promise.resolve())}>Обновить статус</button>
-        <a className={styles.button} href="/owner-browser/vnc.html?autoconnect=1&resize=scale">Вход в MAX</a>
+        <a className={styles.button} href={OWNER_BROWSER_URL}>Вход в MAX</a>
       </div><p className={styles.muted}>Пауза сохраняет черновики и историю. Отправка с неизвестным исходом требует сверки и не повторяется автоматически.</p>
     </section>
     <section className={styles.card} aria-labelledby="settings-heading"><h2 id="settings-heading">Источники и отбор</h2>

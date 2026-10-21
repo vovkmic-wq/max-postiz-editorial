@@ -15,5 +15,5 @@ value = json.loads(path.read_text())
 value['max']['browser']['channel'] = 'chrome'
 path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
 PY
-# Chromium sandboxing remains enabled; no global AppArmor/sysctl relaxation.
-systemctl restart max-postiz-hub
+# Sandbox сохранён. Не включаем остановленную редакцию и не запускаем старый Hub.
+systemctl try-restart max-postiz-editorial.service
