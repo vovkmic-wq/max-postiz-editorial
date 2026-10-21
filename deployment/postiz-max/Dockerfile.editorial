@@ -1,0 +1,11 @@
+# Перед сборкой сверить image ID с editorial-manifest.json; контейнеры здесь не запускаются.
+FROM max-postiz-linux:0.5.1
+ARG PUBLIC_ORIGIN
+ENV MAIN_URL=$PUBLIC_ORIGIN FRONTEND_URL=$PUBLIC_ORIGIN NEXT_PUBLIC_BACKEND_URL=$PUBLIC_ORIGIN/api
+ENV NODE_OPTIONS=--max-old-space-size=6144 NEXT_TELEMETRY_DISABLED=1
+COPY editorial-manifest.json patch-editorial.cjs build-editorial-image.cjs editorial.controller.ts editorial.page.tsx editorial-panel.tsx editorial-form.ts editorial.module.css test-editorial-contract.cjs /adapter-editorial/
+# Компилируем только новый controller и его регистрацию: сохранены прежние CAS и transport guards.
+RUN node /adapter-editorial/patch-editorial.cjs && node /adapter-editorial/test-editorial-contract.cjs
+WORKDIR /app
+# Нативная страница входит в обычную сборку Next; iframe и отдельной панели нет.
+RUN test -n "$PUBLIC_ORIGIN" && pnpm --filter ./apps/frontend exec next build --webpack

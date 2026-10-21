@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 
 from max_postiz_agent.db import Base
 from max_postiz_agent import hub_models  # noqa: F401
+from max_postiz_agent import server_models  # noqa: F401
 
 url = os.environ.get("DATABASE_URL")
 connection = context.config.attributes.get("connection")

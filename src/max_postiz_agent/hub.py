@@ -334,6 +334,8 @@ class HubService(Service):
 
     def approve_hourly_policy(self, ident, revision, body_hash, due_at):
         from .automatic_policy import POLICY_ACTOR
+        from .server_state import require_running
+        require_running(self)
         return self._approve_variant(ident, revision, body_hash, due_at, POLICY_ACTOR, automatic=True)
 
     def _check_schedule_limits(self, session, variant, target, due_at, *, automatic_policy=None):
@@ -388,6 +390,9 @@ class HubService(Service):
             raise AgentError("SCHEDULE_INVALID")
         due_at = float(due_at)
         with self.db.session.begin() as s:
+            from .server_state import require_running
+            # Общая пауза и согласование берут Control раньше Variant/Target.
+            require_running(self, s, lock=True)
             v = self._variant(s, ident, True)
             t = s.scalar(select(Target).where(Target.id == v.target_id).with_for_update())
             snapshot = self.snapshot(v, t)
@@ -532,6 +537,8 @@ class HubService(Service):
         return Delivery("awaiting_manual")
 
     def _send(self, d, t):
+        from .server_state import require_running
+        require_running(self)
         self.bridge.guard_send(d, t)
         snap = d.snapshot
         if t.route == "manual":
@@ -560,6 +567,13 @@ class HubService(Service):
         raise AgentError("TARGET_ROUTE_UNSUPPORTED")
 
     def publish_due(self, *, human_hourly_only=False, hourly_only=False):
+        from .server_state import require_running
+        try:
+            require_running(self)
+        except AgentError as exc:
+            if exc.code == "EDITORIAL_PAUSED":
+                return 0
+            raise
         completed = 0
         scope = None
         if human_hourly_only or hourly_only:
@@ -586,6 +600,12 @@ class HubService(Service):
             s.execute(expired.values(state="unknown", error="SEND_LEASE_EXPIRED"))
         for _ in range(50):
             with self.db.session.begin() as s:
+                try:
+                    require_running(self, s, lock=True)
+                except AgentError as exc:
+                    if exc.code == "EDITORIAL_PAUSED":
+                        break
+                    raise
                 query = select(Dispatch).join(Variant).join(Target).where(
                     Dispatch.state.in_({"pending", "retry_wait"}), Target.paused.is_(False),
                     or_(Dispatch.due_at <= now(), Target.route == "postiz")).order_by(Dispatch.due_at)

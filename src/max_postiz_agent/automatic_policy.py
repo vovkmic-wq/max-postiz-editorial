@@ -159,6 +159,8 @@ def check_approval(core, session, variant, target, dispatch, approval, evidence,
 
 
 def publish(cycle, record, ledger, reviewed_hash, due_at):
+    from .server_state import require_running
+    require_running(cycle.core)
     core, policy = cycle.core, cycle._policy()
     if policy.get("approval_mode") != "automatic":
         raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)

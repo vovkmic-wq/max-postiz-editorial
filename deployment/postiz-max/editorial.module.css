@@ -1,0 +1,28 @@
+.panel { max-width: 1120px; margin: 0 auto; padding: 32px 24px; color: var(--new-text-primary, #e5e7eb); }
+.header, .actions, .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.header { justify-content: space-between; margin-bottom: 24px; }
+.panel h1 { font-size: 28px; font-weight: 650; margin: 0; }
+.panel h2 { font-size: 19px; font-weight: 600; margin: 0 0 18px; }
+.muted { color: #a5adba; font-size: 14px; line-height: 1.6; }
+.card { border: 1px solid #475569; background: #17202d; border-radius: 12px; padding: 22px; margin-bottom: 20px; }
+.badge { display: inline-block; border: 1px solid #64748b; border-radius: 999px; padding: 4px 12px; font-size: 14px; }
+.running { background: #134e4a; color: #ccfbf1; }
+.paused { background: #334155; color: #e2e8f0; }
+.notice { border: 1px solid #b45309; background: #422006; color: #ffedd5; border-radius: 8px; padding: 12px; margin: 14px 0; white-space: pre-wrap; }
+.error { border-color: #b91c1c; background: #450a0a; color: #fee2e2; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 18px; }
+.field { display: flex; flex-direction: column; gap: 7px; font-size: 14px; }
+.field input, .field textarea, .field select { color: #f8fafc; background: #0f172a; border: 1px solid #64748b; border-radius: 7px; padding: 10px; width: 100%; }
+.field textarea { min-height: 85px; resize: vertical; }
+.button { border: 1px solid #64748b; border-radius: 7px; background: #334155; padding: 9px 15px; color: #f8fafc; cursor: pointer; }
+.primary { background: #2563eb; border-color: #3b82f6; }
+.danger { background: #7f1d1d; border-color: #b91c1c; }
+.button:disabled { opacity: .5; cursor: not-allowed; }
+.tableWrap { overflow-x: auto; }
+.table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table th, .table td { text-align: left; padding: 12px 8px; border-bottom: 1px solid #334155; vertical-align: top; }
+.table a { color: #93c5fd; text-decoration: underline; }
+.table th { color: #cbd5e1; }
+.detail { display: block; margin-top: 5px; font-size: 12px; color: #a5adba; }
+.srOnly { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+@media (max-width: 600px) { .panel { padding: 20px 12px; } .card { padding: 16px; } }

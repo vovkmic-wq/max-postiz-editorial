@@ -62,6 +62,10 @@ class HourlyArticleCycle:
         return policy
 
     def _load(self):
+        from .server_state import DatabaseArticleLedger
+        database = DatabaseArticleLedger(self).load()
+        if database is not None:
+            return database
         try:
             value = json.loads(self.ledger_path.read_text(encoding="utf-8")) if self.ledger_path.exists() else {"records": []}
             if set(value) != {"records"} or not isinstance(value["records"], list):
@@ -73,6 +77,9 @@ class HourlyArticleCycle:
             raise AgentError("ARTICLE_LEDGER_INVALID", 409) from exc
 
     def _save(self, ledger):
+        from .server_state import DatabaseArticleLedger
+        if DatabaseArticleLedger(self).save(ledger):
+            return
         temporary = self.ledger_path.with_suffix(".new")
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -376,6 +383,8 @@ class HourlyArticleCycle:
                 raise AgentError("ARTICLE_CANDIDATE_RETRY_REQUIRED", 409)
             self._validate_correction(candidate)
         with profile_lock(self.directory / "cycle.lock"):
+            from .server_state import require_running
+            require_running(self.core)
             policy = self._policy()
             source, target = self._source_target(policy)
             article = self._article(article, policy, source, target)
@@ -478,6 +487,8 @@ class HourlyArticleCycle:
 
     def _store_prepared(self, article, prepared, record, ledger, policy, source, target,
                         provenance, attempt=None, *, check_slot=True):
+        from .server_state import require_running
+        require_running(self.core)
         attempt = attempt or {}
         original_hash = record["original_hash"]
         material_hash = fingerprint(" ".join(article["original"].casefold().split()))

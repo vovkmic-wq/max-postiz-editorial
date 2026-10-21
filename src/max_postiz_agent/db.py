@@ -317,6 +317,7 @@ class Database:
     # Создаём отсутствующие настройки или структуру хранения.
     def initialize(self):
         from . import hub_models  # noqa: F401 -- register hub tables before either backend
+        from . import server_models  # noqa: F401 -- постоянное управление автономной редакцией
         if self.engine.dialect.name == "postgresql":
             from alembic import command
             from alembic.config import Config
@@ -359,6 +360,8 @@ class Database:
             "material_media",
             "hub_bridge_posts",
             "hub_reddit_submissions",
+            "editorial_control",
+            "editorial_article_ledger",
         }:
             raise AgentError("BACKUP_SCHEMA_MISMATCH")
         data = {name: data.get(name, []) for name in Base.metadata.tables}
