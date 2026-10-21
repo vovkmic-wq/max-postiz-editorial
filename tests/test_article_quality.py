@@ -5,9 +5,14 @@ import pytest
 
 from max_postiz_agent.article_quality import (
     MAGELLANIC_EVIDENCE,
+    SPACETIME_EVIDENCE,
+    SPACETIME_SOURCE_CONTEXT,
+    SPACETIME_SOURCE_TERM,
+    FRESH_SPACETIME_SPELLING_CONTRACT,
     ArticleQuality,
     adjudicate_scientific_spelling,
     canonical_article_url,
+    spacetime_spelling_evidence,
 )
 from max_postiz_agent.config import AgentError
 
@@ -380,6 +385,172 @@ def test_scientific_adjudication_preserves_raw_trace_and_other_findings_still_bl
             check.prepare("Observations of a nearby galaxy", original, URL)
     finally:
         check.close()
+
+
+SPACETIME_ORIGINAL = ("These systems are called extreme mass ratio inspirals. The ergosphere is a region "
+                      "around a rotating black hole where space-time is dragged along with the black hole as it turns.")
+SPACETIME_TITLE = "Вращение чёрной дыры"
+SPACETIME_BODY = ("Эргосфера — область вокруг вращающейся чёрной дыры, в которой пространство-время "
+                  "уносится вместе с чёрной дырой по мере её вращения.")
+
+
+def spacetime_match(text):
+    start = text.index("пространство-")
+    return {"offset": len(text[:start].encode("utf-16-le")) // 2, "length": len("пространство-время"),
+        "message": "Unknown scientific term.", "type": {"typeName": "UnknownWord"},
+        "rule": {"id": "MORFOLOGIK_RULE_RU_RU", "issueType": "misspelling", "category": {"id": "TYPOS"}}}
+
+
+def test_spacetime_exception_requires_exact_source_context_and_preserves_raw_finding():
+    text = SPACETIME_TITLE + "\n\n" + SPACETIME_BODY
+    match = spacetime_match(text)
+    evidence = spacetime_spelling_evidence(SPACETIME_ORIGINAL, text, match)
+    assert evidence == {"match": match, "word": "пространство-время",
+        "phrase": "в которой пространство-время уносится вместе с чёрной дырой по мере её вращения",
+        "source_term": SPACETIME_SOURCE_TERM, "source_context": SPACETIME_SOURCE_CONTEXT,
+        "evidence_url": SPACETIME_EVIDENCE, "reason": "SOURCE_BOUND_VERIFIED_SCIENTIFIC_TERM"}
+    evidence["match"]["rule"]["category"]["id"] = "changed-copy"
+    assert match["rule"]["category"]["id"] == "TYPOS"
+    accepted, unresolved = adjudicate_scientific_spelling(SPACETIME_ORIGINAL, text, [match], allow_spacetime=True)
+    assert unresolved == [] and accepted[0]["match"] == match
+
+
+def test_spacetime_exception_uses_utf16_and_never_a_python_index_fallback():
+    text = "🌌 " + SPACETIME_BODY
+    match = spacetime_match(text)
+    assert spacetime_spelling_evidence(SPACETIME_ORIGINAL, text, match)
+    assert spacetime_spelling_evidence(SPACETIME_ORIGINAL, text,
+        {**match, "offset": text.index("пространство-время")}) is None
+
+
+@pytest.mark.parametrize("original", [
+    "Scientists study space-time near black holes.",
+    SPACETIME_ORIGINAL.replace("extreme mass ratio inspirals", "extreme mass ratio orbits"),
+    SPACETIME_ORIGINAL.replace("where space-time is dragged along", "where matter is dragged along"),
+    SPACETIME_ORIGINAL.replace("as it turns.", "as it grows."),
+    SPACETIME_ORIGINAL.replace("extreme mass ratio inspirals", "nonextreme mass ratio inspirals"),
+    SPACETIME_ORIGINAL.replace("where space-time", "elsewhere space-time"),
+    SPACETIME_ORIGINAL.replace("as it turns.", "as it turns.suffix"),
+    SPACETIME_SOURCE_CONTEXT,
+    SPACETIME_SOURCE_TERM,
+])
+def test_spacetime_exception_rejects_missing_changed_or_embedded_source_context(original):
+    assert spacetime_spelling_evidence(original, SPACETIME_BODY, spacetime_match(SPACETIME_BODY)) is None
+
+
+@pytest.mark.parametrize("text", [
+    "Учёные изучают пространство-время.",
+    SPACETIME_BODY.replace("в которой", "нев которой"),
+    SPACETIME_BODY.replace("пространство-время", "непространство-время"),
+    SPACETIME_BODY.replace("пространство-время", "пространство-времяподобное"),
+    SPACETIME_BODY.replace("пространство-время", "пространство-временной"),
+    SPACETIME_BODY.replace("уносится", "не уносится"),
+    SPACETIME_BODY.replace("чёрной дырой", "чёрной звездой"),
+    SPACETIME_BODY.replace("по мере её вращения", "по мере её роста"),
+    SPACETIME_BODY.replace("по мере её вращения", "по мере её вращенияподобного"),
+])
+def test_spacetime_exception_rejects_wrong_token_context_and_boundaries(text):
+    assert spacetime_spelling_evidence(SPACETIME_ORIGINAL, text, spacetime_match(text)) is None
+
+
+@pytest.mark.parametrize("change", [
+    {"offset": 0}, {"offset": -1}, {"offset": True}, {"offset": 60.0}, {"offset": "60"},
+    {"length": 17}, {"length": 19}, {"length": True}, {"length": 18.0}, {"length": "18"},
+    {"type": {"typeName": "Other"}}, {"type": None},
+    {"rule": {"id": "OTHER", "issueType": "misspelling", "category": {"id": "TYPOS"}}},
+    {"rule": {"id": "MORFOLOGIK_RULE_RU_RU", "issueType": "grammar", "category": {"id": "TYPOS"}}},
+    {"rule": {"id": "MORFOLOGIK_RULE_RU_RU", "issueType": "misspelling", "category": {"id": "GRAMMAR"}}},
+    {"rule": {"id": "MORFOLOGIK_RULE_RU_RU", "issueType": "misspelling"}},
+    {"rule": None},
+])
+def test_spacetime_exception_rejects_wrong_positions_types_and_grammar_rules(change):
+    match = {**spacetime_match(SPACETIME_BODY), **change}
+    accepted, unresolved = adjudicate_scientific_spelling(SPACETIME_ORIGINAL, SPACETIME_BODY, [match], allow_spacetime=True)
+    assert accepted == [] and unresolved == [match]
+
+
+@pytest.mark.parametrize("route", ["prepare", "candidate"])
+def test_spacetime_adjudication_keeps_trace_and_other_grammar_errors_blocking(route):
+    text = SPACETIME_TITLE + "\n\n" + SPACETIME_BODY
+    match = spacetime_match(text)
+    events = []
+    def checker(matches):
+        return ArticleQuality(Model({"title": SPACETIME_TITLE, "body": SPACETIME_BODY}), Model({**APPROVAL, "warnings": []}),
+            trace=events.append, review_rubric="meaning-first-v1", transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, json={"matches": matches})))
+
+    check = checker([match])
+    try:
+        if route == "prepare":
+            prepared = check.prepare("Extreme mass ratio inspirals", SPACETIME_ORIGINAL,
+                                      "https://svs.gsfc.nasa.gov/5586/")
+        else:
+            prepared = check.check_candidate(SPACETIME_TITLE, SPACETIME_BODY,
+                "Extreme mass ratio inspirals", SPACETIME_ORIGINAL, "https://svs.gsfc.nasa.gov/5586/")
+    finally:
+        check.close()
+    assert prepared["machine_review_status"] == "passed"
+    proof = prepared["machine_review_evidence"]
+    assert proof["fresh_spelling_contract"] == FRESH_SPACETIME_SPELLING_CONTRACT
+    assert proof["spelling_matches"] == [match] and proof["spelling_unresolved"] == []
+    assert proof["spelling_adjudicated"][0]["evidence_url"] == SPACETIME_EVIDENCE
+    assert next(event for event in events if event["phase"] == "spelling_returned")["matches"] == [match]
+    grammar = {"offset": 0, "length": 5, "message": "Actual gender agreement error.",
+               "type": {"typeName": "Other"},
+               "rule": {"id": "Unify_Adj_NN_gender", "issueType": "uncategorized", "category": {"id": "GRAMMAR"}}}
+    check = checker([match, grammar])
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.check_candidate(SPACETIME_TITLE, SPACETIME_BODY,
+                "Extreme mass ratio inspirals", SPACETIME_ORIGINAL, "https://svs.gsfc.nasa.gov/5586/")
+    finally:
+        check.close()
+
+
+def test_spacetime_is_not_enabled_by_default_or_by_a_truthy_non_boolean_flag():
+    match = spacetime_match(SPACETIME_BODY)
+    for flag in (False, None, 1, "true"):
+        assert adjudicate_scientific_spelling(SPACETIME_ORIGINAL, SPACETIME_BODY, [match],
+                                             allow_spacetime=flag) == ([], [match])
+    assert adjudicate_scientific_spelling(SPACETIME_ORIGINAL, SPACETIME_BODY, [match]) == ([], [match])
+
+
+def test_legacy_human_rubric_keeps_spacetime_finding_blocking():
+    match = spacetime_match(SPACETIME_TITLE + "\n\n" + SPACETIME_BODY)
+    check = quality(matches=[match])
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.check_candidate(SPACETIME_TITLE, SPACETIME_BODY, "Extreme mass ratio inspirals",
+                SPACETIME_ORIGINAL, "https://svs.gsfc.nasa.gov/5586/")
+    finally:
+        check.close()
+
+
+@pytest.mark.parametrize("route", ["protocol", "mur"])
+def test_saved_review_recoveries_cannot_reclassify_new_spacetime_finding(route):
+    source = SPACETIME_ORIGINAL + " Scientists also use the Multi-scale Ultra-high Resolution (MUR) Sea Surface Temperature Analysis."
+    body = SPACETIME_BODY + " Учёные также используют данные многомасштабного анализа температуры поверхности моря."
+    text = SPACETIME_TITLE + "\n\n" + body
+    match = spacetime_match(text)
+    translator, reviewer, events, requests = Model("No inference"), Model("No inference"), [], []
+
+    def spelling(request):
+        requests.append(request)
+        return httpx.Response(200, json={"matches": [match]})
+
+    check = ArticleQuality(translator, reviewer, review_rubric="meaning-first-v1",
+                           trace=events.append, transport=httpx.MockTransport(spelling))
+    raw = json.dumps({**APPROVAL, "warnings": ["Optional advice."] * 4})
+    try:
+        method = check.recover_review_protocol if route == "protocol" else check.recover_scientific_spelling
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            method(SPACETIME_TITLE, body, "Extreme mass ratio inspirals", source,
+                "https://svs.gsfc.nasa.gov/5586/", raw_review=raw, expected_review_prompt_hash=check.review_prompt_hash)
+    finally:
+        check.close()
+    assert len(requests) == 1 and not translator.prompts and not reviewer.prompts
+    decision = next(event for event in events if event["phase"] == "spelling_adjudicated")
+    assert decision["adjudicated"] == [] and decision["unresolved"] == [match]
 
 
 def test_exact_editorial_candidate_is_checked_without_translator_call():

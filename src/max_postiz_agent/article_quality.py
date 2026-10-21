@@ -28,6 +28,12 @@ MULTISCALE_SOURCE_TERM = "Multi-scale Ultra-high Resolution (MUR) Sea Surface Te
 MULTISCALE_PHRASE = "многомасштабного анализа"
 RONI_EVIDENCE = "https://public.wmo.int/ru/temy/yavleniya-el-nino-i-la-ninya"
 RONI_SOURCE_TERM = "Relative Oceanic Niño Index (RONI)"
+SPACETIME_EVIDENCE = "https://www.mathnet.ru/tmf6729"
+SPACETIME_SOURCE_CONTEXT = "where space-time is dragged along with the black hole as it turns."
+SPACETIME_SOURCE_TERM = "extreme mass ratio inspirals"
+FRESH_SPACETIME_SPELLING_CONTRACT = "spacetime-fresh-review-v1"
+_SPACETIME_PHRASE = re.compile(r"(?<![\w-])в которой (?P<word>пространство-время) "
+                               r"уносится вместе с чёрной дырой по мере её вращения(?![\w-])")
 _RONI_PHRASE = re.compile(r"(?<![\w-])(?:[Оо]тносительного океанического индекса|"
                           r"[Оо]тносительный океанический индекс) (?P<word>Ниньо) \(RONI\)(?![\w-])")
 MAX_REVIEW_ISSUES = 3
@@ -254,14 +260,42 @@ def roni_spelling_evidence(original, translated, match):
     return None
 
 
-def adjudicate_scientific_spelling(original, translated, matches):
+def spacetime_spelling_evidence(original, translated, match):
+    """Resolve one exact scientific token in the verified EMRI source context."""
+    if not isinstance(original, str) or not isinstance(translated, str) or not isinstance(match, dict):
+        return None
+    rule, kind = match.get("rule"), match.get("type")
+    offset, length = match.get("offset"), match.get("length")
+    if (not isinstance(rule, dict) or rule.get("id") != "MORFOLOGIK_RULE_RU_RU"
+            or rule.get("issueType") != "misspelling" or not isinstance(rule.get("category"), dict)
+            or rule["category"].get("id") != "TYPOS"
+            or not isinstance(kind, dict) or kind.get("typeName") != "UnknownWord"
+            or type(offset) is not int or offset < 0 or type(length) is not int or length != len("пространство-время")
+            or any(not re.search(r"(?<![\w-])" + re.escape(term) + r"(?![\w-])", original)
+                   for term in (SPACETIME_SOURCE_CONTEXT, SPACETIME_SOURCE_TERM))):
+        return None
+    for phrase in _SPACETIME_PHRASE.finditer(translated):
+        try:
+            expected = len(translated[:phrase.start("word")].encode("utf-16-le")) // 2
+        except UnicodeError:
+            continue
+        if offset == expected:
+            return {"match": copy.deepcopy(match), "word": "пространство-время", "phrase": phrase.group(),
+                    "source_term": SPACETIME_SOURCE_TERM, "source_context": SPACETIME_SOURCE_CONTEXT,
+                    "evidence_url": SPACETIME_EVIDENCE, "reason": "SOURCE_BOUND_VERIFIED_SCIENTIFIC_TERM"}
+    return None
+
+
+def adjudicate_scientific_spelling(original, translated, matches, *, allow_spacetime=False):
     """Resolve documented exact scientific terms; retain every other LT finding."""
     adjudicated, unresolved = [], []
     for match in matches:
         rule, kind = match.get("rule"), match.get("type")
         offset, length = match.get("offset"), match.get("length")
         evidence = (multiscale_spelling_evidence(original, translated, match)
-                    or roni_spelling_evidence(original, translated, match))
+                    or roni_spelling_evidence(original, translated, match)
+                    or (spacetime_spelling_evidence(original, translated, match)
+                        if allow_spacetime is True else None))
         if (isinstance(rule, dict) and rule.get("id") == "MORFOLOGIK_RULE_RU_RU"
                 and rule.get("issueType") == "misspelling"
                 and isinstance(kind, dict) and kind.get("typeName") == "UnknownWord"
@@ -290,11 +324,12 @@ def adjudicate_scientific_spelling(original, translated, matches):
     return adjudicated, unresolved
 
 
-def rubric_spelling(original, translated, matches, rubric):
+def rubric_spelling(original, translated, matches, rubric, *, allow_spacetime=False):
     """Retain style suggestions as audited advice; grammar and unknown rules block."""
     if not isinstance(rubric, str) or rubric not in REVIEW_RUBRICS:
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
-    adjudicated, unresolved = adjudicate_scientific_spelling(original, translated, matches)
+    adjudicated, unresolved = adjudicate_scientific_spelling(original, translated, matches,
+                                                           allow_spacetime=allow_spacetime)
     if rubric == LEGACY_REVIEW_RUBRIC:
         return adjudicated, unresolved
     blocking = []
@@ -404,7 +439,7 @@ class ArticleQuality:
             raise AgentError("ARTICLE_SPELLING_UNAVAILABLE", 503) from exc
 
     def _human_evidence(self, prepared, title, original, reviewed, raw, matches,
-                        adjudicated, unresolved):
+                        adjudicated, unresolved, *, fresh_spelling=False):
         if self.allow_human_rejection or self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC:
             prepared["machine_review_status"] = "passed" if reviewed["approved"] else "rejected"
             prepared["machine_review_evidence"] = {
@@ -421,6 +456,8 @@ class ArticleQuality:
                 prepared["machine_review_evidence"].update(
                     review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash,
                     parser_contract=review_parser_contract(raw))
+                if fresh_spelling is True:
+                    prepared["machine_review_evidence"]["fresh_spelling_contract"] = FRESH_SPACETIME_SPELLING_CONTRACT
         return prepared
 
     def prepare(self, title, original, url):
@@ -530,7 +567,8 @@ class ArticleQuality:
                 self._emit("spelling_failed", attempt, error=exc.code)
                 raise
             self._emit("spelling_returned", attempt, matches=matches)
-            adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric)
+            adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric,
+                allow_spacetime=self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC)
             self._emit("spelling_adjudicated", attempt, adjudicated=adjudicated, unresolved=unresolved)
             passed = reviewed["approved"] and not reviewed["issues"]
             human_rejection = (self.allow_human_rejection and reviewed["approved"] is False
@@ -539,7 +577,7 @@ class ArticleQuality:
                 prepared = {"title": translated["title"], "body": full, "translation": text,
                             "original": source, "url": url, "topic": reviewed["topic"]}
                 self._human_evidence(prepared, title, original, reviewed, raw_review, matches,
-                                     adjudicated, unresolved)
+                                     adjudicated, unresolved, fresh_spelling=True)
                 self._emit("accepted" if passed else "rejected_for_human", attempt, result=prepared)
                 return prepared
             context["repair_feedback"] = {"review_approved": reviewed["approved"],
@@ -611,7 +649,8 @@ class ArticleQuality:
             self._emit("spelling_failed", 1, error=exc.code)
             raise
         self._emit("spelling_returned", 1, matches=matches)
-        adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric)
+        adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric,
+            allow_spacetime=self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC)
         self._emit("spelling_adjudicated", 1, adjudicated=adjudicated, unresolved=unresolved)
         passed = reviewed["approved"] and not reviewed["issues"]
         human_rejection = (self.allow_human_rejection and reviewed["approved"] is False
@@ -624,7 +663,7 @@ class ArticleQuality:
         prepared = {"title": title, "body": full, "translation": text,
                     "original": source, "url": url, "topic": reviewed["topic"]}
         self._human_evidence(prepared, original_title, original, reviewed, raw_review, matches,
-                             adjudicated, unresolved)
+                             adjudicated, unresolved, fresh_spelling=True)
         self._emit("accepted" if passed else "rejected_for_human", 1, mode="candidate", result=prepared)
         return prepared
 

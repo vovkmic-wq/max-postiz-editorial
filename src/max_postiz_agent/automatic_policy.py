@@ -20,12 +20,12 @@ POLICY_ACTOR = "hourly_article_policy"
 
 
 def _validate(evidence, title, body, source):
-    from .article_quality import (MAX_REVIEW_ISSUES, MEANING_FIRST_REVIEW_RUBRIC, TOPICS,
+    from .article_quality import (FRESH_SPACETIME_SPELLING_CONTRACT, MAX_REVIEW_ISSUES, MEANING_FIRST_REVIEW_RUBRIC, TOPICS,
                                   normalize_rubric_review, protocol_recovery_provenance,
                                   review_parser_contract, rubric_spelling, rubric_translation_gate)
     required = {"review_raw", "review", "spelling_matches", "spelling_adjudicated", "spelling_unresolved",
                 "hard_gates_passed", "text_hash", "source_hash", "review_rubric", "review_prompt_hash", "trace_hash"}
-    optional = {"parser_contract", "protocol_recovery"}
+    optional = {"parser_contract", "protocol_recovery", "fresh_spelling_contract"}
     if (not isinstance(evidence, dict) or not required <= set(evidence) <= required | optional
             or evidence["review_rubric"] != MEANING_FIRST_REVIEW_RUBRIC
             or evidence["hard_gates_passed"] is not True
@@ -34,6 +34,10 @@ def _validate(evidence, title, body, source):
                                                        "body": source["body"].strip()})
             or any(not isinstance(evidence[key], str) or not re.fullmatch(r"[0-9a-f]{64}", evidence[key])
                    for key in ("review_prompt_hash", "trace_hash"))):
+        raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
+    if "fresh_spelling_contract" in evidence and (
+            evidence["fresh_spelling_contract"] != FRESH_SPACETIME_SPELLING_CONTRACT
+            or "protocol_recovery" in evidence):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     rubric = evidence["review_rubric"]
     review = normalize_rubric_review(evidence["review"], rubric)
@@ -60,7 +64,8 @@ def _validate(evidence, title, body, source):
     matches = evidence["spelling_matches"]
     if not isinstance(matches, list) or any(not isinstance(value, dict) for value in matches):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
-    adjudicated, unresolved = rubric_spelling(original, candidate, matches, rubric)
+    adjudicated, unresolved = rubric_spelling(original, candidate, matches, rubric,
+        allow_spacetime=evidence.get("fresh_spelling_contract") == FRESH_SPACETIME_SPELLING_CONTRACT)
     if (unresolved or evidence["spelling_adjudicated"] != adjudicated
             or evidence["spelling_unresolved"] != unresolved):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)

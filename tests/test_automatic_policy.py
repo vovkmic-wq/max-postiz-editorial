@@ -97,6 +97,72 @@ def test_automatic_preparation_and_policy_approval_never_claim_human_consent(aut
         assert not session.get(Target, "max").paused
 
 
+@pytest.fixture
+def fresh_spacetime(automatic_cycle, monkeypatch):
+    from test_article_quality import (SPACETIME_BODY, SPACETIME_ORIGINAL, SPACETIME_TITLE, spacetime_match)
+    (cycle, core, article, records, writes, _, _), review = automatic_cycle
+    article.update(title="Extreme mass ratio inspirals", original=SPACETIME_ORIGINAL)
+    reviewer_calls = []
+    match = spacetime_match(SPACETIME_TITLE + "\n\n" + SPACETIME_BODY)
+
+    class FreshReviewer(Model):
+        def generate_text(self, prompt):
+            reviewer_calls.append(json.loads(prompt))
+            return super().generate_text(prompt)
+
+    def quality(record_id=None, review_only=False):
+        assert review_only is False
+        return ArticleQuality(Model({"title": SPACETIME_TITLE, "body": SPACETIME_BODY}, "hy-mt2-7b-q8"),
+            FreshReviewer(copy.deepcopy(review), "ministral"), prompt_dir=core.settings.root / "prompts",
+            trace=cycle._trace_writer(record_id), review_rubric="meaning-first-v1",
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"matches": [match]})))
+
+    monkeypatch.setattr(cycle, "_quality", quality)
+    prepared = cycle.prepare(article)
+    return cycle, core, records, writes, prepared, reviewer_calls, match
+
+
+def test_fresh_spacetime_contract_survives_real_machine_metadata_and_automatic_validation(fresh_spacetime):
+    from max_postiz_agent.article_quality import FRESH_SPACETIME_SPELLING_CONTRACT, SPACETIME_EVIDENCE
+    cycle, core, records, writes, prepared, reviewer_calls, match = fresh_spacetime
+    assert prepared["state"] == "automatic_ready" and len(records) == len(writes) == len(reviewer_calls) == 1
+    with core.db.session() as session:
+        variant = session.get(Variant, prepared["variant_id"])
+        evidence = variant.metadata_json["machine_review_evidence"]
+        assert evidence["fresh_spelling_contract"] == FRESH_SPACETIME_SPELLING_CONTRACT
+        assert evidence["spelling_matches"] == [match] and evidence["spelling_unresolved"] == []
+        assert evidence["spelling_adjudicated"][0]["evidence_url"] == SPACETIME_EVIDENCE
+        assert automatic_evidence(session, variant) is not None
+        assert session.query(TargetApproval).count() == session.query(Dispatch).count() == 0
+    assert cycle._load()["records"][0]["state"] == "automatic_ready"
+
+
+@pytest.mark.parametrize("change", ["missing", "wrong", "boolean", "protocol_recovery"])
+def test_spacetime_evidence_without_exact_fresh_contract_cannot_be_approved(fresh_spacetime, change):
+    _, core, records, writes, prepared, reviewer_calls, _ = fresh_spacetime
+    with core.db.session.begin() as session:
+        variant = session.get(Variant, prepared["variant_id"])
+        evidence = copy.deepcopy(variant.metadata_json["machine_review_evidence"])
+        if change == "missing":
+            evidence.pop("fresh_spelling_contract")
+        elif change == "wrong":
+            evidence["fresh_spelling_contract"] = "future-contract"
+        elif change == "boolean":
+            evidence["fresh_spelling_contract"] = True
+        else:
+            from max_postiz_agent.article_quality import protocol_recovery_provenance, review_parser_contract
+            review = {**evidence["review"], "warnings": ["Optional advice."] * 4}
+            raw = json.dumps(review)
+            evidence.update(review=review, review_raw=raw, parser_contract=review_parser_contract(raw),
+                protocol_recovery=protocol_recovery_provenance(raw, evidence["review_prompt_hash"]))
+        variant.metadata_json = {**variant.metadata_json, "machine_review_evidence": evidence,
+                                 "machine_review_evidence_hash": fingerprint(evidence)}
+    with core.db.session() as session:
+        assert automatic_evidence(session, session.get(Variant, prepared["variant_id"])) is None
+        assert session.query(TargetApproval).count() == session.query(Dispatch).count() == 0
+    assert len(records) == len(writes) == len(reviewer_calls) == 1
+
+
 def test_restricted_worker_delivers_automatic_once_and_pauses_target(automatic_cycle):
     (cycle, core, article, records, _, stamp, _), _ = automatic_cycle
     core.publisher.mode = "browser"

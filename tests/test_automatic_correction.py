@@ -461,7 +461,7 @@ def spelling_case(correction_case, monkeypatch):
     # Reproduce the preceding release's exact sole LT false positive, then
     # restore today's source-bound scientific adjudication for recovery.
     monkeypatch.setattr("max_postiz_agent.article_quality.rubric_spelling",
-                        lambda *args: ([], [match]) if args[2] else rubric_spelling(*args))
+                        lambda *args, **kwargs: ([], [match]) if args[2] else rubric_spelling(*args, **kwargs))
     with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
         run(case, SCIENTIFIC_CORRECTION)
     monkeypatch.setattr("max_postiz_agent.article_quality.rubric_spelling", rubric_spelling)

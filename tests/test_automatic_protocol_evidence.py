@@ -81,8 +81,12 @@ def test_recovery_provenance_is_validated_exactly_including_hashes_limits_and_nu
         protocol = protocol_recovery_provenance(evidence["review_raw"], evidence["review_prompt_hash"])
     # This unit checks the extension validator; the durable old/new trace
     # protocol and fresh LanguageTool flow are exercised by cycle recovery tests.
-    assert replace_evidence(core, prepared["variant_id"],
-        lambda evidence: evidence.update(protocol_recovery=copy.deepcopy(protocol))) is not None
+    # Model protocol-only provenance, without claiming a fresh model review.
+    def protocol_only(evidence):
+        evidence.pop("fresh_spelling_contract", None)
+        evidence.update(protocol_recovery=copy.deepcopy(protocol))
+
+    assert replace_evidence(core, prepared["variant_id"], protocol_only) is not None
     for field, value in [
         ("contract", "unknown"), ("parser_contract_hash", "0" * 64),
         ("raw_review_sha256", "0" * 64), ("review_prompt_hash", "0" * 64),

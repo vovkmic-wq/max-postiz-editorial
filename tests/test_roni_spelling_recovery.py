@@ -44,7 +44,7 @@ def roni_case(automatic_cycle, monkeypatch):
     from max_postiz_agent.article_quality import rubric_spelling
     with monkeypatch.context() as old_release:
         old_release.setattr("max_postiz_agent.article_quality.rubric_spelling",
-                            lambda *args: ([], copy.deepcopy(args[2])) if args[2] else rubric_spelling(*args))
+                            lambda *args, **kwargs: ([], copy.deepcopy(args[2])) if args[2] else rubric_spelling(*args, **kwargs))
         with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
             run(case, RONI)
     saved = case["cycle"]._load()["records"][0]
