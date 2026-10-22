@@ -36,18 +36,19 @@ class Reviewer:
         return response if isinstance(response, str) else json.dumps(response, ensure_ascii=False), {}
 
 
-def dedicated_quality(reviewer, events):
+def dedicated_quality(reviewer, events, *, translation=None, matches=None):
     translations, spelling = [], []
+    translation = TRANSLATION if translation is None else translation
 
     def translate(request):
         value = json.loads(request.content)
         translations.append(value)
         return httpx.Response(200, json={"model": value["model"], "complete": True,
-            "text": TRANSLATION["title"] if value["text"] == TITLE else TRANSLATION["body"]})
+            "text": translation["title"] if value["text"] == TITLE else translation["body"]})
 
     def spell(request):
         spelling.append(request)
-        return httpx.Response(200, json={"matches": []})
+        return httpx.Response(200, json={"matches": [] if matches is None else matches})
 
     translator = DedicatedTranslator(
         {"model": "hy-mt2-7b-q8", "base_url": "http://127.0.0.1:8094"},
@@ -74,7 +75,7 @@ def test_unverifiable_dedicated_review_cannot_be_replaced_by_later_approval(inva
         check.close()
         check.translator.client.close()
     assert len(reviewer.prompts) == 1
-    assert len(translations) == 2  # Exactly one title/body translation; subsequent calls reuse it.
+    assert len(translations) == 2  # Один перевод заголовка и тела, без повторного вызова.
     assert not spelling
     assert not any(event["phase"] == "accepted" for event in events)
     raw = invalid if isinstance(invalid, str) else json.dumps(invalid, ensure_ascii=False)
@@ -82,7 +83,10 @@ def test_unverifiable_dedicated_review_cannot_be_replaced_by_later_approval(inva
     assert events[-1]["feedback"]["raw_review_untrusted"] == raw
     if isinstance(invalid, dict):
         assert events[-1]["feedback"]["review_untrusted"] == invalid
-    assert sum(event["phase"] == "candidate_repeated" for event in events) == 2
+    assert sum(event["phase"] == "translation_started" for event in events) == 1
+    assert not any(event["phase"] == "candidate_repeated" for event in events)
+    assert events[-1]["attempt"] == 1
+    assert any(event["phase"] == "review_invalid" for event in events)
     assert not capsys.readouterr().out
 
 
@@ -105,12 +109,12 @@ def test_negative_dedicated_review_keeps_findings_and_spelling_without_resamplin
         json.dumps(rejection, ensure_ascii=False))
 
 
-def test_changed_candidate_after_unverifiable_review_requires_its_own_review():
+def test_mutable_changed_candidate_after_unverifiable_review_requires_its_own_review():
     revised = {**TRANSLATION, "body": TRANSLATION["body"].replace("фиксировал", "регистрировал")}
 
     class ChangingTranslator(Reviewer):
-        # The immutable marker must block the exact text, not every future candidate.
-        immutable_candidates = True
+        # Эта фикстура действительно исправляет текст, в отличие от DedicatedTranslator.
+        immutable_candidates = False
         model = "dedicated-translation-contract"
 
     translator = ChangingTranslator(TRANSLATION, revised)
@@ -124,8 +128,58 @@ def test_changed_candidate_after_unverifiable_review_requires_its_own_review():
     assert len(reviewer.prompts) == 2
     assert reviewer.prompts[0]["translation_untrusted"] != reviewer.prompts[1]["translation_untrusted"]
     assert reviewer.prompts[1]["translation_untrusted"] == result["translation"]
-    assert translator.prompts[1]["repair_feedback"]["raw_review_untrusted"] == "not JSON"
+    assert "invalid JSON" in translator.prompts[1]["repair_feedback"]
+    assert next(e for e in events if e["phase"] == "review_returned")["raw"] == "not JSON"
     assert result["translation"] == revised["title"] + "\n\n" + revised["body"]
+
+
+@pytest.mark.parametrize("failure", ["number_gate", "negative_review", "spelling"])
+def test_immutable_known_failure_stops_after_one_call_and_retains_all_evidence(failure):
+    import copy
+
+    translation = copy.deepcopy(TRANSLATION)
+    original = ORIGINAL + (" The experiment lasted 3 hours." if failure == "number_gate" else "")
+    rejection = {"approved": False, "topic": "science", "issues": ["The candidate changes a source fact."]}
+    reviewer = Reviewer(rejection if failure == "negative_review" else APPROVAL, APPROVAL)
+    matches = []
+    if failure == "spelling":
+        translation["body"] = translation["body"].replace("деревянном", "деревяном")
+        text = translation["title"] + "\n\n" + translation["body"]
+        matches = [{"message": "Опечатка в слове", "offset": text.index("деревяном"),
+                    "length": len("деревяном"), "type": {"typeName": "UnknownWord"},
+                    "rule": {"id": "MORFOLOGIK_RULE_RU_RU", "issueType": "misspelling",
+                             "category": {"id": "TYPOS"}}}]
+    events, generate_calls = [], []
+    check, translations, spelling = dedicated_quality(
+        reviewer, events, translation=translation, matches=matches)
+    generate = check.translator.generate_text
+
+    def counted(prompt):
+        generate_calls.append(json.loads(prompt))
+        return generate(prompt)
+
+    check.translator.generate_text = counted
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.prepare(TITLE, original, URL)
+    finally:
+        check.close()
+        check.translator.client.close()
+
+    assert len(generate_calls) == 1 and len(translations) == 2
+    assert len(reviewer.prompts) == len(spelling) == (0 if failure == "number_gate" else 1)
+    assert events[-1]["phase"] == "rejected" and events[-1]["attempt"] == 1
+    assert json.loads(next(e for e in events if e["phase"] == "translation_returned")["raw"]) == translation
+    assert not any(e["phase"] in {"accepted", "candidate_repeated"} for e in events)
+    if failure == "number_gate":
+        assert events[-1]["feedback"]["code"] == "TRANSLATION_NUMBER_CHANGED"
+        assert events[-1]["feedback"]["missing_numbers"] == ["3"]
+    else:
+        expected = rejection if failure == "negative_review" else APPROVAL
+        assert json.loads(next(e for e in events if e["phase"] == "review_returned")["raw"]) == expected
+        assert events[-1]["feedback"]["review_approved"] is expected["approved"]
+        assert events[-1]["feedback"]["review_issues"] == expected["issues"]
+        assert events[-1]["feedback"]["spelling_matches"] == matches
 
 
 @pytest.mark.parametrize("code", ["OPENCODE_PROVIDER_UNAVAILABLE", "INVALID_EDITOR_RESULT"])

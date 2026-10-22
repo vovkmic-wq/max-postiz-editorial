@@ -295,7 +295,7 @@ class HourlyArticleCycle:
         from .article_quality import normalize_article_links
         return fingerprint({key: normalize_article_links(candidate[key].strip()) for key in ("title", "body")})
 
-    def _legacy_candidate_hashes(self, record, attempt, hashes):
+    def _legacy_candidate_hashes(self, record, attempt, hashes, *, replay=False):
         """Read one old checked candidate; missing provenance cannot permit a retry."""
         try:
             expected = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
@@ -328,14 +328,160 @@ class HourlyArticleCycle:
                         or not isinstance(source, dict) or source.get("url") != record["url"]
                         or not isinstance(source.get("body"), str) or text_hash(source["body"]) != record["original_hash"]):
                     raise ValueError
-                found.add(self._candidate_hash(candidate))
+                found.add(self._initial_replay_hash(candidate) if replay else self._candidate_hash(candidate))
             if len(found) != 1:
                 raise ValueError
             return found
         except (OSError, ValueError, TypeError, KeyError, UnicodeError, AgentError) as exc:
             raise AgentError("ARTICLE_REJECTED_CANDIDATE_TRACE_REQUIRED", 409) from exc
 
-    def _guard_candidate_replay(self, ledger, record, candidate, operation):
+    @staticmethod
+    def _initial_replay_hash(candidate):
+        from .article_quality import normalize_article_links
+        # Это только запрет повтора: сохранённые quality/content hashes не меняем.
+        return fingerprint({key: " ".join(normalize_article_links(candidate[key].strip()).split())
+                            for key in ("title", "body")})
+
+    def _load_canonical_initial_candidates(self, record, attempt, article=None):
+        """Доказать исходные отклонённые тексты, не запрашивая модель повторно."""
+        from .adapters import extract_object
+        from .article_quality import normalize_article_links
+        from .editorial import numbers
+
+        try:
+            expected = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
+            if (record.get("quality_trace") != expected
+                    or not re.fullmatch(r"[a-f0-9-]{36}", record["id"])
+                    or attempt.get("state") not in {"needs_attention", "rejected", "failed"}
+                    or attempt.get("error") != "ARTICLE_QUALITY_REJECTED"
+                    or type(attempt.get("number")) is not int or attempt["number"] < 1):
+                raise ValueError
+            attempts = record.get("preparation_attempts")
+            if (not isinstance(attempts, list) or attempt["number"] > len(attempts)
+                    or attempts[attempt["number"] - 1] != attempt):
+                raise ValueError
+            started, finished = attempt["started_at"], attempt["finished_at"]
+            if (any(type(value) not in {int, float} or not math.isfinite(value) or value < 0
+                    for value in (started, finished)) or started > finished):
+                raise ValueError
+            if article is None and record.get("variant_id"):
+                # После staging исходный input берём из его собственного Material,
+                # а не из текста нового оператора или несвязанного trace.
+                with self.core.db.session() as session:
+                    variant = session.get(Variant, record["variant_id"])
+                    if (not variant or variant.metadata_json.get("record_id") != record["id"]
+                            or len(variant.sources) != 1):
+                        raise ValueError
+                    material = session.get(Material, variant.sources[0]["id"])
+                    if not material or material.published_at != record["source_published_at"]:
+                        raise ValueError
+                    article = {"url": material.url, "title": material.title, "original": material.text,
+                               "published_at": record["source_published_at"]}
+            raw = inside(self.core.settings.root, expected).read_bytes()
+            if not 0 < len(raw) <= 2 * 1024 * 1024:
+                raise ValueError
+            lines = raw.decode("utf-8").splitlines()
+            if not lines or len(lines) > 10000 or any(not line.strip() for line in lines):
+                raise ValueError
+            events, previous = [], -1
+            for line in lines:
+                event = parse_json(line)
+                if (not isinstance(event, dict) or event.get("record_id") != record["id"]
+                        or type(event.get("at")) not in {int, float}
+                        or not math.isfinite(event["at"]) or event["at"] < previous
+                        or type(event.get("attempt")) is not int or event["attempt"] < 1):
+                    raise ValueError
+                previous = event["at"]
+                events.append(event)
+            # Счётчик внутренних попыток начинается заново у каждого вызова.
+            # Границы по фазам нужны даже при одинаковых timestamp в двух вызовах.
+            segments = []
+            for index, event in enumerate(events):
+                if (event.get("phase") != "translation_started" or event["attempt"] != 1
+                        or not started <= event["at"] <= finished):
+                    continue
+                segment = []
+                for current in events[index:]:
+                    if segment and current.get("phase") in {"translation_started", "candidate_started"} and current["attempt"] == 1:
+                        break
+                    if not started <= current["at"] <= finished:
+                        break
+                    segment.append(current)
+                    if current.get("phase") in {"accepted", "rejected_for_human", "rejected"}:
+                        break
+                if segment[-1].get("phase") == "rejected":
+                    segments.append(segment)
+            if len(segments) != 1:
+                raise ValueError
+            segment = segments[0]
+            terminal = segment[-1]
+            if (terminal.get("error") != "ARTICLE_QUALITY_REJECTED" or terminal.get("mode") is not None
+                    or terminal["attempt"] > 3):
+                raise ValueError
+            prompt = (self.core.settings.root / "prompts/ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8")
+            found, position = set(), 0
+            for number in range(1, terminal["attempt"] + 1):
+                block = []
+                while position < len(segment) - 1 and segment[position]["attempt"] == number:
+                    block.append(segment[position])
+                    position += 1
+                phases = [event.get("phase") for event in block]
+                if phases[:3] != ["translation_started", "translation_returned", "translation_parsed"]:
+                    raise ValueError
+                context = block[0].get("context")
+                source = context.get("source_untrusted") if isinstance(context, dict) else None
+                if (not isinstance(source, dict) or set(source) != {"title", "body", "url"}
+                        or any(not isinstance(value, str) or not value.strip() for value in source.values())):
+                    raise ValueError
+                bound_article = article if article is not None else {
+                    "url": source["url"], "title": source["title"], "original": source["body"],
+                    "published_at": record["source_published_at"]}
+                if (set(bound_article) != {"url", "title", "original", "published_at"}
+                        or fingerprint(bound_article) != record["input_hash"]
+                        or bound_article["url"] != record["url"]
+                        or bound_article["published_at"] != record["source_published_at"]
+                        or text_hash(bound_article["original"]) != record["original_hash"]
+                        or source != {"url": bound_article["url"], "title": bound_article["title"].strip(),
+                                      "body": bound_article["original"].strip()}
+                        or context.get("instruction") != prompt
+                        or context.get("numeric_tokens_must_match_exactly") != sorted(numbers(source["title"] + "\n\n" + source["body"]))):
+                    raise ValueError
+                if not isinstance(block[1].get("raw"), str):
+                    raise ValueError
+                translated = extract_object(block[1]["raw"])
+                if (set(translated) != {"title", "body"}
+                        or any(not isinstance(value, str) or not value.strip() for value in translated.values())):
+                    raise ValueError
+                translated = {key: normalize_article_links(value.strip()) for key, value in translated.items()}
+                if block[2].get("translation") != translated or phases[-1] != "retry":
+                    raise ValueError
+                tail = phases[3:]
+                if tail not in (["gate_rejected", "retry"], ["gate_passed", "candidate_repeated", "retry"]):
+                    # Здесь устанавливается только факт отказа, а не истинность
+                    # машинных замечаний. Raw review и LT не меняются и не одобряются.
+                    if "review_normalized" in tail:
+                        tail = [phase for phase in tail if phase != "review_normalized"]
+                    if tail not in (
+                        ["gate_passed", "review_started", "review_invalid", "retry"],
+                        ["gate_passed", "review_started", "review_returned", "review_invalid", "retry"],
+                        ["gate_passed", "review_started", "review_returned", "review_parsed", "spelling_started",
+                         "spelling_returned", "spelling_adjudicated", "retry"],
+                    ):
+                        raise ValueError
+                    review = next(event.get("context") for event in block if event.get("phase") == "review_started")
+                    if (not isinstance(review, dict) or review.get("source_untrusted") != source["title"] + "\n\n" + source["body"]
+                            or review.get("translation_untrusted") != translated["title"] + "\n\n" + translated["body"]):
+                        raise ValueError
+                if terminal["attempt"] == number and terminal.get("feedback") != block[-1].get("feedback"):
+                    raise ValueError
+                found.add(self._initial_replay_hash(translated))
+            if position != len(segment) - 1 or not found:
+                raise ValueError
+            return found
+        except (OSError, ValueError, TypeError, KeyError, UnicodeError, AgentError, RecursionError) as exc:
+            raise AgentError("ARTICLE_REJECTED_CANDIDATE_TRACE_REQUIRED", 409) from exc
+
+    def _guard_candidate_replay(self, ledger, record, candidate, operation, article=None):
         """A persisted substantive refusal cannot be replaced by a fresh model sample."""
         candidate_hash = self._candidate_hash(candidate)
         supplied_hash = fingerprint(candidate)
@@ -352,9 +498,11 @@ class HourlyArticleCycle:
                 hashes = [attempt[key] for key in ("candidate_hash", "candidate_normalized_hash", "candidate_raw_hash")
                           if key in attempt]
                 if not hashes:
-                    # Historical automatic Qwen attempts have no explicit candidate hash.
                     if name == "correction_attempts" or attempt.get("operator_correction"):
                         raise AgentError("ARTICLE_LEDGER_INVALID", 409)
+                    # Первичный Hy/Qwen не получал operator candidate_hash. Отказ
+                    # всё равно связан с фактическим текстом канонического trace.
+                    rejected |= self._initial_replay_hash(candidate) in self._load_canonical_initial_candidates(record, attempt, article)
                     continue
                 if any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value)
                        for value in hashes):
@@ -364,8 +512,16 @@ class HourlyArticleCycle:
                 normalization = attempt.get("candidate_normalization")
                 if normalization not in {None, "article-links-v1"}:
                     raise AgentError("ARTICLE_LEDGER_INVALID", 409)
+                replay_hash = attempt.get("candidate_replay_hash")
+                if replay_hash is not None and (not isinstance(replay_hash, str)
+                                               or not re.fullmatch(r"[a-f0-9]{64}", replay_hash)):
+                    raise AgentError("ARTICLE_LEDGER_INVALID", 409)
                 if normalization is None and not rejected:
                     rejected = candidate_hash in self._legacy_candidate_hashes(record, attempt, hashes)
+                if not rejected:
+                    replay_hashes = ({replay_hash} if normalization == "article-links-v1" and replay_hash else
+                                     self._legacy_candidate_hashes(record, attempt, hashes, replay=True))
+                    rejected = self._initial_replay_hash(candidate) in replay_hashes
         if rejected:
             record.setdefault("preparation_actions", []).append({
                 "at": now(), "action": "rejected_candidate_replay_blocked", "operation": operation,
@@ -445,12 +601,13 @@ class HourlyArticleCycle:
                 record["preparation_attempts"] = [{"number": 1, "started_at": record["claimed_at"],
                     "state": record["state"], "error": record.get("error"), "legacy_record": True}]
             if candidate is not None:
-                self._guard_candidate_replay(ledger, record, candidate, "prepare_candidate")
+                self._guard_candidate_replay(ledger, record, candidate, "prepare_candidate", article)
             attempt = {"number": len(record["preparation_attempts"]) + 1,
                        "started_at": now(), "state": "preparing", "operator_retry": bool(retry_record)}
             if candidate is not None:
                 attempt.update(candidate_hash=self._candidate_hash(candidate), operator_correction=True,
                                candidate_normalization="article-links-v1",
+                               candidate_replay_hash=self._initial_replay_hash(candidate),
                                candidate_raw_hash=fingerprint(candidate))
             record["preparation_attempts"].append(attempt)
             record.update(state="preparing", input_hash=fingerprint(article))
@@ -708,6 +865,7 @@ class HourlyArticleCycle:
             self._guard_candidate_replay(ledger, record, correction, "revise_prepared")
             attempt = {"started_at": now(), "candidate_hash": self._candidate_hash(correction), "state": "checking",
                        "candidate_normalization": "article-links-v1",
+                       "candidate_replay_hash": self._initial_replay_hash(correction),
                        "candidate_raw_hash": fingerprint(correction)}
             record.setdefault("correction_attempts", []).append(attempt)
             record.update(state="revising", correction_blocked=True)

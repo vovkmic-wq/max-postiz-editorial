@@ -468,7 +468,10 @@ class ArticleQuality:
                    "numeric_tokens_must_match_exactly": sorted(numbers(source))}
         immutable_candidates = getattr(self.translator, "immutable_candidates", False) is True
         rejected_candidates = {}
-        for attempt in range(1, 4):
+        # Неизменяемый переводчик не исправляет feedback: повтор вернул бы тот же
+        # отклонённый текст. Реальные редакторы сохраняют три попытки исправления.
+        max_attempts = 1 if immutable_candidates else 3
+        for attempt in range(1, max_attempts + 1):
             self._emit("translation_started", attempt, context=context)
             raw_translation = None
             try:
@@ -585,7 +588,7 @@ class ArticleQuality:
                 "spelling_matches": unresolved[:20]}
             rejected_candidates[text] = copy.deepcopy(context["repair_feedback"])
             self._emit("retry", attempt, feedback=context["repair_feedback"])
-        self._emit("rejected", 3, error="ARTICLE_QUALITY_REJECTED",
+        self._emit("rejected", attempt, error="ARTICLE_QUALITY_REJECTED",
                    feedback=context.get("repair_feedback"))
         raise AgentError("ARTICLE_QUALITY_REJECTED")
 

@@ -210,25 +210,113 @@ def test_unknown_prepare_is_not_retried(server):
     assert not any(c[0] == "publish" for c in server.calls)
 
 
-def test_completed_known_rejection_closes_without_retry_or_publish(server):
+def completed_rejection(server, *, extra_events=(), keep_staged=False):
     record = {**server.record, "state": "needs_attention", "error": "ARTICLE_QUALITY_REJECTED",
               "preparation_attempts": [{"finished_at": server.stamp[0]}]}
-    for key in ("variant_id", "postiz_id", "dispatch_id"):
-        record.pop(key, None)
+    if not keep_staged:
+        for key in ("variant_id", "postiz_id", "dispatch_id"):
+            record.pop(key, None)
     record["quality_trace"] = "data/hourly-articles/quality-" + record["id"] + ".local.jsonl"
     path = server.core.settings.root / record["quality_trace"]
     path.write_text("\n".join(json.dumps(e) for e in [
         {"phase": "review_parsed", "record_id": record["id"], "at": server.stamp[0], "review": {"approved": False}},
+        *({"record_id": record["id"], "at": server.stamp[0], **event} for event in extra_events),
         {"phase": "rejected", "record_id": record["id"], "at": server.stamp[0], "error": "ARTICLE_QUALITY_REJECTED"}]), encoding="utf-8")
+    return record, path
+
+
+def test_current_hour_known_rejection_preserves_candidate_and_all_evidence(server):
+    record, path = completed_rejection(server)
+    server.ledger["records"].append(record)
+    original = copy.deepcopy(record)
+    trace = path.read_bytes()
+    server.controller.selector = lambda *_a, **_k: pytest.fail("selection before explicit correction")
+    for _ in range(2):
+        result = server.controller.run_once()
+        assert result == {"phase": "rejected", "record_id": record["id"], "slot": record["slot"],
+                          "last_error": {"code": "ARTICLE_QUALITY_REJECTED"},
+                          "next_run_at": (record["slot"] + 1) * 3600}
+        assert server.ledger["records"] == [original]
+        assert path.read_bytes() == trace
+    assert [c[0] for c in server.calls] == ["pre_draft_guard", "pre_draft_guard"]
+
+
+def test_expired_known_rejection_closes_once_preserving_source_hour_and_trace(server):
+    record, path = completed_rejection(server)
+    original = copy.deepcopy(record)
+    trace = path.read_bytes()
+    server.ledger["records"].append(record)
+    server.stamp[0] = (record["slot"] + 1) * 3600
+    result = server.controller.run_once()
+    assert result["phase"] == "rejected"
+    assert result["last_error"] == {"code": "ARTICLE_QUALITY_REJECTED"}
+    assert [c[0] for c in server.calls] == ["pre_draft_guard", "cancel"]
+    assert server.ledger["records"] == [{**original, "state": "cancelled"}]
+    assert path.read_bytes() == trace
+    server.controller.selector = lambda *_a, **_k: None
+    assert server.controller.run_once()["phase"] == "no_source"
+    assert sum(c[0] == "cancel" for c in server.calls) == 1
+    assert server.ledger["records"] == [{**original, "state": "cancelled"}]
+
+
+def test_new_completed_rejection_is_reported_without_closing_its_current_hour(server):
+    record, path = completed_rejection(server)
+    trace = path.read_bytes()
+
+    def rejected(_article):
+        server.calls.append(("prepare",))
+        server.ledger["records"].append(record)
+        raise AgentError("ARTICLE_QUALITY_REJECTED", 409)
+
+    server.controller.cycle.prepare = rejected
+    result = server.controller.run_once()
+    assert result["phase"] == "rejected"
+    assert result["last_error"] == {"code": "ARTICLE_QUALITY_REJECTED"}
+    assert result["next_run_at"] == (record["slot"] + 1) * 3600
+    assert server.ledger["records"][0]["state"] == "needs_attention"
+    assert server.controller.run_once()["phase"] == "rejected"
+    assert [c[0] for c in server.calls] == ["prepare", "pre_draft_guard", "pre_draft_guard"]
+    assert path.read_bytes() == trace
+
+
+def test_explicitly_corrected_current_record_can_continue_through_existing_ready_path(server):
+    record, _ = completed_rejection(server)
     server.ledger["records"].append(record)
     assert server.controller.run_once()["phase"] == "rejected"
-    assert [c[0] for c in server.calls] == ["pre_draft_guard", "cancel"]
-    assert server.controller.run_once()["phase"] == "hour_used"
+    # Только внешний штатный correction-путь устанавливает новое проверенное состояние.
+    server.ledger["records"][0] = copy.deepcopy(server.record)
+    assert server.controller.run_once()["phase"] == "waiting_dispatch"
+    assert [c[0] for c in server.calls] == ["pre_draft_guard", "snapshot", "publish"]
+
+
+@pytest.mark.parametrize("phase", ["review_failed", "translation_failed", "spelling_failed",
+                                   "review_invalid", "translation_invalid"])
+def test_infrastructure_or_invalid_review_trace_never_autocloses_even_after_hour(server, phase):
+    record, path = completed_rejection(server, extra_events=[{"phase": phase}])
+    original = copy.deepcopy(record)
+    trace = path.read_bytes()
+    server.ledger["records"].append(record)
+    server.stamp[0] = (record["slot"] + 1) * 3600
+    assert server.controller.run_once()["phase"] == "blocked"
+    assert server.ledger["records"] == [original]
+    assert path.read_bytes() == trace
+    assert server.calls == []
+
+
+@pytest.mark.parametrize("slot", [None, True, "hour", -1, "future"])
+def test_invalid_or_future_refusal_hour_never_autocloses(server, slot):
+    record, _ = completed_rejection(server)
+    record["slot"] = int(server.stamp[0] // 3600) + 1 if slot == "future" else slot
+    server.ledger["records"].append(record)
+    assert server.controller.run_once()["phase"] == "blocked"
+    assert server.ledger["records"][0]["state"] == "needs_attention"
+    assert server.calls == []
 
 
 def test_incomplete_failure_trace_remains_blocked(server):
     server.ledger["records"].append({**server.record, "state": "needs_attention",
                                     "error": "ARTICLE_QUALITY_REJECTED"})
+    server.stamp[0] += 3600
     assert server.controller.run_once()["phase"] == "blocked"
     assert not any(c[0] == "cancel" for c in server.calls)
 

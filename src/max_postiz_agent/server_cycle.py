@@ -163,9 +163,11 @@ class ServerCycle:
                                snapshot_hash=dispatch.snapshot_hash, due_at=due, variant_id=variant.id)
         return True
 
-    def _close_known_rejection(self, record):
+    def _known_rejection(self, record):
+        """Проверить завершённый известный отказ, не меняя запись и её доказательства."""
         if (record.get("state") != "needs_attention"
-                or record.get("error") != "ARTICLE_QUALITY_REJECTED"):
+                or record.get("error") != "ARTICLE_QUALITY_REJECTED"
+                or type(record.get("slot")) is not int or record["slot"] < 0):
             return False
         attempts = record.get("preparation_attempts", [])
         if not attempts or attempts[-1].get("finished_at") is None:
@@ -196,6 +198,15 @@ class ServerCycle:
         if not known:
             return False
         self.cycle._assert_pre_draft(record)
+        return True
+
+    def _close_known_rejection(self, record):
+        slot = record.get("slot")
+        # Пока исходный час открыт, оператор может явно исправить кандидат.
+        # Закрытие не освобождает использованный источник или занятый час.
+        if (type(slot) is not int or slot >= int(self.clock() // 3600)
+                or not self._known_rejection(record)):
+            return False
         self.state.assert_running()
         self.cycle.cancel_preparation(record["id"],
             "Autonomous policy preserved a completed known rejection; no automatic correction or verdict retry")
@@ -232,8 +243,10 @@ class ServerCycle:
             if record.get("dispatch_id"):
                 result = self.cycle.status(record["id"])
                 return self._phase("reconciling", record_id=record["id"], result=result)
-            if self._close_known_rejection(record):
-                return self._phase("rejected", record_id=record["id"])
+            if (self._close_known_rejection(record)
+                    or record.get("slot") == int(self.clock() // 3600) and self._known_rejection(record)):
+                return self._phase("rejected", record_id=record["id"], slot=record["slot"],
+                                   last_error={"code": "ARTICLE_QUALITY_REJECTED"})
             return self._phase("blocked", record_id=record["id"],
                                last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
         ready = [r for r in ledger["records"] if r["state"] == "automatic_ready"]
@@ -262,8 +275,10 @@ class ServerCycle:
         except AgentError:
             fresh = self.cycle._load()
             failed = next((r for r in reversed(fresh["records"]) if r.get("slot") == slot), None)
-            if failed and self._close_known_rejection(failed):
-                return self._phase("rejected", record_id=failed["id"], slot=slot)
+            if failed and (self._close_known_rejection(failed)
+                    or failed.get("slot") == int(self.clock() // 3600) and self._known_rejection(failed)):
+                return self._phase("rejected", record_id=failed["id"], slot=slot,
+                                   last_error={"code": "ARTICLE_QUALITY_REJECTED"})
             raise
         record = self.cycle._record(self.cycle._load(), result["id"])
         if record.get("state") != "automatic_ready":

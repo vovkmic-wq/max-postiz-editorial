@@ -827,6 +827,7 @@ def legacy_markdown_refusal(cycle):
     record = ledger["records"][0]
     attempt = record["preparation_attempts"][-1]
     attempt.pop("candidate_normalization")
+    attempt.pop("candidate_replay_hash")
     attempt.update(candidate_hash=fingerprint(markdown), candidate_raw_hash=fingerprint(markdown))
     value._save(ledger)
     trace = value.core.settings.root / record["quality_trace"]
