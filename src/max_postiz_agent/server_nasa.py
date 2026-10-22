@@ -295,6 +295,9 @@ def select_nasa_article(core, options, ledger, policy, *, now, transport=None, c
                     continue
                 try:
                     released = datetime.fromisoformat(item["release_date"])
+                    # Будущая дата временна: не исключаем материал из последующего подбора.
+                    if released.tzinfo is not None and released.timestamp() > now:
+                        continue
                     if (
                         released.tzinfo is None
                         or not 0
@@ -308,6 +311,9 @@ def select_nasa_article(core, options, ledger, policy, *, now, transport=None, c
                         return None
                     full_gets += 1
                     data, raw = _get(client, API + str(ident) + "/")
+                    full_released = datetime.fromisoformat(data["release_date"])
+                    if full_released.tzinfo is not None and full_released.timestamp() > now:
+                        continue
                     article = _article(data, extractor, canonical)
                     if (
                         not 0

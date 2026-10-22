@@ -274,3 +274,122 @@ def test_checkpoint_keeps_only_known_skips_before_a_transport_failure(source, cy
     with source.core.db.session() as session:
         data = session.get(Cursor, "server_nasa_svs").data
         assert data["head_seen"] == [1] and data["offset"] == 0
+
+
+@pytest.mark.parametrize("future_date", ["catalog", "page"])
+def test_future_release_is_rechecked_at_due_time_without_remembering(source, cycle, future_date):
+    source.core.db = cycle[1].db
+    original_date = source.page["release_date"]
+    source.page["release_date"] = "2026-10-22T01:00:00+00:00"
+    due = STAMP + 3600
+    seen = []
+
+    def handler(request):
+        assert request.method == "GET"
+        seen.append(request.url.path)
+        if request.url.path == "/api/search/":
+            released = source.page["release_date"] if future_date == "catalog" else original_date
+            return httpx.Response(200, json={"results": [{"id": 1234, "release_date": released}]})
+        assert request.url.path == "/api/1234/"
+        return httpx.Response(200, json=source.page)
+
+    def run(stamp):
+        return select_nasa_article(source.core, source.options, {"records": []}, source.policy,
+            now=stamp, transport=httpx.MockTransport(handler), checkpoint=True)
+
+    expected = ["/api/search/"] + (["/api/1234/"] if future_date == "page" else [])
+    for stamp in (STAMP, due - 1):
+        seen.clear()
+        assert run(stamp) is None
+        assert seen == expected
+        with source.core.db.session() as session:
+            assert session.get(Cursor, "server_nasa_svs").data["head_seen"] == []
+        assert not (source.root / "data/server-sources").exists()
+
+    seen.clear()
+    article = run(due)
+    assert article["url"] == URL and article["published_at"] == due
+    assert seen == ["/api/search/", "/api/1234/"]
+    assert len(list((source.root / "data/server-sources").glob("*.local.json"))) == 1
+    with source.core.db.session() as session:
+        assert session.get(Cursor, "server_nasa_svs").data["head_seen"] == [1234]
+    seen.clear()
+    assert run(due) is None and seen == ["/api/search/"]
+    assert not cycle[3] and not cycle[4]
+
+
+@pytest.mark.parametrize("other_error", [None, "rights", "href", "type", "credits", "stale"])
+def test_erroneous_future_page_date_is_rechecked_without_bypassing_other_rejections(
+    source, cycle, other_error
+):
+    source.core.db = cycle[1].db
+    catalog_date = source.page["release_date"]
+    source.page["release_date"] = "2027-01-01T00:00:00+00:00"
+    if other_error == "rights":
+        source.page["media_groups"][0]["description"] += " Copyright someone."
+    elif other_error == "href":
+        source.page["media_groups"][0]["description"] += '<a href="javascript:bad()">bad</a>'
+    elif other_error == "type":
+        source.page["page_type"] = "Animation"
+    elif other_error == "credits":
+        source.page["main_credits"] = {}
+    seen = []
+
+    def handler(request):
+        assert request.method == "GET"
+        seen.append(request.url.path)
+        if request.url.path == "/api/search/":
+            return httpx.Response(200, json={"results": [{"id": 1234,
+                "release_date": catalog_date}]})
+        assert request.url.path == "/api/1234/"
+        return httpx.Response(200, json=source.page)
+
+    def run():
+        return select_nasa_article(source.core, source.options, {"records": []}, source.policy,
+            now=STAMP, transport=httpx.MockTransport(handler), checkpoint=True)
+
+    assert run() is None
+    with source.core.db.session() as session:
+        assert session.get(Cursor, "server_nasa_svs").data["head_seen"] == []
+    assert not (source.root / "data/server-sources").exists()
+    # Page API исправил ошибочный год: повторный GET разрешён в следующий цикл,
+    # однако прежние отказы прав, ссылок, типа, credits и давности сохраняются.
+    source.page["release_date"] = (
+        "2024-01-01T00:00:00+00:00" if other_error == "stale" else catalog_date
+    )
+    result = run()
+    assert (result is not None) is (other_error is None)
+    assert seen == ["/api/search/", "/api/1234/"] * 2
+    with source.core.db.session() as session:
+        assert session.get(Cursor, "server_nasa_svs").data["head_seen"] == [1234]
+    assert bool(list((source.root / "data/server-sources").glob("*.local.json"))) is (
+        other_error is None
+    )
+    assert not cycle[3] and not cycle[4]
+
+
+@pytest.mark.parametrize("bad_date", ["2027-01-01T00:00:00", "not-a-date"])
+def test_invalid_full_page_date_is_not_deferred_as_an_aware_future(source, cycle, bad_date):
+    source.core.db = cycle[1].db
+    catalog_date = source.page["release_date"]
+    source.page["release_date"] = bad_date
+    seen = []
+
+    def handler(request):
+        assert request.method == "GET"
+        seen.append(request.url.path)
+        if request.url.path == "/api/search/":
+            return httpx.Response(200, json={"results": [{"id": 1234,
+                "release_date": catalog_date}]})
+        assert request.url.path == "/api/1234/"
+        return httpx.Response(200, json=source.page)
+
+    transport = httpx.MockTransport(handler)
+    for _ in range(2):
+        assert select_nasa_article(source.core, source.options, {"records": []}, source.policy,
+            now=STAMP, transport=transport, checkpoint=True) is None
+        with source.core.db.session() as session:
+            assert session.get(Cursor, "server_nasa_svs").data["head_seen"] == [1234]
+    assert seen == ["/api/search/", "/api/1234/", "/api/search/"]
+    assert not (source.root / "data/server-sources").exists()
+    assert not cycle[3] and not cycle[4]
