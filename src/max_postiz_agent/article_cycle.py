@@ -26,8 +26,8 @@ from .reddit import text_hash
 class HourlyArticleCycle:
     """A private durable ledger stops interrupted operations instead of replaying them."""
 
-    def __init__(self, core, quality_factory=None):
-        self.core, self.quality_factory = core, quality_factory
+    def __init__(self, core, quality_factory=None, repair_factory=None):
+        self.core, self.quality_factory, self.repair_factory = core, quality_factory, repair_factory
         self.directory = inside(core.settings.root, "data/hourly-articles")
         self.directory.mkdir(parents=True, exist_ok=True)
         self.ledger_path = self.directory / "ledger.local.json"
@@ -225,6 +225,22 @@ class HourlyArticleCycle:
                     "translation_model": translator.model,
                     "review_model": getattr(quality.reviewer, "model", None)}
         return {"quality": "qwen_ministral_languagetool"}
+
+    def automatic_repair_status(self, record):
+        from .article_repair_cycle import AutomaticArticleRepair
+        return AutomaticArticleRepair(self).status(record)
+
+    def repair_rejected(self, ident):
+        from .article_repair_cycle import AutomaticArticleRepair
+        return AutomaticArticleRepair(self).run(ident)
+
+    def _repair(self, trace):
+        from .article_repair import ArticleRepair, REPAIR_MODEL
+        if self.repair_factory:
+            return self.repair_factory(trace)
+        editor = OpenCode(self.core.settings)
+        editor.model = REPAIR_MODEL
+        return ArticleRepair(editor, prompt_dir=self.core.settings.root / "prompts", trace=trace)
 
     def _assert_pre_draft(self, record):
         if any(record.get(key) for key in ("variant_id", "postiz_id", "dispatch_id", "due_at", "prepared_hash")):
@@ -533,7 +549,9 @@ class HourlyArticleCycle:
                     source_hash=record["original_hash"], error="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED")
             raise AgentError("ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED", 409)
 
-    def prepare(self, article, retry_record=None, candidate=None):
+    def prepare(self, article, retry_record=None, candidate=None, automatic_repair_claim=None):
+        if automatic_repair_claim and (not retry_record or candidate is None):
+            raise AgentError("ARTICLE_AUTOMATIC_REPAIR_CLAIM_LOST", 409)
         if candidate is not None:
             if not retry_record:
                 raise AgentError("ARTICLE_CANDIDATE_RETRY_REQUIRED", 409)
@@ -596,19 +614,26 @@ class HourlyArticleCycle:
                           "target_id": target.id, "source_id": source["id"], "source_published_at": article["published_at"],
                           "input_hash": fingerprint(article), "preparation_attempts": []}
                 ledger["records"].append(record)
+                from .article_repair_cycle import capture_input
+                capture_input(self, record, article)
             elif "preparation_attempts" not in record:
                 # Preserve older failed ledgers without inventing an unrecorded completion time.
                 record["preparation_attempts"] = [{"number": 1, "started_at": record["claimed_at"],
                     "state": record["state"], "error": record.get("error"), "legacy_record": True}]
+            from .article_repair_cycle import AutomaticArticleRepair
+            repair_protocol = AutomaticArticleRepair(self)
+            repair_claim = repair_protocol.authorize(record, automatic_repair_claim, candidate, article)
             if candidate is not None:
                 self._guard_candidate_replay(ledger, record, candidate, "prepare_candidate", article)
             attempt = {"number": len(record["preparation_attempts"]) + 1,
-                       "started_at": now(), "state": "preparing", "operator_retry": bool(retry_record)}
+                       "started_at": now(), "state": "preparing", "operator_retry": bool(retry_record) and not repair_claim}
             if candidate is not None:
-                attempt.update(candidate_hash=self._candidate_hash(candidate), operator_correction=True,
+                attempt.update(candidate_hash=self._candidate_hash(candidate), operator_correction=not bool(repair_claim),
                                candidate_normalization="article-links-v1",
                                candidate_replay_hash=self._initial_replay_hash(candidate),
                                candidate_raw_hash=fingerprint(candidate))
+                if repair_claim:
+                    attempt["automatic_repair_claim"] = repair_claim["id"]
             record["preparation_attempts"].append(attempt)
             record.update(state="preparing", input_hash=fingerprint(article))
             record["quality_trace"] = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
@@ -616,19 +641,27 @@ class HourlyArticleCycle:
             quality = None
             try:
                 with self.core.db.session.begin() as session:
-                    self.core.db.audit(session, "hourly_article_operator" if retry_record else "article_quality",
+                    self.core.db.audit(session, "automatic_article_repair" if repair_claim else
+                        ("hourly_article_operator" if retry_record else "article_quality"),
                         "hourly_article_prepare_attempt", record["id"], attempt=attempt["number"],
-                        operator_retry=bool(retry_record), source_hash=original_hash,
+                        operator_retry=attempt["operator_retry"], source_hash=original_hash,
                         input_hash=record["input_hash"], policy_hash=record["policy_hash"],
-                        candidate_hash=attempt.get("candidate_hash"), operator_correction=candidate is not None)
+                        candidate_hash=attempt.get("candidate_hash"), operator_correction=attempt.get("operator_correction", False),
+                        automatic_repair_claim=automatic_repair_claim)
                 quality = self._quality(record["id"])
                 prepared = (quality.check_candidate(candidate["title"], candidate["body"], article["title"],
                     article["original"], article["url"]) if candidate is not None else
                     quality.prepare(article["title"], article["original"], article["url"]))
                 if record["slot"] != int(now() // 3600):
                     raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
+                provenance = self._quality_provenance(quality, operator_candidate=candidate is not None)
+                if repair_claim:
+                    repair_protocol.after_quality(record, repair_claim, article)
+                    provenance = {"quality": "automatic_correction_ministral_languagetool",
+                        "automatic_repair_claim": repair_claim["id"], "repair_contract": repair_claim["contract"],
+                        "repair_model": repair_claim["model"], "repair_evidence": copy.deepcopy(repair_claim["evidence"])}
                 return self._store_prepared(article, prepared, record, ledger, policy, source, target,
-                    self._quality_provenance(quality, operator_candidate=candidate is not None), attempt)
+                    provenance, attempt)
             except Exception as exc:
                 record.update(state="needs_attention", error=exc.code if isinstance(exc, AgentError) else "ARTICLE_PREPARATION_INTERRUPTED")
                 attempt.update(state="needs_attention", error=record["error"], finished_at=now())
@@ -693,7 +726,9 @@ class HourlyArticleCycle:
                     "machine_reviewed_at": now(),
                     **machine_metadata(prepared, {"title": article["title"], "body": article["original"],
                         "url": article["url"]}, self.core.settings.root / record["quality_trace"]),
-                    "operator_correction_hash": attempt.get("candidate_hash"), "topic": prepared["topic"],
+                    "operator_correction_hash": attempt.get("candidate_hash") if attempt.get("operator_correction") else None,
+                    "automatic_correction_hash": attempt.get("candidate_hash") if attempt.get("automatic_repair_claim") else None,
+                    "topic": prepared["topic"],
                     "translation_hash": translation_hash})
             session.add(variant)
             session.flush()
@@ -801,6 +836,10 @@ class HourlyArticleCycle:
         with profile_lock(self.directory / "cycle.lock"):
             ledger = self._load()
             record = self._record(ledger, ident)
+            from .article_repair_cycle import AutomaticArticleRepair
+            _, repair_block = AutomaticArticleRepair(self)._history(record)
+            if repair_block:
+                raise AgentError("ARTICLE_AUTOMATIC_REPAIR_" + repair_block, 409)
             if record["state"] not in {"needs_attention", "preparing", "rejected", "failed"}:
                 raise AgentError("ARTICLE_PREPARATION_NOT_CANCELLABLE", 409)
             self._assert_pre_draft(record)

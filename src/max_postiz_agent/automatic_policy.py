@@ -131,6 +131,8 @@ def _eligible_record(cycle, session, variant, policy, record):
         raise AgentError("ARTICLE_MEDIA_NOT_ALLOWED", 409)
     if not record or record["state"] not in {"automatic_ready", "automatic_pending_approval", "pending", "sending", "awaiting_postiz"}:
         raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
+    from .article_repair_cycle import AutomaticArticleRepair
+    AutomaticArticleRepair(cycle).assert_complete(record, session)
     material = session.get(Material, variant.sources[0].get("id")) if len(variant.sources) == 1 else None
     if (not material or material.published_at is None
             or material.published_at < now() - policy["max_source_age_hours"] * 3600):
@@ -162,6 +164,9 @@ def publish(cycle, record, ledger, reviewed_hash, due_at):
     from .server_state import require_running
     require_running(cycle.core)
     core, policy = cycle.core, cycle._policy()
+    from .article_repair_cycle import AutomaticArticleRepair
+    with core.db.session() as session:
+        AutomaticArticleRepair(cycle).assert_complete(record, session)
     if policy.get("approval_mode") != "automatic":
         raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
     if record["state"] not in {"prepared", "automatic_ready"}:

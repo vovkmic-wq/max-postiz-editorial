@@ -81,6 +81,15 @@ def server(cycle, monkeypatch):
             if any(value.get(k) for k in ("variant_id", "postiz_id", "dispatch_id")):
                 raise AgentError("ARTICLE_PREPARATION_NOT_CANCELLABLE", 409)
 
+        def automatic_repair_status(self, value):
+            if controller._known_rejection(value):
+                return {"eligible": False, "reason": "EXPIRED" if value["slot"] < int(stamp[0] // 3600)
+                        else "EXHAUSTED", "attempts": 2}
+            return {"eligible": False, "reason": "FAILED", "attempts": 0}
+
+        def repair_rejected(self, _ident):
+            pytest.fail("Исчерпанный или недоказанный отказ не вызывает модель")
+
         def cancel_preparation(self, ident, reason):
             calls.append(("cancel", ident, reason))
             self._record(ledger, ident)["state"] = "cancelled"
@@ -300,6 +309,266 @@ def completed_rejection(server, *, extra_events=(), keep_staged=False):
     return record, path
 
 
+@pytest.fixture
+def repairable(server):
+    record, path = completed_rejection(server)
+    server.ledger["records"].append(record)
+    outcomes = ["passed"]
+    server.controller.selector = lambda *_a, **_k: pytest.fail("Исправление не выбирает другой источник")
+
+    def status(value):
+        attempts = value.get("automatic_repair_attempts", [])
+        if attempts:
+            last = attempts[-1]
+            if last["state"] in {"correcting", "checking"} or last.get("finished_at") is None:
+                return {"eligible": False, "reason": "IN_PROGRESS", "attempts": len(attempts)}
+            if last["state"] in {"failed", "unknown"}:
+                return {"eligible": False, "reason": "FAILED", "attempts": len(attempts)}
+        if not server.controller._known_rejection(value):
+            return {"eligible": False, "reason": "FAILED", "attempts": len(attempts)}
+        if value["slot"] < int(server.stamp[0] // 3600):
+            return {"eligible": False, "reason": "EXPIRED", "attempts": len(attempts)}
+        if attempts and attempts[-1]["state"] in {"no_change", "not_repairable"}:
+            return {"eligible": False, "reason": attempts[-1]["state"].upper(), "attempts": len(attempts)}
+        return {"eligible": len(attempts) < 2, "reason": "ELIGIBLE" if len(attempts) < 2 else "EXHAUSTED",
+                "attempts": len(attempts)}
+
+    def repair(ident):
+        server.calls.append(("repair", ident))
+        value = server.controller.cycle._record(server.ledger, ident)
+        claims = value.setdefault("automatic_repair_attempts", [])
+        claim = {"id": "claim-" + str(len(claims) + 1), "number": len(claims) + 1,
+                 "state": "correcting", "started_at": server.stamp[0]}
+        claims.append(claim)
+        value["state"] = "automatic_repairing"
+        assert outcomes, "Повтор исчерпанного durable claim"
+        outcome = outcomes.pop(0)
+        claim.update(state=outcome, finished_at=server.stamp[0])
+        if outcome == "passed":
+            value.update(state="automatic_ready", variant_id=server.record["variant_id"],
+                         prepared_hash=server.record["prepared_hash"], postiz_id="single-repaired-draft")
+            return copy.deepcopy(value)
+        value.update(state="needs_attention", error="ARTICLE_QUALITY_REJECTED")
+        if outcome in {"no_change", "not_repairable"}:
+            return copy.deepcopy(value)
+        if outcome in {"failed", "unknown"}:
+            value["error"] = claim["error"] = "ARTICLE_AUTOMATIC_REPAIR_UNAVAILABLE"
+            raise AgentError(value["error"], 503)
+        assert outcome == "rejected"
+        claim["error"] = "ARTICLE_QUALITY_REJECTED"
+        raise AgentError("ARTICLE_QUALITY_REJECTED", 409)
+
+    server.controller.cycle.automatic_repair_status = status
+    server.controller.cycle.repair_rejected = repair
+    server.repair_outcomes = outcomes
+    server.rejected_record = record
+    server.trace = path
+    return server
+
+
+def test_known_current_rejection_repairs_once_then_schedules_only_its_returned_draft(repairable):
+    server = repairable
+    original = copy.deepcopy(server.rejected_record)
+    trace = server.trace.read_bytes()
+    publish = server.controller.cycle.publish
+
+    def same_draft(ident, *args, **kwargs):
+        assert ident == original["id"]
+        assert len(server.ledger["records"]) == 1
+        assert server.ledger["records"][0]["postiz_id"] == "single-repaired-draft"
+        return publish(ident, *args, **kwargs)
+
+    server.controller.cycle.publish = same_draft
+    assert server.controller.run_once()["phase"] == "waiting_dispatch"
+    final = server.ledger["records"][0]
+    assert [c[0] for c in server.calls if c[0] != "pre_draft_guard"] == ["repair", "snapshot", "publish"]
+    for key in ("id", "slot", "url", "original_hash", "input_hash", "policy_hash", "target_id", "source_id"):
+        assert final.get(key) == original.get(key)
+    assert final["preparation_attempts"] == original["preparation_attempts"]
+    assert final["automatic_repair_attempts"][0]["state"] == "passed"
+    assert server.trace.read_bytes() == trace
+
+
+def test_only_two_completed_repair_refusals_across_polling_and_restart(repairable):
+    server = repairable
+    server.repair_outcomes[:] = ["rejected", "rejected"]
+    trace = server.trace.read_bytes()
+    for number in (1, 2):
+        result = server.controller.run_once()
+        assert result["phase"] == "rejected"
+        assert result["repair_attempts"] == number
+        assert sum(c[0] == "repair" for c in server.calls) == number
+        assert server.ledger["records"][0]["state"] == "needs_attention"
+    saved = copy.deepcopy(server.ledger)
+    restarted = ServerCycle(server.core, state=server.state, cycle=server.controller.cycle,
+                            selector=server.controller.selector, clock=lambda: server.stamp[0])
+    assert restarted.run_once()["repair_status"] == "EXHAUSTED"
+    assert restarted.run_once()["phase"] == "rejected"
+    assert sum(c[0] == "repair" for c in server.calls) == 2
+    assert not any(c[0] in {"prepare", "publish", "cancel"} for c in server.calls)
+    assert server.ledger == saved and server.trace.read_bytes() == trace
+
+
+def test_new_prepare_quality_refusal_can_use_one_repair_in_same_pass(repairable):
+    server = repairable
+    record = server.ledger["records"].pop()
+    server.controller.selector = lambda *_a, **_k: server.article
+
+    def rejected(_article):
+        server.calls.append(("prepare",))
+        server.ledger["records"].append(record)
+        raise AgentError("ARTICLE_QUALITY_REJECTED", 409)
+
+    server.controller.cycle.prepare = rejected
+    assert server.controller.run_once()["phase"] == "waiting_dispatch"
+    assert [c[0] for c in server.calls if c[0] != "pre_draft_guard"] == ["prepare", "repair", "snapshot", "publish"]
+
+
+@pytest.mark.parametrize("outcome", ["no_change", "not_repairable"])
+def test_completed_no_change_or_nonrepairable_result_stops_samples_until_hour_ends(repairable, outcome):
+    server = repairable
+    server.repair_outcomes[:] = [outcome]
+    assert server.controller.run_once()["repair_status"] == outcome.upper()
+    claims = copy.deepcopy(server.ledger["records"][0]["automatic_repair_attempts"])
+    assert server.controller.run_once()["phase"] == "rejected"
+    assert sum(c[0] == "repair" for c in server.calls) == 1
+    server.stamp[0] = (server.rejected_record["slot"] + 1) * 3600
+    assert server.controller.run_once()["phase"] == "rejected"
+    assert server.ledger["records"][0]["state"] == "cancelled"
+    assert server.ledger["records"][0]["automatic_repair_attempts"] == claims
+    assert not any(c[0] == "publish" for c in server.calls)
+
+
+@pytest.mark.parametrize("outcome", ["failed", "unknown"])
+def test_repair_infrastructure_or_unknown_failure_is_never_replayed_or_autoclosed(repairable, outcome):
+    server = repairable
+    server.repair_outcomes[:] = [outcome]
+    with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_UNAVAILABLE"):
+        server.controller.run_once()
+    saved = copy.deepcopy(server.ledger)
+    assert server.controller.run_once()["phase"] == "blocked"
+    server.stamp[0] += 3600
+    assert server.controller.run_once()["phase"] == "blocked"
+    assert server.ledger == saved and sum(c[0] == "repair" for c in server.calls) == 1
+    assert not any(c[0] in {"publish", "cancel"} for c in server.calls)
+
+
+@pytest.mark.parametrize("claim_state", ["correcting", "checking"])
+def test_interrupted_repair_claim_blocks_before_and_after_hour(repairable, claim_state):
+    server = repairable
+    record = server.ledger["records"][0]
+    record.update(state="automatic_repairing", automatic_repair_attempts=[
+        {"id": "durable", "number": 1, "state": claim_state, "started_at": server.stamp[0]}])
+    saved = copy.deepcopy(server.ledger)
+    assert server.controller.run_once()["phase"] == "blocked"
+    server.stamp[0] += 3600
+    assert server.controller.run_once()["phase"] == "blocked"
+    assert server.ledger == saved and not any(c[0] in {"repair", "publish", "cancel"} for c in server.calls)
+
+
+def test_claim_lost_audit_blocks_expired_legacy_refusal_even_before_ledger_claim_was_saved(repairable):
+    server = repairable
+    server.stamp[0] += 3600
+    server.controller.cycle.automatic_repair_status = lambda _: {
+        "eligible": False, "reason": "CLAIM_LOST", "attempts": 0}
+    saved = copy.deepcopy(server.ledger)
+    assert server.controller.run_once()["phase"] == "blocked"
+    assert server.ledger == saved and server.calls == []
+
+
+def test_hour_expiring_during_readonly_repair_status_never_calls_editor(repairable):
+    server = repairable
+    status = server.controller.cycle.automatic_repair_status
+
+    def crossed(value):
+        result = status(value)
+        server.stamp[0] = (value["slot"] + 1) * 3600
+        return result
+
+    server.controller.cycle.automatic_repair_status = crossed
+    original = copy.deepcopy(server.ledger)
+    assert server.controller.run_once()["phase"] == "rejected"
+    assert server.ledger == original
+    assert not any(c[0] in {"repair", "publish", "cancel"} for c in server.calls)
+
+
+def test_pause_while_repair_finishes_preserves_single_draft_without_scheduling(repairable):
+    server = repairable
+    repair = server.controller.cycle.repair_rejected
+
+    def paused(ident):
+        result = repair(ident)
+        server.state.value["paused"] = True
+        return result
+
+    server.controller.cycle.repair_rejected = paused
+    with pytest.raises(AgentError, match="EDITORIAL_PAUSED"):
+        server.controller.run_once()
+    assert server.ledger["records"][0]["state"] == "automatic_ready"
+    assert server.ledger["records"][0]["postiz_id"] == "single-repaired-draft"
+    assert not any(c[0] == "publish" for c in server.calls)
+
+
+@pytest.mark.parametrize("damage", ["source", "slot", "returned_id", "missing_postiz", "dispatch", "due"])
+def test_repair_result_requires_same_source_identity_and_one_unscheduled_draft(repairable, damage):
+    server = repairable
+    repair = server.controller.cycle.repair_rejected
+
+    def broken(ident):
+        result = repair(ident)
+        record = server.ledger["records"][0]
+        if damage == "returned_id":
+            result["id"] = "different"
+        elif damage == "source":
+            record["original_hash"] = "changed"
+        elif damage == "slot":
+            record["slot"] += 1
+        elif damage == "missing_postiz":
+            record.pop("postiz_id")
+        elif damage == "dispatch":
+            record["dispatch_id"] = "existing-dispatch"
+        else:
+            record["due_at"] = 0
+        return result
+
+    server.controller.cycle.repair_rejected = broken
+    with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_RESULT_INVALID"):
+        server.controller.run_once()
+    assert sum(c[0] == "repair" for c in server.calls) == 1
+    assert not any(c[0] == "publish" for c in server.calls)
+
+
+@pytest.mark.parametrize("lease", [False, True])
+def test_global_delivery_or_lease_appearing_during_repair_blocks_scheduling(repairable, lease):
+    server = repairable
+    repair = server.controller.cycle.repair_rejected
+
+    def concurrent(ident):
+        result = repair(ident)
+        server.controller._inventory = lambda: ([] if lease else [
+            {"id": "other", "variant_id": "other", "state": "pending"}], lease)
+        return result
+
+    server.controller.cycle.repair_rejected = concurrent
+    assert server.controller.run_once()["phase"] == "blocked"
+    assert server.ledger["records"][0]["state"] == "automatic_ready"
+    assert not any(c[0] == "publish" for c in server.calls)
+
+
+@pytest.mark.parametrize("status", [None,
+    {"eligible": "yes", "reason": "ELIGIBLE", "attempts": 0},
+    {"eligible": True, "reason": "ELIGIBLE", "attempts": True},
+    {"eligible": True, "reason": "ELIGIBLE", "attempts": 2},
+    {"eligible": True, "reason": "FAILED", "attempts": 1},
+])
+def test_malformed_or_contradictory_repair_status_cannot_call_editor(repairable, status):
+    server = repairable
+    server.controller.cycle.automatic_repair_status = lambda _: copy.deepcopy(status)
+    with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_STATUS_INVALID"):
+        server.controller.run_once()
+    assert not any(c[0] in {"repair", "publish"} for c in server.calls)
+
+
 def test_current_hour_known_rejection_preserves_candidate_and_all_evidence(server):
     record, path = completed_rejection(server)
     server.ledger["records"].append(record)
@@ -309,6 +578,7 @@ def test_current_hour_known_rejection_preserves_candidate_and_all_evidence(serve
     for _ in range(2):
         result = server.controller.run_once()
         assert result == {"phase": "rejected", "record_id": record["id"], "slot": record["slot"],
+                          "repair_status": "EXHAUSTED", "repair_attempts": 2,
                           "last_error": {"code": "ARTICLE_QUALITY_REJECTED"},
                           "next_run_at": (record["slot"] + 1) * 3600}
         assert server.ledger["records"] == [original]
@@ -325,7 +595,7 @@ def test_expired_known_rejection_closes_once_preserving_source_hour_and_trace(se
     result = server.controller.run_once()
     assert result["phase"] == "rejected"
     assert result["last_error"] == {"code": "ARTICLE_QUALITY_REJECTED"}
-    assert [c[0] for c in server.calls] == ["pre_draft_guard", "cancel"]
+    assert [c[0] for c in server.calls] == ["pre_draft_guard", "pre_draft_guard", "cancel"]
     assert server.ledger["records"] == [{**original, "state": "cancelled"}]
     assert path.read_bytes() == trace
     server.controller.selector = lambda *_a, **_k: None

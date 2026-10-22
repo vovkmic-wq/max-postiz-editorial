@@ -1,7 +1,7 @@
 """Один ограниченный серверный цикл; единственный PG leader lock удерживает CLI.
 
-Контроллер не отправляет сообщения и не исправляет отказы модели. Почасовой
-журнал, точное согласование политики и неизвестные исходы сохраняет прежний цикл.
+Контроллер не отправляет сообщения. Ограниченное исправление отказа он поручает
+прежнему циклу, который сохраняет журнал, точное согласование и неизвестные исходы.
 """
 import json
 import math
@@ -216,13 +216,83 @@ class ServerCycle:
         slot = record.get("slot")
         # Пока исходный час открыт, оператор может явно исправить кандидат.
         # Закрытие не освобождает использованный источник или занятый час.
-        if (type(slot) is not int or slot >= int(self.clock() // 3600)
-                or not self._known_rejection(record)):
+        if type(slot) is not int or slot >= int(self.clock() // 3600):
+            return False
+        # Claim может успеть попасть в Audit до записи ledger: старого trace недостаточно.
+        status = self._automatic_repair_status(record)
+        if status["eligible"] or status["reason"] != "EXPIRED" or not self._known_rejection(record):
             return False
         self.state.assert_running()
         self.cycle.cancel_preparation(record["id"],
             "Autonomous policy preserved a completed known rejection; no automatic correction or verdict retry")
         return True
+
+    def _automatic_repair_status(self, record):
+        status = self.cycle.automatic_repair_status(record)
+        if (not isinstance(status, dict) or not {"eligible", "reason", "attempts"} <= set(status)
+                or type(status["eligible"]) is not bool
+                or not isinstance(status["reason"], str) or not status["reason"].strip()
+                or type(status["attempts"]) is not int or not 0 <= status["attempts"] <= 2
+                or status["eligible"] and (status["attempts"] >= 2 or status["reason"] in {
+                    "CLAIM_LOST", "IN_PROGRESS", "FAILED", "EXHAUSTED", "NOT_REPAIRABLE", "NO_CHANGE", "EXPIRED"})):
+            raise AgentError("ARTICLE_AUTOMATIC_REPAIR_STATUS_INVALID", 409)
+        return status
+
+    def _repair_stopped(self, record, status, *, known_rejection=False):
+        if known_rejection or status["reason"] in {"EXHAUSTED", "NOT_REPAIRABLE", "NO_CHANGE"}:
+            return self._phase("rejected", record_id=record["id"], slot=record["slot"],
+                repair_status=status["reason"], repair_attempts=status["attempts"],
+                last_error={"code": "ARTICLE_QUALITY_REJECTED"})
+        return self._phase("blocked", record_id=record["id"], repair_status=status["reason"],
+                           last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
+
+    def _repair_current_rejection(self, record, settings, policy):
+        if (type(record.get("slot")) is not int or record["slot"] != int(self.clock() // 3600)
+                or not (record.get("error") == "ARTICLE_QUALITY_REJECTED"
+                        or record.get("automatic_repair_attempts"))):
+            return None
+        status = self._automatic_repair_status(record)
+        if not status["eligible"]:
+            return self._repair_stopped(record, status)
+        identity = {key: record.get(key) for key in ("id", "slot", "url", "original_hash", "input_hash",
+                    "policy_hash", "target_id", "source_id", "source_published_at")}
+        self.state.assert_running()
+        if record["slot"] != int(self.clock() // 3600):
+            return self._phase("rejected", record_id=record["id"], slot=record["slot"],
+                               last_error={"code": "ARTICLE_QUALITY_REJECTED"})
+        # Один вызов за проход. Лимит и незавершённый claim проверяет durable-протокол.
+        self._phase("preparing", record_id=record["id"], slot=record["slot"],
+                    operation="automatic_repair", repair_attempt=status["attempts"] + 1,
+                    last_error={"code": "ARTICLE_QUALITY_REJECTED"})
+        try:
+            result = self.cycle.repair_rejected(record["id"])
+        except AgentError as exc:
+            if exc.code != "ARTICLE_QUALITY_REJECTED":
+                raise
+            fresh = self.cycle._record(self.cycle._load(), record["id"])
+            if self._close_known_rejection(fresh):
+                return self._phase("rejected", record_id=fresh["id"], slot=fresh["slot"],
+                                   last_error={"code": "ARTICLE_QUALITY_REJECTED"})
+            status = self._automatic_repair_status(fresh)
+            return self._repair_stopped(fresh, status, known_rejection=status["eligible"])
+        fresh = self.cycle._record(self.cycle._load(), record["id"])
+        if (not isinstance(result, dict) or result.get("id") != record["id"]
+                or any(fresh.get(key) != value for key, value in identity.items())):
+            raise AgentError("ARTICLE_AUTOMATIC_REPAIR_RESULT_INVALID", 409)
+        if fresh.get("state") != "automatic_ready":
+            status = self._automatic_repair_status(fresh)
+            if status["eligible"]:
+                raise AgentError("ARTICLE_AUTOMATIC_REPAIR_RESULT_INVALID", 409)
+            return self._repair_stopped(fresh, status)
+        if (not fresh.get("variant_id")
+                or not fresh.get("postiz_id")
+                or any(fresh.get(key) is not None for key in ("dispatch_id", "due_at"))):
+            raise AgentError("ARTICLE_AUTOMATIC_REPAIR_RESULT_INVALID", 409)
+        active, leased = self._inventory()
+        if active or leased:
+            return self._phase("blocked", record_id=fresh["id"],
+                               last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
+        return self._ready(fresh, settings, policy)
 
     def run_once(self):
         control = self.state.read()
@@ -254,10 +324,12 @@ class ServerCycle:
             if record.get("dispatch_id"):
                 result = self.cycle.status(record["id"])
                 return self._observed_phase("reconciling", record, result)
-            if (self._close_known_rejection(record)
-                    or record.get("slot") == int(self.clock() // 3600) and self._known_rejection(record)):
+            if self._close_known_rejection(record):
                 return self._phase("rejected", record_id=record["id"], slot=record["slot"],
                                    last_error={"code": "ARTICLE_QUALITY_REJECTED"})
+            repaired = self._repair_current_rejection(record, settings, policy)
+            if repaired is not None:
+                return repaired
             return self._phase("blocked", record_id=record["id"],
                                last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
         ready = [r for r in ledger["records"] if r["state"] == "automatic_ready"]
@@ -283,13 +355,16 @@ class ServerCycle:
         self._phase("preparing", slot=slot, source_url=article["url"])
         try:
             result = self.cycle.prepare(article)
-        except AgentError:
+        except AgentError as exc:
             fresh = self.cycle._load()
             failed = next((r for r in reversed(fresh["records"]) if r.get("slot") == slot), None)
-            if failed and (self._close_known_rejection(failed)
-                    or failed.get("slot") == int(self.clock() // 3600) and self._known_rejection(failed)):
-                return self._phase("rejected", record_id=failed["id"], slot=slot,
-                                   last_error={"code": "ARTICLE_QUALITY_REJECTED"})
+            if exc.code == "ARTICLE_QUALITY_REJECTED" and failed:
+                if self._close_known_rejection(failed):
+                    return self._phase("rejected", record_id=failed["id"], slot=slot,
+                                       last_error={"code": "ARTICLE_QUALITY_REJECTED"})
+                repaired = self._repair_current_rejection(failed, settings, policy)
+                if repaired is not None:
+                    return repaired
             raise
         record = self.cycle._record(self.cycle._load(), result["id"])
         if record.get("state") != "automatic_ready":
