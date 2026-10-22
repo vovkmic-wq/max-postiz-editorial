@@ -19,7 +19,8 @@ from .reddit import text_hash
 from .server_state import require_running
 
 MAX_AUTOMATIC_REPAIRS = 2
-QUARANTINE_ERRORS = {"ARTICLE_REPAIR_RESPONSE_INVALID", "ARTICLE_REPAIR_PATCH_INVALID"}
+QUARANTINE_ERRORS = {"ARTICLE_REPAIR_RESPONSE_INVALID", "ARTICLE_REPAIR_PATCH_INVALID",
+                     "TRANSLATION_REFERENCE_CHANGED"}
 _BINDING = ("id", "number", "contract", "model", "input_hash", "policy_hash", "slot",
             "parent_trace_hash", "parent_trace_bytes", "snapshot_hash", "snapshot_path", "prompts", "target_binding_hash",
             "source_config_hash")
@@ -125,7 +126,7 @@ class AutomaticArticleRepair:
             return {**result, "reason": {"not_repairable": "NOT_REPAIRABLE", "no_change": "NO_CHANGE"}.get(history[-1]["state"], "EXHAUSTED")}
         if len(history) >= MAX_AUTOMATIC_REPAIRS:
             return {**result, "reason": "EXHAUSTED"}
-        if self.cycle._policy().get("approval_mode") != "automatic":
+        if self.cycle._policy_for_record(record).get("approval_mode") != "automatic":
             return result
         return {**result, "eligible": True, "reason": "READY"}
 
@@ -138,7 +139,7 @@ class AutomaticArticleRepair:
         require_running(self.core)
         self.cycle._assert_pre_draft(record)
         if (record["slot"] != int(_now() // 3600)
-                or fingerprint(self.cycle._policy()) != record["policy_hash"]
+                or fingerprint(self.cycle._policy_for_record(record)) != record["policy_hash"]
                 or record["policy_hash"] != fingerprint(policy)):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         source, target = self.cycle._source_target(policy)
@@ -159,6 +160,7 @@ class AutomaticArticleRepair:
     def _payload(self, record):
         """Читаем полный завершённый отказ, не принимая замечания за инструкции."""
         from .adapters import extract_object
+        from .article_attribution import article_footer
         from .article_quality import (_numeric_feedback, normalize_article_links, normalize_rubric_review,
                                       rubric_spelling, rubric_translation_gate, TOPICS)
         from .editorial import numbers
@@ -273,7 +275,7 @@ class AutomaticArticleRepair:
                         require(fingerprint(supplied) == attempt["candidate_raw_hash"])
                     tail, retry = block[1:], None
                 translated = candidate["title"] + "\n\n" + candidate["body"]
-                full = translated + "\n\nИсточник: " + article["url"] + "\nПеревод и редактура с помощью нейросетей."
+                full = translated + "\n\n" + article_footer(article["url"])
                 gate_error = None
                 try:
                     rubric_translation_gate(original, translated, "meaning-first-v1")
@@ -350,15 +352,16 @@ class AutomaticArticleRepair:
         return write
 
     def _quarantine_proof(self, record, claim, *, saved=False):
-        """Завершённый неверный JSON можно отложить; неизвестный запрос — нельзя."""
+        """Полный заведомо негодный ответ можно отложить; неизвестный запрос — нельзя."""
         code = claim.get("error")
         if code not in QUARANTINE_ERRORS:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409)
         self.cycle._assert_pre_draft(record)
         snapshot = parse_json(inside(self.core.settings.root, claim["snapshot_path"]).read_text(encoding="utf-8"))
         self._files(record, claim, snapshot["article"])
-        source, target = self.cycle._source_target(self.cycle._policy())
-        if (self._prompts() != claim["prompts"] or fingerprint(self.cycle._policy()) != claim["policy_hash"]
+        policy = self.cycle._policy_for_record(record)
+        source, target = self.cycle._source_target(policy)
+        if (self._prompts() != claim["prompts"] or fingerprint(policy) != claim["policy_hash"]
                 or fingerprint(source) != claim["source_config_hash"] or target.binding_hash != claim["target_binding_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         with self.core.db.session() as session:
@@ -373,18 +376,48 @@ class AutomaticArticleRepair:
             "old_replay_hash": repair_replay_hash(snapshot["candidate"]),
             "feedback_hash": fingerprint(snapshot["feedback"])}
         article = snapshot["article"]
+        from .editorial import numbers
+        expected_context = {"source_untrusted": {
+            "title": article["title"].strip(), "body": article["original"].strip(), "url": article["url"]},
+            "candidate_untrusted": snapshot["candidate"], "feedback_untrusted": snapshot["feedback"],
+            "numeric_tokens_must_match_exactly": sorted(numbers(article["title"].strip() + "\n\n"
+                                                               + article["original"].strip()))}
         if ([e.get("phase") for e in events] != ["repair_started", "repair_returned", "repair_failed"]
                 or any(e.get("record_id") != record["id"] or e.get("repair_claim") != claim["id"]
                        or e.get("attempt") != 1 or e.get("binding") != expected for e in events)
                 or any(type(e.get("at")) not in {int, float} or not math.isfinite(e["at"])
                        or e["at"] < claim["started_at"] for e in events)
                 or [e["at"] for e in events] != sorted(e["at"] for e in events)
-                or events[0].get("context", {}).get("source_untrusted") != {
-                    "title": article["title"].strip(), "body": article["original"].strip(), "url": article["url"]}
-                or events[0].get("context", {}).get("candidate_untrusted") != snapshot["candidate"]
-                or events[0].get("context", {}).get("feedback_untrusted") != snapshot["feedback"]
+                or events[0].get("context") != expected_context
+                or claim.get("finished_at") is not None and (
+                    type(claim["finished_at"]) not in {int, float}
+                    or not math.isfinite(claim["finished_at"])
+                    or any(e["at"] > claim["finished_at"] for e in events))
                 or events[-1].get("error") != code or not isinstance(events[1].get("raw"), str)
                 or not events[1]["raw"].strip() or len(events[1]["raw"].encode("utf-8")) > 128 * 1024):
+            raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409)
+        # Повторяем только чистую проверку сохранённого ответа. Редактор ниже
+        # возвращает уже записанный raw: модели, HTTP и trace writer отсутствуют.
+        # Одной надписи repair_failed недостаточно для снятия блокировки claim.
+        from .article_repair import ArticleRepair
+        if (claim["contract"] != REPAIR_CONTRACT or claim["model"] != REPAIR_MODEL
+                or fingerprint(self._payload(record)) != fingerprint(snapshot)):
+            raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409)
+
+        class SavedResponse:
+            model = REPAIR_MODEL
+
+            def generate_text(self, _prompt):
+                return events[1]["raw"], {}
+
+        replay = ArticleRepair(SavedResponse(), prompt_dir=self.core.settings.root / "prompts")
+        try:
+            replay.propose(article, snapshot["candidate"], snapshot["feedback"],
+                rejected_replay_hashes=snapshot["rejected_replay_hashes"])
+        except AgentError as exc:
+            if exc.code != code:
+                raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409) from exc
+        else:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409)
         if saved:
             with self.core.db.session() as session:
@@ -395,6 +428,84 @@ class AutomaticArticleRepair:
                                              "snapshot_hash": claim["snapshot_hash"]}):
                     raise AgentError("ARTICLE_AUTOMATIC_REPAIR_CLAIM_LOST", 409)
         return _sha(raw)
+
+    def quarantine_failed_reference(self, ident, reason):
+        """Адресный одноразовый карантин старого полного отказа по потере ссылки.
+
+        Ничего не переводит и не отправляет. Неизвестный исход, другое нарушение
+        или потерянный durable claim сохраняют блокировку. Запуск возможен только
+        на общей паузе; исходные failed-поля и доказательства остаются в истории.
+        """
+        from .server_models import EditorialControl
+        from .server_state import CONTROL_ID
+        error = "ARTICLE_AUTOMATIC_REPAIR_REFERENCE_QUARANTINE_NOT_SAFE"
+        if not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 2000:
+            raise AgentError("ARTICLE_AUTOMATIC_REPAIR_QUARANTINE_REASON_REQUIRED", 409)
+        reason = reason.strip()
+        with profile_lock(self.cycle.directory / "cycle.lock"):
+            ledger = self.cycle._load()
+            record = self.cycle._record(ledger, ident)
+            history, blocked = self._history(record)
+            if (blocked != "FAILED" or not history or record.get("state") != "needs_attention"
+                    or record.get("error") != "TRANSLATION_REFERENCE_CHANGED"
+                    or any(claim.get("state") != "rejected" for claim in history[:-1])):
+                raise AgentError(error, 409)
+            claim = history[-1]
+            if (claim.get("state") != "failed" or claim.get("error") != "TRANSLATION_REFERENCE_CHANGED"
+                    or claim.get("outcome_origin") is not None
+                    or any(claim.get(key) is not None for key in ("proposal_path", "candidate_hash"))
+                    or any(type(claim.get(key)) not in {int, float} or not math.isfinite(claim[key])
+                           for key in ("started_at", "finished_at"))
+                    or claim["finished_at"] < claim["started_at"]
+                    or record.get("policy_hash") != claim["policy_hash"]
+                    or record.get("input_hash") != claim["input_hash"]
+                    or record.get("slot") != claim["slot"]):
+                raise AgentError(error, 409)
+            policy = self.cycle._policy_for_record(record)
+            if (policy.get("approval_mode") != "automatic"
+                    or record.get("target_id") != policy["target_id"]
+                    or record.get("source_id") != policy["source_id"]):
+                raise AgentError(error, 409)
+            key = str(uuid5(NAMESPACE_URL, claim["id"] + ":quarantine"))
+            receipt = str(uuid5(NAMESPACE_URL, claim["id"] + ":reference-quarantine"))
+            with self.core.db.session() as session:
+                control = session.get(EditorialControl, CONTROL_ID)
+                if control is None or not control.paused:
+                    raise AgentError("EDITORIAL_PAUSE_BEFORE_QUARANTINE", 409)
+                if session.get(Audit, key) or session.get(Audit, receipt):
+                    raise AgentError("ARTICLE_AUTOMATIC_REPAIR_QUARANTINE_ALREADY_ATTEMPTED", 409)
+            hashed = self._quarantine_proof(record, claim)
+            previous = copy.deepcopy(claim)
+            action = {"at": _now(), "action": "quarantine_failed_reference", "reason": reason,
+                "claim_id": claim["id"], "previous_record_state": record["state"],
+                "previous_record_error": record["error"], "previous_claim_hash": fingerprint(previous),
+                "trace_hash": hashed, "snapshot_hash": claim["snapshot_hash"]}
+            try:
+                with self.core.db.session.begin() as session:
+                    # Control блокируется до фиксации claims: параллельное start
+                    # не может разрешить отправку во время адресного восстановления.
+                    control = session.scalar(select(EditorialControl).where(
+                        EditorialControl.id == CONTROL_ID).with_for_update())
+                    if control is None or not control.paused:
+                        raise AgentError("EDITORIAL_PAUSE_BEFORE_QUARANTINE", 409)
+                    self._quiet_session(session)
+                    session.add(Audit(id=key, actor="automatic_article_repair",
+                        action="automatic_article_repair_quarantined", entity=ident,
+                        details={"claim_id": claim["id"], "error": claim["error"], "trace_hash": hashed,
+                                 "snapshot_hash": claim["snapshot_hash"]}))
+                    session.add(Audit(id=receipt, actor="automatic_article_repair",
+                        action="automatic_article_repair_reference_quarantine", entity=ident,
+                        details={**action, "previous_failure": previous}))
+            except IntegrityError as exc:
+                raise AgentError("ARTICLE_AUTOMATIC_REPAIR_QUARANTINE_ALREADY_ATTEMPTED", 409) from exc
+            # Audit PK уже durable. Неуспешный save не разрешает повтор операции.
+            claim.update(state="not_repairable", outcome_origin="protocol_guard",
+                repair_trace_hash=hashed, quarantine_previous_failure=previous,
+                quarantined_at=action["at"], quarantine_reason=reason)
+            record.setdefault("preparation_actions", []).append(action)
+            record.update(state="needs_attention", error="ARTICLE_QUALITY_REJECTED")
+            self.cycle._save(ledger)
+            return {"id": ident, "claim_id": claim["id"], "state": "not_repairable", "trace_hash": hashed}
 
     def authorize(self, record, claim_id, candidate, article):
         """Проверка перехода в штатный prepare после освобождения cycle.lock."""
@@ -418,7 +529,7 @@ class AutomaticArticleRepair:
                 or _sha(inside(self.core.settings.root, record["quality_trace"]).read_bytes()) != claim["parent_trace_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         self._files(record, claim, article, candidate)
-        self._quiet(record, self.cycle._policy())
+        self._quiet(record, self.cycle._policy_for_record(record))
         return claim
 
     def _files(self, record, claim, article, candidate=None):
@@ -464,7 +575,7 @@ class AutomaticArticleRepair:
         self._files(record, claim, snapshot["article"])
 
     def after_quality(self, record, claim, article):
-        source, target = self._quiet(record, self.cycle._policy())
+        source, target = self._quiet(record, self.cycle._policy_for_record(record))
         if (self._prompts() != claim["prompts"] or fingerprint(article) != claim["input_hash"]
                 or target.binding_hash != claim["target_binding_hash"] or fingerprint(source) != claim["source_config_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
@@ -484,8 +595,9 @@ class AutomaticArticleRepair:
     def run(self, ident):
         cycle, editor, claim = self.cycle, None, None
         with profile_lock(cycle.directory / "cycle.lock"):
-            policy, ledger = cycle._policy(), cycle._load()
+            ledger = cycle._load()
             record = cycle._record(ledger, ident)
+            policy = cycle._policy_for_record(record)
             status = self.status(record)
             if not status["eligible"]:
                 raise AgentError("ARTICLE_AUTOMATIC_REPAIR_" + status["reason"], 409)

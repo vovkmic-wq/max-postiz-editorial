@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0",
+  "revision": 1,
+  "sources": [
+    {
+      "id": "noirlab_iotw",
+      "enabled": false,
+      "type": "html",
+      "name": "NOIRLab: научный текст недели",
+      "endpoint": "https://noirlab.edu/public/images/iotw/",
+      "external_chat_id": null,
+      "channel_ids": ["main"],
+      "language_hint": "en",
+      "trust": "primary",
+      "access_ref": null,
+      "interval_seconds": 3600,
+      "lookback_hours": 8760,
+      "max_items_per_run": 30,
+      "full_text": true,
+      "extraction_profile": "server_science",
+      "collection_mode": "manual",
+      "purpose": "news",
+      "rights": {
+        "basis": "cc_by_4_0_text",
+        "evidence_ref": "https://noirlab.edu/public/copyright/",
+        "verified": true,
+        "attribution_required": true,
+        "allow_storage": true,
+        "allow_derivative": true,
+        "allow_full_repost": true,
+        "allow_media": false
+      }
+    },
+    {
+      "id": "esahubble_potw",
+      "enabled": false,
+      "type": "html",
+      "name": "ESA/Hubble: научный текст недели",
+      "endpoint": "https://esahubble.org/images/potw/",
+      "external_chat_id": null,
+      "channel_ids": ["main"],
+      "language_hint": "en",
+      "trust": "primary",
+      "access_ref": null,
+      "interval_seconds": 3600,
+      "lookback_hours": 8760,
+      "max_items_per_run": 30,
+      "full_text": true,
+      "extraction_profile": "server_science",
+      "collection_mode": "manual",
+      "purpose": "news",
+      "rights": {
+        "basis": "cc_by_4_0_text",
+        "evidence_ref": "https://esahubble.org/copyright/",
+        "verified": true,
+        "attribution_required": true,
+        "allow_storage": true,
+        "allow_derivative": true,
+        "allow_full_repost": true,
+        "allow_media": false
+      }
+    }
+  ]
+}

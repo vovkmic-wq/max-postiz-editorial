@@ -127,6 +127,8 @@ def _correct(cycle, ident, correction, reviewed_hash, reason):
         raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
     ledger = cycle._load()
     record = cycle._record(ledger, ident)
+    from .article_sources import require_legacy_source
+    require_legacy_source(record)
     claim_id = str(uuid5(NAMESPACE_URL, "max-postiz:staged-automatic-correction:" + ident))
     with core.db.session() as session:
         if record.get("automatic_corrections") or session.get(Audit, claim_id):
@@ -433,6 +435,8 @@ def _recover_staged_spelling(cycle, ident, correction, reviewed_hash, trace_sha2
         core, policy = cycle.core, cycle._policy()
         ledger = cycle._load()
         record = cycle._record(ledger, ident)
+        from .article_sources import require_legacy_source
+        require_legacy_source(record)
         claim = str(uuid5(NAMESPACE_URL, namespace + ident))
         with core.db.session() as session:
             if record.get(ledger_key) or session.get(Audit, claim):

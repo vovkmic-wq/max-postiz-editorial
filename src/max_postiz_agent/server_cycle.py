@@ -71,6 +71,41 @@ class ServerCycle:
     def _select(self, settings, ledger, policy):
         if self.selector is not None:
             return self.selector(settings, ledger=ledger, policy=policy, now=self.clock())
+        if settings["source"] == "open_science":
+            from .server_nasa import select_nasa_article
+            from .server_science import select_science_article
+            policies = self.cycle._policies()
+            # Приоритет вращается по общему часу; после перезапуска часа нет второй подготовки.
+            offset = int(self.clock() // 3600) % len(policies)
+            policies = policies[offset:] + policies[:offset]
+            failures = []
+            for current in policies:
+                self.state.assert_running()
+                try:
+                    if current["source_id"] == policy["source_id"]:
+                        article = select_nasa_article(self.core, settings["nasa"], ledger,
+                            current, now=self.clock(), checkpoint=True)
+                    else:
+                        article = select_science_article(self.core, current["source_id"],
+                            settings["nasa"], ledger, current, now=self.clock(), checkpoint=True)
+                    if article is not None:
+                        if fingerprint(self.cycle._policy_for_article(article)) != fingerprint(current):
+                            raise AgentError("ARTICLE_SOURCE_CHANGED", 409)
+                        self.state.phase("selecting", source_errors=failures)
+                        return article
+                except AgentError as exc:
+                    # Неудачный GET другого источника не одобряет его текст и не повторяется.
+                    # Пауза/потеря leader и нарушение границ подбора останавливают весь цикл.
+                    if exc.code not in {"NASA_SOURCE_UNAVAILABLE", "SCIENCE_SOURCE_UNAVAILABLE",
+                            "NASA_SOURCE_CATALOG_INVALID", "SCIENCE_SOURCE_CATALOG_INVALID",
+                            "SCIENCE_SOURCE_CONTENT_INVALID", "SCIENCE_SOURCE_ACCESS_BLOCKED",
+                            "ARTICLE_SOURCE_TOO_LARGE",
+                            "ARTICLE_SOURCE_RIGHTS_REVIEW_REQUIRED"}:
+                        raise
+                    failures.append({"source_id": current["source_id"], "code": exc.code})
+            self.state.phase("selecting", source_errors=failures,
+                last_error={"code": "SCIENCE_SOURCES_UNAVAILABLE"} if failures else None)
+            return None
         if settings["source"] != "nasa_svs":
             # Другой источник требует отдельной привязки разрешений и прав на текст.
             raise AgentError("EDITORIAL_SOURCE_POLICY_REQUIRED", 409)
@@ -78,6 +113,7 @@ class ServerCycle:
         return select_nasa_article(self.core, settings["nasa"], ledger, policy, now=self.clock(), checkpoint=True)
 
     def _ready(self, record, settings, policy):
+        policy = self.cycle._policy_for_record(record)
         self.state.assert_running()
         snapshot = self.cycle._snapshot(record)
         hashed = fingerprint(snapshot)
@@ -109,6 +145,7 @@ class ServerCycle:
 
     def _resume_pending(self, record, dispatch_id, settings, policy):
         """Возобновить только прежнюю точную отправку после общей паузы."""
+        policy = self.cycle._policy_for_record(record)
         with self.core.db.session() as session:
             target = session.get(Target, record.get("target_id"))
             if target is not None and not target.paused:
@@ -247,6 +284,7 @@ class ServerCycle:
                            last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
 
     def _repair_current_rejection(self, record, settings, policy):
+        policy = self.cycle._policy_for_record(record)
         if (type(record.get("slot")) is not int or record["slot"] != int(self.clock() // 3600)
                 or not (record.get("error") == "ARTICLE_QUALITY_REJECTED"
                         or record.get("automatic_repair_attempts"))):

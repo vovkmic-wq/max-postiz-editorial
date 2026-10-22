@@ -95,6 +95,8 @@ def _migrate(cycle, record_id, reason):
     cycle._clear_outstanding(policy["target_id"])
     ledger = cycle._load()
     record = cycle._record(ledger, record_id)
+    from .article_sources import require_legacy_source
+    require_legacy_source(record)
     original_record = copy.deepcopy(record)
     with core.db.session() as session:
         captured = _capture(cycle, session, record, policy)

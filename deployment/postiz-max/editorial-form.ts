@@ -25,7 +25,7 @@ export function formFromSettings(settings: EditorialSettings): EditorialForm {
 export function settingsFromForm(settings: EditorialSettings, form: EditorialForm): EditorialSettings {
   const minutes = Number(form.interval), nasaRating = Number(form.nasaRating), redditRating = Number(form.redditRating);
   const comments = Number(form.redditComments), age = Number(form.redditAge), limit = Number(form.redditLimit);
-  if (!['nasa_svs', 'reddit'].includes(form.source) || !Number.isSafeInteger(minutes) || minutes < 60 || minutes > 1440 ||
+  if (!['nasa_svs', 'open_science', 'reddit'].includes(form.source) || !Number.isSafeInteger(minutes) || minutes < 60 || minutes > 1440 ||
       nasaRating !== 0 || !Number.isSafeInteger(redditRating) || redditRating < 0 || redditRating > 1000000 ||
       !Number.isSafeInteger(comments) || comments < 0 || comments > 1000000 || !Number.isSafeInteger(age) || age < 1 || age > 8760 ||
       !Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !['top', 'new', 'hot'].includes(form.redditSort) ||

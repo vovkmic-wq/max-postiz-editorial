@@ -44,6 +44,10 @@ def detect_language(text):
 
 # Собираем материалы разрешённого веб-источника.
 def collect_web(source, cursor, http, root):
+    # Этот профиль обслуживает строгий серверный сборщик с доказательствами
+    # лицензии и полными ссылками. Общий HTML-парсер не может заменить его.
+    if source.get("extraction_profile") == "server_science":
+        raise AgentError("SCIENCE_DEDICATED_COLLECTOR_REQUIRED", 409)
     if source["type"] == "json_api":
         from .json_source import collect_json
         return collect_json(source, cursor, http, root)

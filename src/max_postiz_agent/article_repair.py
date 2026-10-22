@@ -9,6 +9,7 @@ import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from .article_attribution import article_footer
 from .article_quality import (
     MEANING_FIRST_REVIEW_RUBRIC,
     _validated_source,
@@ -242,7 +243,7 @@ class ArticleRepair:
                 raise AgentError("ARTICLE_REPAIR_UNCHANGED", 409)
             text = proposed["title"] + "\n\n" + proposed["body"]
             rubric_translation_gate(source, text, MEANING_FIRST_REVIEW_RUBRIC)
-            _require(len(text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей.") <= 3500,
+            _require(len(text + "\n\n" + article_footer(url)) <= 3500,
                      "ARTICLE_POST_TOO_LONG")
             evidence.update(outcome="candidate", new_candidate_hash=fingerprint(proposed),
                             replay_hash=replay, actual_changes_hash=fingerprint(actual),

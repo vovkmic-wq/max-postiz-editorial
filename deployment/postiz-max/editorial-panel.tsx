@@ -26,7 +26,7 @@ const errors: Record<string, string> = {
   REDDIT_APPROVAL_REQUIRED: 'Доступ Reddit или права на перевод и внешнюю публикацию ещё не подтверждены.',
   REDDIT_SETTINGS_INVALID: 'Проверьте настройки Reddit: имена сообществ и авторов, рейтинг и период.',
   INPUT_INVALID: 'Проверьте заполненные поля и обновите сохранённые настройки.',
-  NASA_RATING_UNAVAILABLE: 'NASA SVS не предоставляет рейтинг материалов. Для этого источника рейтинг должен оставаться равным нулю.',
+  NASA_RATING_UNAVAILABLE: 'Научные источники не предоставляют проверенный рейтинг материалов. Рейтинг должен оставаться равным нулю.',
   EDITORIAL_SOURCE_POLICY_REQUIRED: 'Для выбранного источника не настроены проверенные права и политика обработки. Публикация заблокирована.',
   ARTICLE_RECONCILIATION_REQUIRED: 'Есть незавершённая отправка. Требуется сверка результата; повторная отправка заблокирована.',
   EDITORIAL_LEADERSHIP_LOST: 'Потеряно право управления циклом. Требуется сверка серверного процесса.',
@@ -61,6 +61,9 @@ const phases: Record<string, string> = {
   selection_slot_expired: 'Час отбора завершился — ожидаем следующий', waiting_interval: 'Ожидание допустимого интервала между доставками',
 };
 export function phaseText(phase?: string) { return phases[phase || ''] || phase || '—'; }
+export function sourceText(source?: string) {
+  return ({ nasa_svs: 'NASA SVS', nasa_svs_articles: 'NASA SVS', open_science: 'Открытая наука', noirlab_iotw: 'NOIRLab', esahubble_potw: 'ESA/Hubble', reddit: 'Reddit' } as Record<string, string>)[source || ''] || source || '—';
+}
 async function api(path: string, method = 'GET', body?: unknown, signal?: AbortSignal) {
   // Нативный fetch не переносит cookie в auth-header и не раскрывает внутренний ключ.
   const response = await fetch(`/api/editorial/${path}`, {
@@ -77,12 +80,12 @@ export function EditorialRecords({ records }: { records: Recent[] }) {
     <thead><tr><th>Материал</th><th>Источник</th><th>Состояние</th><th>Время</th></tr></thead>
     <tbody>{records.map(record => <tr key={record.id}>
       <td>{safeSourceUrl(record.url) ? <a href={safeSourceUrl(record.url)} target="_blank" rel="noopener noreferrer">{record.title || record.id}</a> : record.title || record.id}</td>
-      <td>{record.source || '—'}</td><td>{phaseText(record.state)}{record.error && <span className={styles.detail}>{errorText(record.error)}</span>}</td><td>{readableTime(record.updated_at)}</td>
+      <td>{sourceText(record.source)}</td><td>{phaseText(record.state)}{record.error && <span className={styles.detail}>{errorText(record.error)}</span>}</td><td>{readableTime(record.updated_at)}</td>
     </tr>)}</tbody></table>{!records.length && <p className={styles.muted}>Записей пока нет. История появится после первого цикла.</p>}</div>;
 }
 
-export function NasaRatingField() {
-  return <label className={styles.field}><span>Рейтинг NASA</span>
+export function NasaRatingField({ mixed = false }: { mixed?: boolean } = {}) {
+  return <label className={styles.field}><span>{mixed ? 'Рейтинг источника' : 'Рейтинг NASA'}</span>
     <input type="number" value="0" disabled readOnly />
     <span className={styles.muted}>Источник не предоставляет оценку</span>
   </label>;
@@ -146,13 +149,13 @@ export function EditorialPanel() {
     <section className={styles.card} aria-labelledby="settings-heading"><h2 id="settings-heading">Источники и отбор</h2>
       {form && settings ? <form onSubmit={event => { event.preventDefault(); perform(() => api('settings', 'PUT', { revision, settings: settingsFromForm(settings, form) }), true); }}>
         <div className={styles.grid}>
-          <label className={styles.field}>Источник<select value={form.source} onChange={event => change('source', event.target.value)} disabled={pending}><option value="nasa_svs">NASA SVS</option><option value="reddit">Reddit</option></select></label>
+          <label className={styles.field}>Источник<select value={form.source} onChange={event => change('source', event.target.value)} disabled={pending}><option value="open_science">Открытая наука: NASA, NOIRLab, ESA/Hubble</option><option value="nasa_svs">NASA SVS</option><option value="reddit">Reddit</option></select></label>
           {field('Интервал между статьями, минут', 'interval', 'number', 'Не менее 60 минут. Догоняющих пачек после простоя нет.')}
         </div>
-        {form.source === 'nasa_svs' ? <div className={styles.grid}>
-          {field('Авторы NASA', 'nasaAuthors', 'textarea', 'По одному имени на строку или через запятую. Пусто — любой автор.')}
-          {field('Ключевые слова NASA', 'nasaKeywords', 'textarea', 'Подойдёт любая из указанных фраз. Пусто — без фильтра по словам.')}
-          <NasaRatingField />
+        {['nasa_svs', 'open_science'].includes(form.source) ? <div className={styles.grid}>
+          {field(form.source === 'open_science' ? 'Авторы' : 'Авторы NASA', 'nasaAuthors', 'textarea', 'По одному имени на строку или через запятую. Пусто — любой автор.')}
+          {field(form.source === 'open_science' ? 'Ключевые слова' : 'Ключевые слова NASA', 'nasaKeywords', 'textarea', 'Подойдёт любая из указанных фраз. Пусто — без фильтра по словам.')}
+          <NasaRatingField mixed={form.source === 'open_science'} />
         </div> : <>
           {state?.capabilities?.reddit?.available !== true && <div className={styles.notice}>Reddit включается только после проверки доступа к API и прав на публикацию. Выбор источника сам по себе не снимает эти проверки.</div>}
           <div className={styles.grid}>

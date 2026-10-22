@@ -15,6 +15,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
 from .adapters import OpenCode
+from .article_attribution import article_footer
 from .browser_runtime import profile_lock
 from .config import AgentError, fingerprint, inside, parse_json
 from .db import Audit, Draft, DraftRevision, Material, Story, now, uid
@@ -76,6 +77,24 @@ class HourlyArticleCycle:
         except (OSError, ValueError, TypeError) as exc:
             raise AgentError("ARTICLE_LEDGER_INVALID", 409) from exc
 
+    def _policies(self, enabled=True):
+        from .article_sources import registered_policies
+        return registered_policies(self._policy(enabled=enabled), self.core.settings)
+
+    def _policy_for_article(self, article):
+        from .article_sources import policy_for_article
+        return policy_for_article(self._policy(), self.core.settings, article)
+
+    def _policy_for_record(self, record):
+        from .article_sources import policy_for_record
+        return policy_for_record(self._policy(), self.core.settings, record)
+
+    def _policy_for_source(self, source_id, enabled=True):
+        for policy in self._policies(enabled=enabled):
+            if policy["source_id"] == source_id:
+                return policy
+        raise AgentError("EDITORIAL_SOURCE_POLICY_REQUIRED", 409)
+
     def _save(self, ledger):
         from .server_state import DatabaseArticleLedger
         if DatabaseArticleLedger(self).save(ledger):
@@ -112,6 +131,14 @@ class HourlyArticleCycle:
             return source, target
 
     def _article(self, article, policy, source, target):
+        from .article_sources import source_spec, validate_source_url
+        if policy["source_id"] in {"noirlab_iotw", "esahubble_potw"}:
+            spec = source_spec(policy["source_id"])
+            if (policy["allowed_hosts"] != [spec["host"]]
+                    or policy["rights_evidence"] != spec["rights_evidence"]
+                    or source["id"] != policy["source_id"]):
+                raise AgentError("EDITORIAL_SOURCE_POLICY_REQUIRED", 409)
+            validate_source_url(policy["source_id"], article.get("url"))
         try:
             if set(article) != {"url", "title", "original", "published_at"}:
                 raise ValueError
@@ -559,7 +586,7 @@ class HourlyArticleCycle:
         with profile_lock(self.directory / "cycle.lock"):
             from .server_state import require_running
             require_running(self.core)
-            policy = self._policy()
+            policy = self._policy_for_article(article)
             source, target = self._source_target(policy)
             article = self._article(article, policy, source, target)
             self._clear_outstanding(target.id)
@@ -680,6 +707,9 @@ class HourlyArticleCycle:
         from .server_state import require_running
         require_running(self.core)
         attempt = attempt or {}
+        if fingerprint(self._policy_for_record(record)) != record["policy_hash"]:
+            raise AgentError("ARTICLE_POLICY_CHANGED", 409)
+        self._source_target(policy)
         original_hash = record["original_hash"]
         material_hash = fingerprint(" ".join(article["original"].casefold().split()))
         if prepared["url"] != article["url"]:
@@ -774,6 +804,8 @@ class HourlyArticleCycle:
             if policy.get("approval_mode") != "human":
                 raise AgentError("ARTICLE_HUMAN_REVIEW_NOT_ELIGIBLE", 409)
             record = self._record(ledger, ident)
+            from .article_sources import require_legacy_source
+            require_legacy_source(record)
             if (record["state"] not in {"needs_attention", "rejected", "failed", "cancelled"}
                     or (record["state"] == "cancelled" and restore_cancelled is not True)):
                 raise AgentError("ARTICLE_REJECTED_RECOVERY_NOT_SAFE", 409)
@@ -883,6 +915,8 @@ class HourlyArticleCycle:
         with profile_lock(self.directory / "cycle.lock"):
             policy, ledger = self._policy(), self._load()
             record = self._record(ledger, ident)
+            from .article_sources import require_legacy_source
+            require_legacy_source(record)
             if policy.get("approval_mode") == "automatic" and record.get("postiz_id"):
                 raise AgentError("ARTICLE_EDIT_IN_POSTIZ_REQUIRED", 409)
             if (record["state"] != "prepared" or not record.get("variant_id")
@@ -1060,8 +1094,7 @@ class HourlyArticleCycle:
             if (first.get("mode") != "candidate" or first.get("candidate") != canonical
                     or first.get("candidate_raw", first.get("candidate")) != candidate
                     or first.get("source_untrusted") != source
-                    or gate.get("characters") != len(translation + "\n\nИсточник: " + article["url"] +
-                                                       "\nПеревод и редактура с помощью нейросетей.")
+                    or gate.get("characters") != len(translation + "\n\n" + article_footer(article["url"]))
                     or context.get("instruction") != prompt or context.get("review_prompt_hash") != prompt_hash
                     or context.get("review_rubric") != "meaning-first-v1"
                     or context.get("source_untrusted") != original or context.get("translation_untrusted") != translation
@@ -1133,6 +1166,8 @@ class HourlyArticleCycle:
         with profile_lock(self.directory / "cycle.lock"):
             policy, ledger = self._policy(), self._load()
             record = self._record(ledger, ident)
+            from .article_sources import require_legacy_source
+            require_legacy_source(record)
             if (policy.get("approval_mode") != "automatic" or record.get("state") != "needs_attention"
                     or record.get("error") != "ARTICLE_QUALITY_REJECTED" or record["slot"] != int(now() // 3600)
                     or record.get("policy_hash") != fingerprint(policy)):

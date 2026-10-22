@@ -5,6 +5,7 @@ import re
 
 from sqlalchemy import select
 
+from .article_attribution import article_footer, requires_licensed_footer
 from .config import AgentError, fingerprint
 from .browser_runtime import profile_lock
 from .db import Audit, Material, now
@@ -198,11 +199,14 @@ def candidate_body(variant, source):
         if body.startswith(prefix) and body[len(prefix):] and not body[len(prefix):].startswith("\n"):
             body = body[len(prefix):]
             break
-    footer = "Источник: " + source["url"] + "\nПеревод и редактура с помощью нейросетей."
+    footer = article_footer(source["url"])
     for separator in ("\n\n", "\n"):
         suffix = separator + footer
         if body.endswith(suffix) and not body[:-len(suffix)].endswith("\n"):
             return body[:-len(suffix)]
+    if requires_licensed_footer(source["url"]):
+        # Потерянная лицензия или attribution не снимаются старым NASA-форматом.
+        raise AgentError("ARTICLE_ATTRIBUTION_REQUIRED", 409)
     # Keep the pre-existing two-LF legacy attribution contract. A single-LF
     # boundary is accepted only with the complete service disclosure above.
     legacy_footer = "\n\nИсточник: " + source["url"]

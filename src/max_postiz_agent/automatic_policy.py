@@ -113,8 +113,10 @@ def automatic_evidence(session, variant):
 def eligible(core, session, variant):
     from .article_cycle import HourlyArticleCycle
     cycle = HourlyArticleCycle(core)
-    policy = cycle._policy()
     record = next((value for value in cycle._load()["records"] if value.get("variant_id") == variant.id), None)
+    if record is None:
+        raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
+    policy = cycle._policy_for_record(record)
     return _eligible_record(cycle, session, variant, policy, record)
 
 
@@ -124,6 +126,7 @@ def _eligible_record(cycle, session, variant, policy, record):
             or variant.metadata_json.get("approval_mode") != "automatic"
             or variant.metadata_json.get("origin") != "hourly_article_test"
             or variant.target_id != policy["target_id"]
+            or variant.metadata_json.get("rights_evidence") != policy["rights_evidence"]
             or variant.metadata_json.get("policy_hash") != fingerprint(policy)):
         raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
     cycle._source_target(policy)
@@ -131,10 +134,17 @@ def _eligible_record(cycle, session, variant, policy, record):
         raise AgentError("ARTICLE_MEDIA_NOT_ALLOWED", 409)
     if not record or record["state"] not in {"automatic_ready", "automatic_pending_approval", "pending", "sending", "awaiting_postiz"}:
         raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
+    if (record.get("source_id") != policy["source_id"]
+            or record.get("target_id") != policy["target_id"]
+            or record.get("policy_hash") != fingerprint(policy)):
+        raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
     from .article_repair_cycle import AutomaticArticleRepair
     AutomaticArticleRepair(cycle).assert_complete(record, session)
     material = session.get(Material, variant.sources[0].get("id")) if len(variant.sources) == 1 else None
-    if (not material or material.published_at is None
+    if (not material or material.source_id != policy["source_id"]
+            or material.url != record.get("url")
+            or material.published_at != record.get("source_published_at")
+            or material.published_at is None
             or material.published_at < now() - policy["max_source_age_hours"] * 3600):
         raise AgentError("STALE_SOURCE", 409)
     if automatic_evidence(session, variant) is None:
@@ -163,7 +173,7 @@ def check_approval(core, session, variant, target, dispatch, approval, evidence,
 def publish(cycle, record, ledger, reviewed_hash, due_at):
     from .server_state import require_running
     require_running(cycle.core)
-    core, policy = cycle.core, cycle._policy()
+    core, policy = cycle.core, cycle._policy_for_record(record)
     from .article_repair_cycle import AutomaticArticleRepair
     with core.db.session() as session:
         AutomaticArticleRepair(cycle).assert_complete(record, session)
@@ -321,7 +331,7 @@ def reconcile_approval(cycle, record, ledger, reviewed_hash, due_at, reason):
     """Approve one proven scheduled post once; never repeat its remote mutation."""
     if not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 2000:
         raise AgentError("ARTICLE_APPROVAL_RECONCILE_REASON_REQUIRED", 409)
-    core, policy = cycle.core, cycle._policy()
+    core, policy = cycle.core, cycle._policy_for_record(record)
     if (policy.get("approval_mode") != "automatic" or record.get("state") != "needs_attention"
             or record.get("error") != "SCHEDULE_GAP_TOO_SHORT" or not record.get("variant_id")
             or not record.get("postiz_id") or record.get("dispatch_id") or "automatic_slot" not in record):
@@ -361,7 +371,7 @@ def reconcile_approval(cycle, record, ledger, reviewed_hash, due_at, reason):
         record["state"] = "automatic_pending_approval"
         cycle._save(ledger)
         _reconcile_remote(cycle, captured)
-        if fingerprint(cycle._policy()) != fingerprint(policy) or due_at < now() + 30:
+        if fingerprint(cycle._policy_for_record(record)) != fingerprint(policy) or due_at < now() + 30:
             raise AgentError("ARTICLE_APPROVAL_RECONCILE_NOT_SAFE", 409)
         dispatch_id = core.approve_hourly_policy(record["variant_id"], claim["revision"], reviewed_hash, due_at)
         claim.update(state="completed", finished_at=now(), dispatch_id=dispatch_id)

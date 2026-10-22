@@ -14,6 +14,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 
+from .article_attribution import article_footer
 from .adapters import extract_object
 from .collectors import detect_language
 from .config import AgentError, fingerprint
@@ -499,7 +500,7 @@ class ArticleQuality:
                           for key, value in translated.items()}
             self._emit("translation_parsed", attempt, translation=translated)
             text = translated["title"] + "\n\n" + translated["body"]
-            full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
+            full = text + "\n\n" + article_footer(url)
             context["previous_translation"] = translated
             try:
                 rubric_translation_gate(source, text, self.review_rubric)
@@ -602,7 +603,7 @@ class ArticleQuality:
         candidate_raw = {"title": title, "body": body}
         title, body = normalize_article_links(title.strip()), normalize_article_links(body.strip())
         text = title + "\n\n" + body
-        full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
+        full = text + "\n\n" + article_footer(url)
         self._emit("candidate_started", 1, mode="candidate", candidate={"title": title, "body": body},
                    source_untrusted={"title": original_title, "body": original, "url": url},
                    **({"candidate_raw": candidate_raw}
@@ -697,7 +698,7 @@ class ArticleQuality:
                    source_untrusted={"title": en_title, "body": en_body, "url": url})
         self._emit("protocol_recovery_validated", 1, protocol=protocol, review=reviewed)
         text = title + "\n\n" + body
-        full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
+        full = text + "\n\n" + article_footer(url)
         try:
             rubric_translation_gate(source, text, self.review_rubric)
             if len(full) > 3500:
@@ -756,7 +757,7 @@ class ArticleQuality:
                    review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash)
         self._emit("saved_review_recovery_validated", 1, kind="scientific_spelling", review=reviewed)
         text = title + "\n\n" + body
-        full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
+        full = text + "\n\n" + article_footer(url)
         try:
             rubric_translation_gate(source, text, self.review_rubric)
             if len(full) > 3500:
@@ -811,7 +812,7 @@ class ArticleQuality:
                    review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash)
         self._emit("saved_review_recovery_validated", 1, kind="roni_spelling", review=reviewed)
         text = title + "\n\n" + body
-        full = text + "\n\nИсточник: " + url + "\nПеревод и редактура с помощью нейросетей."
+        full = text + "\n\n" + article_footer(url)
         try:
             rubric_translation_gate(source, text, self.review_rubric)
             if len(full) > 3500:

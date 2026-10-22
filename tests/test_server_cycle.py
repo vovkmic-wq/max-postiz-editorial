@@ -52,6 +52,9 @@ def server(cycle, monkeypatch):
         def _policy(self):
             return automatic
 
+        def _policy_for_record(self, _record):
+            return automatic
+
         def _snapshot(self, value):
             calls.append(("snapshot", value["id"]))
             return copy.deepcopy(snapshot)

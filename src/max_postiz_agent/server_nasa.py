@@ -23,15 +23,25 @@ CHECKPOINT_ID = "server_nasa_svs"
 
 
 def _get(client, url, params=None):
-    with client.stream("GET", url, params=params) as response:
-        if response.status_code != 200:
-            raise AgentError("NASA_SOURCE_UNAVAILABLE", 503)
-        raw = bytearray()
-        for chunk in response.iter_bytes():
-            raw.extend(chunk)
-            if len(raw) > MAX_BYTES:
-                raise AgentError("ARTICLE_SOURCE_TOO_LARGE")
-    return json.loads(raw), bytes(raw)
+    try:
+        with client.stream("GET", url, params=params) as response:
+            if response.status_code != 200:
+                raise AgentError("NASA_SOURCE_UNAVAILABLE", 503)
+            raw = bytearray()
+            for chunk in response.iter_bytes():
+                raw.extend(chunk)
+                if len(raw) > MAX_BYTES:
+                    raise AgentError("ARTICLE_SOURCE_TOO_LARGE")
+    except httpx.HTTPError as exc:
+        # Повтор GET не выполняем; смешанный подбор может проверить другой источник.
+        raise AgentError("NASA_SOURCE_UNAVAILABLE", 503) from exc
+    try:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError
+    except (ValueError, UnicodeError) as exc:
+        raise AgentError("NASA_SOURCE_CATALOG_INVALID", 503) from exc
+    return value, bytes(raw)
 
 
 def _parser():

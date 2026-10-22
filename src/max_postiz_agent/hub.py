@@ -274,7 +274,24 @@ class HubService(Service):
         attested = v.metadata_json.get("original_attested_hash") == fingerprint({"body": v.body, "media": v.media})
         if original and not attested:
             raise AgentError("BRIDGE_ORIGINAL_ATTESTATION_REQUIRED", 409)
+        licensed_content = None
+        if v.metadata_json.get("origin") == "hourly_article_test" and len(materials) == 1:
+            from .article_attribution import requires_licensed_footer
+            from .human_review import candidate_body, source_data
+            source = source_data(s, v)
+            if requires_licensed_footer(source["url"]):
+                # Проверка обязательной лицензии действует и при отсутствии чисел.
+                licensed_content = {**result, "body": candidate_body(v, source)
+                                    + "\n\nИсточник: " + source["url"]}
         checks = validate_draft(result, materials, policy, model_verified=False, allow_original=original and attested)
+        if "UNSUPPORTED_NUMBER" in checks and licensed_content is not None:
+            # Версия CC BY 4.0 — фиксированная атрибуция, не числовой факт
+            # статьи. Убираем только точный проверенный footer; числа самого
+            # перевода и URL проходят прежний детерминированный gate.
+            content_checks = validate_draft(licensed_content, materials, policy,
+                model_verified=False, allow_original=False)
+            if "UNSUPPORTED_NUMBER" not in content_checks:
+                checks = [value for value in checks if value != "UNSUPPORTED_NUMBER"]
         blocking = {"EXCLUDED_TOPIC", "OUTPUT_NOT_RUSSIAN", "LENGTH_EXCEEDED", "UNSUPPORTED_NUMBER",
                     "MISSING_SOURCE_LINK", "INSUFFICIENT_EVIDENCE", "CLAIM_NOT_IN_BODY"}
         if blocking.intersection(checks):
@@ -579,7 +596,8 @@ class HubService(Service):
         if human_hourly_only or hourly_only:
             from .article_cycle import HourlyArticleCycle
             from .human_review import HUMAN_ACTORS
-            policy = HourlyArticleCycle(self)._policy()
+            article_cycle = HourlyArticleCycle(self)
+            policy = article_cycle._policy()
             mode = policy.get("approval_mode")
             if mode not in ({"human"} if human_hourly_only else {"human", "automatic"}):
                 raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 403)
@@ -590,7 +608,10 @@ class HubService(Service):
                          Target.id == policy["target_id"], Target.platform == "max", Target.route == "max_browser",
                          Variant.metadata_json["origin"].as_string() == "hourly_article_test",
                          Variant.metadata_json["approval_mode"].as_string() == mode,
-                         Variant.metadata_json["policy_hash"].as_string() == fingerprint(policy),
+                         # Каждый hash выводится из той же базовой политики и
+                         # явно разрешённого source; чужой маршрут не включаем.
+                         Variant.metadata_json["policy_hash"].as_string().in_(
+                             [fingerprint(value) for value in article_cycle._policies()]),
                          TargetApproval.actor.in_(actors), TargetApproval.revoked.is_(False)))
         # Expired send leases are uncertain; never select them for a second send.
         with self.db.session.begin() as s:

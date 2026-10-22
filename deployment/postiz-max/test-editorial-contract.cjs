@@ -169,6 +169,25 @@ test('structured form roundtrip preserves server-only bounds and maps Russian ra
   assert.equal(result.opaque_server_option, 'keep'); assert.equal(result.reddit.max_pages, 3); assert.equal(result.nasa.max_words, 500);
   assert.equal(result.nasa.min_rating, 0);
 });
+test('open science roundtrip keeps shared filters in legacy nasa settings and preserves Reddit exactly', () => {
+  const settings = { ...initial, source: 'open_science', nasa: { ...initial.nasa, max_words: 400, authors: ['ESA/Hubble'], keywords: ['galaxy'] } };
+  const form = formApi.formFromSettings(settings);
+  assert.equal(form.source, 'open_science'); assert.equal(form.nasaAuthors, 'ESA/Hubble'); assert.equal(form.nasaKeywords, 'galaxy');
+  assert.deepEqual(JSON.parse(JSON.stringify(formApi.settingsFromForm(settings, form))), settings);
+  form.nasaAuthors = 'NOIRLab, ESA/Hubble\nNOIRLab'; form.nasaKeywords = 'galaxy\nstar';
+  const result = JSON.parse(JSON.stringify(formApi.settingsFromForm(settings, form)));
+  assert.deepEqual(result.nasa, { authors: ['NOIRLab', 'ESA/Hubble'], keywords: ['galaxy', 'star'], min_rating: 0, max_words: 400 });
+  assert.deepEqual(result.reddit, settings.reddit); assert.deepEqual(Object.keys(result).sort(), Object.keys(settings).sort());
+  assert.equal(result.opaque_server_option, 'keep'); assert.equal(result.open_science, undefined);
+  form.nasaRating = '1'; assert.throws(() => formApi.settingsFromForm(settings, form), /EDITORIAL_FORM_INVALID/);
+});
+test('legacy NASA roundtrip and transitions to open science preserve the existing settings envelope', () => {
+  const form = formApi.formFromSettings(initial);
+  assert.deepEqual(JSON.parse(JSON.stringify(formApi.settingsFromForm(initial, form))), initial);
+  form.source = 'open_science';
+  assert.deepEqual(JSON.parse(JSON.stringify(formApi.settingsFromForm(initial, form))), { ...initial, source: 'open_science' });
+  form.source = 'untrusted_source'; assert.throws(() => formApi.settingsFromForm(initial, form), /EDITORIAL_FORM_INVALID/);
+});
 for (const [field, value] of [['interval', '59'], ['interval', '60.5'], ['redditRating', '-1'], ['redditRating', '1000001'], ['redditAge', '0'], ['redditLimit', '101'], ['redditSort', 'unknown']]) {
   test(`form rejects invalid ${field}=${value}`, () => { const form = formApi.formFromSettings(initial); form[field] = value; assert.throws(() => formApi.settingsFromForm(initial, form), /EDITORIAL_FORM_INVALID/); });
 }
@@ -176,6 +195,35 @@ test('Reddit requires authors or subreddit, never invents access authorization',
   const form = formApi.formFromSettings(initial); form.source = 'reddit';
   assert.throws(() => formApi.settingsFromForm(initial, form), /EDITORIAL_FORM_INVALID/);
   form.redditAuthors = 'example'; assert.equal(formApi.settingsFromForm(initial, form).source, 'reddit');
+});
+
+test('loaded source controls show shared science filters, preserve legacy NASA labels and leave Reddit controls separate', () => {
+  const React = require(path.join(tooling, 'react'));
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const renderSource = source => {
+    const settings = { ...initial, source }, seeds = [{ revision: 1, paused: true }, settings, 1, formApi.formFromSettings(settings), false, false, ''];
+    let index = 0;
+    // Подставляем сохранённые настройки, не вызывая сеть или обработчики управления.
+    const seededReact = { ...React, useState() { return React.useState(seeds[index++]); } };
+    const ui = loadModule('editorial-panel.tsx', { react: seededReact, 'react/jsx-runtime': require(path.join(tooling, 'react/jsx-runtime')),
+      './editorial-form': formApi, './editorial.module.css': new Proxy({}, { get: (_, key) => String(key) }) });
+    return { ui, markup: renderToStaticMarkup(React.createElement(ui.EditorialPanel)) };
+  };
+  const { ui, markup: mixed } = renderSource('open_science');
+  assert.ok(mixed.includes('Открытая наука: NASA, NOIRLab, ESA/Hubble'));
+  for (const text of ['>Авторы<', '>Ключевые слова<', '>Рейтинг источника<', 'Источник не предоставляет оценку']) assert.ok(mixed.includes(text));
+  assert.ok(!mixed.includes('Авторы NASA')); assert.ok(!mixed.includes('Сообщества Reddit')); assert.ok(!mixed.includes('Минимальный рейтинг'));
+  const nasa = renderSource('nasa_svs').markup;
+  for (const text of ['Авторы NASA', 'Ключевые слова NASA', 'Рейтинг NASA']) assert.ok(nasa.includes(text));
+  const reddit = renderSource('reddit').markup;
+  for (const text of ['Сообщества Reddit', 'Авторы Reddit', 'Минимальный рейтинг', 'Период рейтинга', 'проверки доступа к API и прав']) assert.ok(reddit.includes(text));
+  assert.ok(!reddit.includes('Рейтинг источника')); assert.ok(!reddit.includes('Авторы NASA'));
+  for (const [id, label] of [['nasa_svs_articles', 'NASA SVS'], ['noirlab_iotw', 'NOIRLab'], ['esahubble_potw', 'ESA/Hubble'], ['reddit', 'Reddit']]) {
+    assert.equal(ui.sourceText(id), label);
+    const record = renderToStaticMarkup(React.createElement(ui.EditorialRecords, { records: [{ id, source: id }] }));
+    assert.ok(record.includes(`<td>${label}</td>`));
+  }
+  assert.equal(ui.sourceText('future_source'), 'future_source'); assert.equal(ui.sourceText(undefined), '—');
 });
 test('native React records escape titles, reject unsafe URLs, loading page has Russian controls', () => {
   const React = require(path.join(tooling, 'react'));

@@ -111,6 +111,22 @@ def test_rating_without_verified_nasa_scale_fails_before_http(source):
     assert source.requests == []
 
 
+@pytest.mark.parametrize("failure", ["timeout", "json", "array"])
+def test_known_get_failure_is_normalized_without_another_request(source, failure):
+    requests = []
+    def handler(request):
+        requests.append(str(request.url))
+        if failure == "timeout":
+            raise httpx.ReadTimeout("upstream timed out", request=request)
+        if failure == "json":
+            return httpx.Response(200, content=b"not JSON")
+        return httpx.Response(200, json=[])
+    code = "NASA_SOURCE_UNAVAILABLE" if failure == "timeout" else "NASA_SOURCE_CATALOG_INVALID"
+    with pytest.raises(AgentError, match=code):
+        source.run(transport=httpx.MockTransport(handler))
+    assert len(requests) == 1
+
+
 def test_unverified_rights_fail_before_http(source):
     source.rights["verified"] = False
     with pytest.raises(AgentError, match="ARTICLE_RIGHTS_REQUIRED"):

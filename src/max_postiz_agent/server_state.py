@@ -29,7 +29,7 @@ def default_settings():
 
 def validate_settings(value):
     if (not isinstance(value, dict) or set(value) != set(default_settings())
-            or value["source"] not in {"nasa_svs", "reddit"}
+            or value["source"] not in {"nasa_svs", "open_science", "reddit"}
             or type(value["interval_seconds"]) is not int
             or not 3600 <= value["interval_seconds"] <= 86400):
         raise AgentError("EDITORIAL_SETTINGS_INVALID", 422)
