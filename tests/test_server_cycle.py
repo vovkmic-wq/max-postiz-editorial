@@ -123,6 +123,26 @@ def test_ready_has_priority_and_never_selects_another_source(server):
     assert [c[0] for c in server.calls] == ["snapshot", "publish"]
 
 
+def test_revalidated_ready_clears_stale_runtime_error_before_scheduling_without_erasing_history(server):
+    record = {**server.record, "error": "ARTICLE_QUALITY_REJECTED",
+              "preparation_actions": [{"action": "explicit_correction", "old_error": "ARTICLE_QUALITY_REJECTED"}]}
+    server.ledger["records"].append(record)
+    before = copy.deepcopy(record)
+    server.state.value["runtime"]["last_error"] = {"code": "ARTICLE_RECONCILIATION_REQUIRED"}
+    publish = server.controller.cycle.publish
+
+    def scheduled(*args, **kwargs):
+        assert server.state.value["runtime"]["phase"] == "scheduling"
+        assert server.state.value["runtime"]["last_error"] is None
+        return publish(*args, **kwargs)
+
+    server.controller.cycle.publish = scheduled
+    assert server.controller.run_once()["phase"] == "waiting_dispatch"
+    assert server.state.value["runtime"]["last_error"] is None
+    assert server.ledger["records"] == [{**before, "state": "pending"}]
+    assert [c[0] for c in server.calls] == ["snapshot", "publish"]
+
+
 def test_only_one_of_multiple_ready_is_selected(server):
     older = {**server.record, "id": "older", "slot": server.record["slot"] - 1}
     newer = {**server.record, "id": "newer", "slot": server.record["slot"] - 2}
@@ -134,7 +154,9 @@ def test_only_one_of_multiple_ready_is_selected(server):
 @pytest.mark.parametrize("state", ["published", "cancelled", "failed", "rejected"])
 def test_used_hour_is_not_caught_up(server, state):
     server.ledger["records"].append({**server.record, "state": state})
+    server.state.value["runtime"]["last_error"] = {"code": "OLD_FAILURE"}
     assert server.controller.run_once()["phase"] == "hour_used"
+    assert server.state.value["runtime"]["last_error"] == {"code": "OLD_FAILURE"}
     assert server.state.value["runtime"]["next_run_at"] == (int(server.stamp[0] // 3600) + 1) * 3600
     assert server.calls == []
 
@@ -168,6 +190,57 @@ def test_existing_pending_only_observes_same_record_without_publish(server):
     assert server.calls == [("status", server.record["id"])]
 
 
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("observed", [
+    {"state": "pending", "dispatch_state": "pending", "error": None},
+    {"state": "published", "dispatch_state": "published", "delivery_verified": True,
+     "postiz_state": "PUBLISHED", "error": None},
+])
+def test_known_status_success_clears_only_runtime_error_without_changing_ledger(server, active, observed):
+    record = {**server.record, "state": "pending", "dispatch_id": "existing"}
+    server.ledger["records"].append(record)
+    original = copy.deepcopy(record)
+    server.state.value["runtime"]["last_error"] = {"code": "ARTICLE_RECONCILIATION_REQUIRED"}
+    if active:
+        server.controller._inventory = lambda: ([{"id": "existing", "variant_id": record["variant_id"],
+                                                 "state": "pending"}], False)
+        server.controller._resume_pending = lambda *_: False
+
+    def status(ident):
+        server.calls.append(("status", ident))
+        return {"id": ident, **observed}
+
+    server.controller.cycle.status = status
+    result = server.controller.run_once()
+    assert result["phase"] == ("waiting_dispatch" if active else "reconciling")
+    assert result["last_error"] is None and server.state.value["runtime"]["last_error"] is None
+    assert server.ledger["records"] == [original]
+    assert server.calls == [("status", record["id"])]
+
+
+@pytest.mark.parametrize("observed", [
+    {"state": "unknown", "error": "SEND_UNKNOWN"},
+    {"state": "published_unverified", "dispatch_state": "published", "delivery_verified": False},
+    {"state": "rejected", "error": "ARTICLE_QUALITY_REJECTED"},
+    {"state": "needs_attention", "error": "ARTICLE_APPROVAL_INTERRUPTED"},
+    {"state": "pending", "dispatch_state": "pending", "error": "STILL_UNRESOLVED"},
+    {"state": "published", "delivery_verified": False, "postiz_state": "PUBLISHED"},
+    {"state": "published", "delivery_verified": True, "postiz_state": "QUEUE"},
+    None,
+])
+def test_uncertain_or_failed_status_does_not_hide_existing_error(server, observed):
+    record = {**server.record, "state": "pending", "dispatch_id": "existing"}
+    server.ledger["records"].append(record)
+    original = copy.deepcopy(record)
+    old_error = {"code": "ARTICLE_RECONCILIATION_REQUIRED"}
+    server.state.value["runtime"]["last_error"] = copy.deepcopy(old_error)
+    server.controller.cycle.status = lambda _: copy.deepcopy(observed)
+    assert server.controller.run_once()["phase"] == "reconciling"
+    assert server.state.value["runtime"]["last_error"] == old_error
+    assert server.ledger["records"] == [original]
+    assert server.calls == []
+
+
 def test_any_lease_blocks_even_ready(server):
     server.ledger["records"].append(server.record)
     server.controller._inventory = lambda: ([], True)
@@ -177,9 +250,11 @@ def test_any_lease_blocks_even_ready(server):
 
 def test_missing_or_changed_evidence_cannot_publish(server, monkeypatch):
     server.ledger["records"].append(server.record)
+    server.state.value["runtime"]["last_error"] = {"code": "STILL_UNRESOLVED"}
     monkeypatch.setattr("max_postiz_agent.server_cycle.automatic_evidence", lambda *_: None)
     with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_NOT_READY"):
         server.controller.run_once()
+    assert server.state.value["runtime"]["last_error"] == {"code": "STILL_UNRESOLVED"}
     assert not any(c[0] == "publish" for c in server.calls)
 
 
@@ -387,6 +462,7 @@ def test_real_database_revoked_approval_is_not_reused_for_automatic_ready(server
 
 def test_configured_interval_uses_actual_delivery_time_and_waits_until_schedule_window(server, monkeypatch):
     server.ledger["records"].append(server.record)
+    server.state.value["runtime"]["last_error"] = {"code": "ARTICLE_RECONCILIATION_REQUIRED"}
     server.state.value["settings"]["interval_seconds"] = 7200
     actual = server.stamp[0] - 600
 
@@ -410,6 +486,7 @@ def test_configured_interval_uses_actual_delivery_time_and_waits_until_schedule_
     server.controller._inventory = lambda: ([], False)
     result = server.controller.run_once()
     assert result["phase"] == "waiting_interval"
+    assert server.state.value["runtime"]["last_error"] is None
     assert server.state.value["runtime"]["next_run_at"] == result["earliest_due_at"] == actual + 7201
     assert not any(c[0] == "publish" for c in server.calls)
     server.record["slot"] -= 1
@@ -423,8 +500,10 @@ def test_configured_interval_uses_actual_delivery_time_and_waits_until_schedule_
 @pytest.mark.parametrize("phase", ["preparing", "selecting", "scheduling", "reconciling", "blocked"])
 def test_active_or_blocked_phase_clears_stale_next_run_without_actions(server, phase):
     server.state.value["runtime"]["next_run_at"] = server.stamp[0] + 60
+    server.state.value["runtime"]["last_error"] = {"code": "STILL_UNRESOLVED"}
     server.controller._phase(phase)
     assert server.state.value["runtime"]["next_run_at"] is None
+    assert server.state.value["runtime"]["last_error"] == {"code": "STILL_UNRESOLVED"}
     assert server.calls == []
 
 

@@ -47,6 +47,16 @@ class ServerCycle:
         self.state.phase(phase, **details)
         return {"phase": phase, **details}
 
+    def _observed_phase(self, phase, record, result, **details):
+        # Успешный HTTP/status сам по себе не доказывает известный исход.
+        # Очищаем текущую ошибку только после здоровой очереди или полной сверки доставки.
+        if (isinstance(result, dict) and not result.get("error")
+                and (result.get("state") == result.get("dispatch_state") == "pending"
+                     or result.get("state") == "published" and result.get("delivery_verified") is True
+                     and result.get("postiz_state") == "PUBLISHED")):
+            details["last_error"] = None
+        return self._phase(phase, record_id=record["id"], result=result, **details)
+
     def _inventory(self):
         with self.core.db.session() as session:
             dispatches = list(session.scalars(select(Dispatch).where(Dispatch.state.in_(ACTIVE))))
@@ -87,11 +97,13 @@ class ServerCycle:
             earliest = max(earliest, max(a.created_at for a in actual) + interval + 1)
         due = max(self.clock() + 120, earliest)
         if due > self.clock() + 3700:
-            return self._phase("waiting_interval", record_id=record["id"], earliest_due_at=due)
+            return self._phase("waiting_interval", record_id=record["id"], earliest_due_at=due,
+                               last_error=None)
         # publish повторяет финальные locks/hash/evidence/interval/pause проверки.
         # Вызов ровно один, автоматического повтора неизвестного исхода нет.
         self.state.assert_running()
-        self._phase("scheduling", record_id=record["id"], reviewed_hash=hashed, due_at=due)
+        self._phase("scheduling", record_id=record["id"], reviewed_hash=hashed, due_at=due,
+                    last_error=None)
         result = self.cycle.publish(record["id"], hashed, due_at=due)
         return self._phase("waiting_dispatch", record_id=record["id"], result=result, due_at=due)
 
@@ -233,8 +245,7 @@ class ServerCycle:
                 if len(active) == len(exact) == 1 and exact[0]["state"] == "pending":
                     self._resume_pending(match, exact[0]["id"], settings, policy)
                 result = self.cycle.status(match["id"])
-                return self._phase("waiting_dispatch", record_id=match["id"], result=result,
-                                   due_at=match.get("due_at"))
+                return self._observed_phase("waiting_dispatch", match, result, due_at=match.get("due_at"))
             return self._phase("blocked", last_error={"code": "ARTICLE_OUTSTANDING_DELIVERY"})
         # Сначала сверяем прежний исход. status не вызывает новую отправку.
         unfinished = [r for r in ledger["records"] if r["state"] not in TERMINAL | {"automatic_ready"}]
@@ -242,7 +253,7 @@ class ServerCycle:
             record = unfinished[0]
             if record.get("dispatch_id"):
                 result = self.cycle.status(record["id"])
-                return self._phase("reconciling", record_id=record["id"], result=result)
+                return self._observed_phase("reconciling", record, result)
             if (self._close_known_rejection(record)
                     or record.get("slot") == int(self.clock() // 3600) and self._known_rejection(record)):
                 return self._phase("rejected", record_id=record["id"], slot=record["slot"],
