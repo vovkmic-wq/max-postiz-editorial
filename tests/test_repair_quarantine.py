@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from max_postiz_agent import article_repair_cycle as protocol_module
+from max_postiz_agent.article_repair import ArticleRepair, repair_prompt_name
 from max_postiz_agent.article_repair_cycle import AutomaticArticleRepair
 from max_postiz_agent.config import AgentError
 from max_postiz_agent.db import Audit
@@ -21,6 +22,18 @@ pytest_plugins = ["test_automatic_article_repair"]
 
 REFERENCE = "https://science.example.org/first-look/"
 REASON = "Адресный карантин полного сохранённого ответа: редактор потерял исходную научную ссылку."
+
+
+def contract_factory(value, contract):
+    """Исторический контракт загружает свой прежний промпт уже в конструкторе."""
+    factory = value.cycle.repair_factory
+
+    def create(trace):
+        editor = factory(trace)
+        return ArticleRepair(editor.editor, prompt_dir=value.core.settings.root / "prompts",
+                             trace=trace, contract=contract)
+
+    return create
 
 
 @pytest.fixture
@@ -48,6 +61,8 @@ def failed_reference(linked_repair_cycle, monkeypatch):
     with monkeypatch.context() as previous:
         previous.setattr(protocol_module, "QUARANTINE_ERRORS",
             protocol_module.QUARANTINE_ERRORS - {"TRANSLATION_REFERENCE_CHANGED"})
+        previous.setattr(protocol_module, "REPAIR_CONTRACT", "article-repair-v4")
+        previous.setattr(value.cycle, "repair_factory", contract_factory(value, "article-repair-v4"))
         with pytest.raises(AgentError, match="TRANSLATION_REFERENCE_CHANGED"):
             value.cycle.repair_rejected(value.initial["id"])
     saved = current(value)
@@ -147,7 +162,7 @@ def test_damaged_or_uncertain_failure_cannot_be_quarantined(failed_reference, da
         path = value.core.settings.root / (claim["snapshot_path"] if damage == "snapshot" else record["input_file"])
         path.write_bytes(path.read_bytes() + b" ")
     elif damage == "prompt":
-        path = value.core.settings.root / "prompts/ARTICLE_REPAIR.txt"
+        path = value.core.settings.root / "prompts" / repair_prompt_name(claim["contract"])
         path.write_bytes(path.read_bytes() + b" ")
     elif damage == "policy":
         path = value.core.settings.root / "data/hourly-article-policy.local.json"
@@ -303,19 +318,13 @@ def numeric_repair_cycle(automatic_cycle, monkeypatch):
 @pytest.fixture
 def failed_number(numeric_repair_cycle, monkeypatch):
     value = numeric_repair_cycle
-    factory = value.cycle.repair_factory
-
-    def legacy_factory(trace):
-        editor = factory(trace)
-        editor.contract = "article-repair-v3"
-        return editor
 
     # Старый failed создаётся под настоящим v3, а не переименованием истории.
     with monkeypatch.context() as previous:
         previous.setattr(protocol_module, "QUARANTINE_ERRORS",
             protocol_module.QUARANTINE_ERRORS - {"TRANSLATION_NUMBER_CHANGED"})
         previous.setattr(protocol_module, "REPAIR_CONTRACT", "article-repair-v3")
-        previous.setattr(value.cycle, "repair_factory", legacy_factory)
+        previous.setattr(value.cycle, "repair_factory", contract_factory(value, "article-repair-v3"))
         with pytest.raises(AgentError, match="TRANSLATION_NUMBER_CHANGED"):
             value.cycle.repair_rejected(value.initial["id"])
     saved = current(value)
@@ -408,7 +417,7 @@ def test_number_quarantine_rejects_damage_other_codes_and_unknown_outcomes(faile
         path = value.core.settings.root / (claim["snapshot_path"] if damage == "snapshot" else record["input_file"])
         path.write_bytes(path.read_bytes() + b" ")
     elif damage == "prompt":
-        path = value.core.settings.root / "prompts/ARTICLE_REPAIR.txt"
+        path = value.core.settings.root / "prompts" / repair_prompt_name(claim["contract"])
         path.write_bytes(path.read_bytes() + b" ")
     elif damage == "policy":
         path = value.core.settings.root / "data/hourly-article-policy.local.json"
@@ -464,3 +473,138 @@ def test_number_method_cannot_reclassify_a_reference_failure(failed_reference):
     with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_NUMBER_QUARANTINE_NOT_SAFE"):
         number_quarantine(failed_reference)
     assert current(failed_reference) == before
+
+
+@pytest.mark.parametrize("fixture_name,quarantiner,contract", [
+    ("failed_reference", quarantine, "article-repair-v4"),
+    ("failed_number", number_quarantine, "article-repair-v3"),
+])
+def test_legacy_failed_claim_uses_its_old_prompt_and_context_after_v5_upgrade(
+        request, fixture_name, quarantiner, contract):
+    value = request.getfixturevalue(fixture_name)
+    before = current(value)
+    claim = before["automatic_repair_attempts"][-1]
+    assert claim["contract"] == contract
+    prompts = {"ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt", "ARTICLE_REPAIR.txt"}
+    assert set(claim["prompts"]) == prompts
+    old_prompt_hashes = copy.deepcopy(claim["prompts"])
+    trace = value.core.settings.root / claim["repair_trace"]
+    original = trace.read_bytes()
+    events = [json.loads(line) for line in original.decode("utf-8").splitlines()]
+    assert set(events[0]["context"]) == {"source_untrusted", "candidate_untrusted",
+        "feedback_untrusted", "numeric_tokens_must_match_exactly"}
+    # Даже другой новый промпт не изменяет чистое воспроизведение старого ответа.
+    v5_prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V5.txt"
+    v5_prompt.write_bytes(v5_prompt.read_bytes() + b"\nFuture-only prompt revision.\n")
+    assert AutomaticArticleRepair(value.cycle)._prompts(contract) == old_prompt_hashes
+    quarantiner(value)
+    saved = current(value)
+    assert saved["automatic_repair_attempts"][-1]["prompts"] == old_prompt_hashes
+    assert saved["automatic_repair_attempts"][-1]["quarantine_previous_failure"] == claim
+    assert trace.read_bytes() == original
+    assert value.cycle.automatic_repair_status(saved)["reason"] == "NOT_REPAIRABLE"
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
+    no_delivery(value)
+
+
+def test_new_claim_binds_v5_prompt_and_exact_reference_manifest(linked_repair_cycle):
+    value = linked_repair_cycle
+    with pytest.raises(AgentError, match="TRANSLATION_REFERENCE_CHANGED"):
+        value.cycle.repair_rejected(value.initial["id"])
+    saved = current(value)
+    claim = saved["automatic_repair_attempts"][-1]
+    assert claim["contract"] == "article-repair-v5"
+    assert set(claim["prompts"]) == {"ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt",
+                                     "ARTICLE_REPAIR_V5.txt"}
+    assert claim["prompts"] == AutomaticArticleRepair(value.cycle)._prompts()
+    events = [json.loads(line) for line in
+              (value.core.settings.root / claim["repair_trace"]).read_text(encoding="utf-8").splitlines()]
+    assert events[0]["binding"]["prompt_hash"] == claim["prompts"]["ARTICLE_REPAIR_V5.txt"]
+    assert events[0]["context"]["reference_url_manifest"] == {"contract": "article-links-v1",
+        "required_urls": [REFERENCE], "current_urls": [REFERENCE], "missing_urls": [], "unexpected_urls": []}
+    assert value.cycle.automatic_repair_status(saved)["reason"] == "NOT_REPAIRABLE"
+    old_prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR.txt"
+    old_prompt.write_bytes(old_prompt.read_bytes() + b"\nUnrelated legacy prompt revision.\n")
+    assert value.cycle.automatic_repair_status(saved)["reason"] == "NOT_REPAIRABLE"
+    prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V5.txt"
+    prompt.write_bytes(prompt.read_bytes() + b"\nChanged after saved v5 claim.\n")
+    assert value.cycle.automatic_repair_status(saved)["reason"] == "TRACE_INVALID"
+    assert current(value) == saved
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
+    no_delivery(value)
+
+
+@pytest.mark.parametrize("contract", ["article-repair-v3", "article-repair-v4"])
+def test_old_no_change_is_not_resampled_with_v5_prompt(repair_cycle, monkeypatch, contract):
+    value = repair_cycle
+    value.controls.output = lambda context: context["candidate_untrusted"]
+    with monkeypatch.context() as previous:
+        previous.setattr(protocol_module, "REPAIR_CONTRACT", contract)
+        previous.setattr(value.cycle, "repair_factory", contract_factory(value, contract))
+        with pytest.raises(AgentError, match="ARTICLE_REPAIR_UNCHANGED"):
+            value.cycle.repair_rejected(value.initial["id"])
+    before = current(value)
+    claim = before["automatic_repair_attempts"][-1]
+    assert claim["contract"] == contract and claim["state"] == "no_change"
+    assert set(claim["prompts"]) == {"ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt",
+                                     "ARTICLE_REPAIR.txt"}
+    trace = value.core.settings.root / claim["repair_trace"]
+    raw = trace.read_bytes()
+    prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V5.txt"
+    prompt.write_bytes(prompt.read_bytes() + b"\nFuture-only prompt revision.\n")
+    assert value.cycle.automatic_repair_status(before)["reason"] == "NO_CHANGE"
+    with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_NO_CHANGE"):
+        value.cycle.repair_rejected(before["id"])
+    assert current(value) == before and trace.read_bytes() == raw
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
+    no_delivery(value)
+
+
+@pytest.mark.parametrize("damage", ["source", "manifest"])
+def test_v5_complete_proposal_with_changed_context_is_blocked_before_fresh_quality(repair_cycle, damage):
+    value = repair_cycle
+
+    def tamper_started_context():
+        claim = current(value)["automatic_repair_attempts"][-1]
+        path = value.core.settings.root / claim["repair_trace"]
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        assert len(events) == 1 and events[0]["phase"] == "repair_started"
+        if damage == "source":
+            events[0]["context"]["source_untrusted"]["title"] += " Changed source."
+        else:
+            events[0]["context"]["reference_url_manifest"]["missing_urls"] = [REFERENCE]
+        path.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n", encoding="utf-8")
+
+    value.controls.editor_hook = tamper_started_context
+    value.review.update(approved=True, issues=[])
+    with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID"):
+        value.cycle.repair_rejected(value.initial["id"])
+    saved = current(value)
+    assert saved["automatic_repair_attempts"][-1]["state"] == "failed"
+    assert value.cycle.automatic_repair_status(saved)["reason"] == "FAILED"
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
+    assert value.trace.read_bytes() == value.initial_trace
+    no_delivery(value)
+
+
+def test_v5_cached_quarantine_does_not_trust_a_changed_url_manifest(linked_repair_cycle):
+    value = linked_repair_cycle
+
+    def tamper_started_manifest():
+        claim = current(value)["automatic_repair_attempts"][-1]
+        path = value.core.settings.root / claim["repair_trace"]
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        events[0]["context"]["reference_url_manifest"]["required_urls"] = []
+        path.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n", encoding="utf-8")
+
+    value.controls.editor_hook = tamper_started_manifest
+    with pytest.raises(AgentError, match="TRANSLATION_REFERENCE_CHANGED"):
+        value.cycle.repair_rejected(value.initial["id"])
+    saved = current(value)
+    claim = saved["automatic_repair_attempts"][-1]
+    assert claim["state"] == "failed" and claim.get("outcome_origin") is None
+    assert value.cycle.automatic_repair_status(saved)["reason"] == "FAILED"
+    with value.core.db.session() as session:
+        assert not session.scalar(select(Audit).where(Audit.action == "automatic_article_repair_quarantined"))
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
+    no_delivery(value)

@@ -14,6 +14,7 @@ from .article_attribution import article_footer
 from .article_quality import (
     MEANING_FIRST_REVIEW_RUBRIC,
     _validated_source,
+    article_reference_urls,
     canonical_article_url,
     normalize_article_links,
     rubric_translation_gate,
@@ -21,9 +22,10 @@ from .article_quality import (
 from .config import AgentError, fingerprint, parse_json
 from .editorial import numbers
 
-REPAIR_CONTRACT = "article-repair-v4"
+REPAIR_CONTRACT = "article-repair-v5"
 LEGACY_REPAIR_CONTRACT = "article-repair-v3"
-REPAIR_CONTRACTS = frozenset({LEGACY_REPAIR_CONTRACT, REPAIR_CONTRACT})
+_LINK_CANONICAL_CONTRACTS = frozenset({"article-repair-v4", "article-repair-v5"})
+REPAIR_CONTRACTS = frozenset({LEGACY_REPAIR_CONTRACT, *_LINK_CANONICAL_CONTRACTS})
 REPAIR_MODEL = "proxmox/qwen35-9b"
 MAX_FEEDBACK_BYTES = 128 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024
@@ -39,6 +41,35 @@ def repair_replay_hash(candidate):
 def _require(condition, code="ARTICLE_REPAIR_INPUT_INVALID"):
     if not condition:
         raise AgentError(code, 409)
+
+
+def repair_prompt_name(contract):
+    """Старые claims используют прежний неизменённый файл промпта."""
+    _require(isinstance(contract, str) and contract in REPAIR_CONTRACTS,
+             "ARTICLE_REPAIR_CONTRACT_INVALID")
+    return "ARTICLE_REPAIR_V5.txt" if contract == "article-repair-v5" else "ARTICLE_REPAIR.txt"
+
+
+def repair_context(article, candidate, feedback, *, contract=REPAIR_CONTRACT):
+    """Чистый контекст для нового запроса и точного replay сохранённого trace."""
+    repair_prompt_name(contract)
+    title, body, source = _validated_source(article["title"], article["original"])
+    context = {"source_untrusted": {"title": title, "body": body,
+                                    "url": canonical_article_url(article["url"])},
+               "candidate_untrusted": copy.deepcopy(candidate),
+               "feedback_untrusted": copy.deepcopy(feedback),
+               "numeric_tokens_must_match_exactly": sorted(numbers(source))}
+    if contract == "article-repair-v5":
+        # Диагностика использует тот же literal parser, что и hard gate.
+        # Список помогает редактору; код не дописывает ссылки в его ответ.
+        required = article_reference_urls(source)
+        current = article_reference_urls(candidate["title"] + "\n\n" + candidate["body"])
+        context["reference_url_manifest"] = {
+            "contract": "article-links-v1", "required_urls": sorted(required),
+            "current_urls": sorted(current), "missing_urls": sorted(required - current),
+            "unexpected_urls": sorted(current - required),
+        }
+    return context
 
 
 def _response_object(raw):
@@ -182,7 +213,7 @@ def _patch_candidate(previous, output, source, *, contract=REPAIR_CONTRACT):
     if set(output) == {"title", "body"}:
         # Основной плоский ответ не требует от модели повторного описания diff.
         candidate, changes = output, []
-        if contract == REPAIR_CONTRACT:
+        if contract in _LINK_CANONICAL_CONTRACTS:
             # Raw уже ограничен 128 KiB. Размер поста проверяется после
             # канонизации; сами Markdown-обёртки не являются текстом поста.
             _text_fields(candidate, title_limit=MAX_RESPONSE_BYTES,
@@ -240,7 +271,7 @@ class ArticleRepair:
         self.editor, self.trace = editor, trace
         self.contract = contract
         prompts = Path(prompt_dir) if prompt_dir else Path(__file__).resolve().parents[2] / "prompts"
-        self.instruction = (prompts / "ARTICLE_REPAIR.txt").read_text(encoding="utf-8")
+        self.instruction = (prompts / repair_prompt_name(contract)).read_text(encoding="utf-8")
         self.prompt_hash = hashlib.sha256(self.instruction.encode("utf-8")).hexdigest()
 
     def _emit(self, phase, **details):
@@ -257,7 +288,7 @@ class ArticleRepair:
                  and math.isfinite(article["published_at"]) and article["published_at"] >= 0)
         url = canonical_article_url(article["url"])
         _require(url == article["url"])
-        en_title, en_body, source = _validated_source(article["title"], article["original"])
+        _en_title, _en_body, source = _validated_source(article["title"], article["original"])
         _text_fields(candidate, title_limit=1000, body_limit=16000, code="ARTICLE_REPAIR_INPUT_INVALID")
         _require(isinstance(feedback, dict) and bool(feedback))
         _require(isinstance(rejected_replay_hashes, (list, tuple, set, frozenset))
@@ -272,9 +303,7 @@ class ArticleRepair:
         binding = {"contract": self.contract, "model": REPAIR_MODEL, "prompt_hash": self.prompt_hash,
                    "input_hash": fingerprint(article), "old_candidate_hash": fingerprint(previous),
                    "old_replay_hash": repair_replay_hash(previous), "feedback_hash": fingerprint(diagnostic)}
-        context = {"source_untrusted": {"title": en_title, "body": en_body, "url": url},
-                   "candidate_untrusted": previous, "feedback_untrusted": diagnostic,
-                   "numeric_tokens_must_match_exactly": sorted(numbers(source))}
+        context = repair_context(article, previous, diagnostic, contract=self.contract)
         prompt = self.instruction + "\n\nUNTRUSTED_JSON_DATA:\n" + json.dumps(context, ensure_ascii=False)
         self._emit("repair_started", binding=binding, context=context)
         try:
@@ -311,9 +340,9 @@ class ArticleRepair:
             evidence.update(outcome="candidate", new_candidate_hash=fingerprint(proposed),
                             replay_hash=replay, actual_changes_hash=fingerprint(actual),
                             model_changes_hash=fingerprint(reported))
-            if self.contract == REPAIR_CONTRACT and set(output) == {"title", "body"}:
+            if self.contract in _LINK_CANONICAL_CONTRACTS and set(output) == {"title", "body"}:
                 # Исторический v3 не получает новых полей. Полные raw и
-                # исходный кандидат v4 позволяют воспроизвести преобразование.
+                # исходный кандидат v4/v5 позволяют воспроизвести преобразование.
                 evidence["link_normalization"] = {
                     "contract": "article-links-v1", "raw_candidate": copy.deepcopy(output),
                     "raw_candidate_hash": fingerprint(output),

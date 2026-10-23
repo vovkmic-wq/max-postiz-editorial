@@ -9,7 +9,8 @@ import pytest
 from sqlalchemy import select
 
 from max_postiz_agent.article_cycle import HourlyArticleCycle
-from max_postiz_agent.article_repair import ArticleRepair, REPAIR_MODEL
+from max_postiz_agent.article_repair import (ArticleRepair, REPAIR_CONTRACT, REPAIR_MODEL,
+                                             repair_prompt_name)
 from max_postiz_agent.automatic_policy import automatic_evidence
 from max_postiz_agent.config import AgentError
 from max_postiz_agent.db import Audit, Draft
@@ -343,7 +344,7 @@ def test_changed_inputs_during_editor_are_not_overwritten_or_sent_to_fresh_qa(re
         elif damage == "trace":
             value.trace.write_bytes(value.trace.read_bytes() + b"\n")
         elif damage in {"repair_prompt", "review_prompt"}:
-            name = "ARTICLE_REPAIR.txt" if damage == "repair_prompt" else "ARTICLE_REVIEW_MEANING_FIRST_V1.txt"
+            name = repair_prompt_name(REPAIR_CONTRACT) if damage == "repair_prompt" else "ARTICLE_REVIEW_MEANING_FIRST_V1.txt"
             path = value.core.settings.root / "prompts" / name
             path.write_bytes(path.read_bytes() + b"\nChanged after claim.\n")
         elif damage == "pause":

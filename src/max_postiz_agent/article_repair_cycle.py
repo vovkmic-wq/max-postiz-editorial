@@ -9,7 +9,8 @@ from uuid import NAMESPACE_URL, uuid5
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from .article_repair import REPAIR_CONTRACT, REPAIR_CONTRACTS, REPAIR_MODEL, repair_replay_hash
+from .article_repair import (REPAIR_CONTRACT, REPAIR_CONTRACTS, REPAIR_MODEL,
+                             repair_context, repair_prompt_name, repair_replay_hash)
 from .browser_runtime import profile_lock
 from .config import AgentError, fingerprint, inside, parse_json
 from .db import Audit
@@ -130,10 +131,13 @@ class AutomaticArticleRepair:
             return result
         return {**result, "eligible": True, "reason": "READY"}
 
-    def _prompts(self):
+    def _prompts(self, contract=None):
+        # Claim привязан к своей версии промпта: новая редакция не переоценивает
+        # сохранённые v3/v4 и не меняет их имена полей или hashes в истории.
+        repair_prompt = repair_prompt_name(REPAIR_CONTRACT if contract is None else contract)
         root = self.core.settings.root / "prompts"
         return {name: _sha((root / name).read_bytes()) for name in (
-            "ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt", "ARTICLE_REPAIR.txt")}
+            "ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt", repair_prompt)}
 
     def _quiet(self, record, policy):
         require_running(self.core)
@@ -361,7 +365,7 @@ class AutomaticArticleRepair:
         self._files(record, claim, snapshot["article"])
         policy = self.cycle._policy_for_record(record)
         source, target = self.cycle._source_target(policy)
-        if (self._prompts() != claim["prompts"] or fingerprint(policy) != claim["policy_hash"]
+        if (self._prompts(claim["contract"]) != claim["prompts"] or fingerprint(policy) != claim["policy_hash"]
                 or fingerprint(source) != claim["source_config_hash"] or target.binding_hash != claim["target_binding_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         with self.core.db.session() as session:
@@ -371,17 +375,13 @@ class AutomaticArticleRepair:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409)
         events = [parse_json(line) for line in raw.decode("utf-8").splitlines()]
         expected = {"contract": claim["contract"], "model": claim["model"],
-            "prompt_hash": claim["prompts"]["ARTICLE_REPAIR.txt"], "input_hash": claim["input_hash"],
+            "prompt_hash": claim["prompts"][repair_prompt_name(claim["contract"])], "input_hash": claim["input_hash"],
             "old_candidate_hash": fingerprint(snapshot["candidate"]),
             "old_replay_hash": repair_replay_hash(snapshot["candidate"]),
             "feedback_hash": fingerprint(snapshot["feedback"])}
         article = snapshot["article"]
-        from .editorial import numbers
-        expected_context = {"source_untrusted": {
-            "title": article["title"].strip(), "body": article["original"].strip(), "url": article["url"]},
-            "candidate_untrusted": snapshot["candidate"], "feedback_untrusted": snapshot["feedback"],
-            "numeric_tokens_must_match_exactly": sorted(numbers(article["title"].strip() + "\n\n"
-                                                               + article["original"].strip()))}
+        expected_context = repair_context(article, snapshot["candidate"], snapshot["feedback"],
+                                          contract=claim["contract"])
         if ([e.get("phase") for e in events] != ["repair_started", "repair_returned", "repair_failed"]
                 or any(e.get("record_id") != record["id"] or e.get("repair_claim") != claim["id"]
                        or e.get("attempt") != 1 or e.get("binding") != expected for e in events)
@@ -537,7 +537,7 @@ class AutomaticArticleRepair:
             if not audit or any(claim.get(key) != audit.details.get(key) for key in _BINDING):
                 raise AgentError("ARTICLE_AUTOMATIC_REPAIR_CLAIM_LOST", 409)
         if (fingerprint(article) != claim["input_hash"] or fingerprint(candidate) != claim.get("candidate_hash")
-                or self._prompts() != claim["prompts"]
+                or self._prompts(claim["contract"]) != claim["prompts"]
                 or _sha(inside(self.core.settings.root, record["quality_trace"]).read_bytes()) != claim["parent_trace_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         self._files(record, claim, article, candidate)
@@ -588,7 +588,7 @@ class AutomaticArticleRepair:
 
     def after_quality(self, record, claim, article):
         source, target = self._quiet(record, self.cycle._policy_for_record(record))
-        if (self._prompts() != claim["prompts"] or fingerprint(article) != claim["input_hash"]
+        if (self._prompts(claim["contract"]) != claim["prompts"] or fingerprint(article) != claim["input_hash"]
                 or target.binding_hash != claim["target_binding_hash"] or fingerprint(source) != claim["source_config_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         self._files(record, claim, article)
@@ -626,7 +626,7 @@ class AutomaticArticleRepair:
                 "parent_trace_hash": payload["parent_trace_hash"], "snapshot_path": path,
                 "parent_trace_bytes": len(inside(self.core.settings.root, record["quality_trace"]).read_bytes()),
                 "snapshot_hash": _write_json(inside(self.core.settings.root, path), payload),
-                "prompts": self._prompts(), "target_binding_hash": target.binding_hash,
+                "prompts": self._prompts(REPAIR_CONTRACT), "target_binding_hash": target.binding_hash,
                 "source_config_hash": fingerprint(source),
                 "repair_trace": f"data/hourly-articles/repair-{claim_id}.local.jsonl",
                 "owner_authorization": "2026-10-22 bounded automatic translation corrections"}
@@ -645,6 +645,9 @@ class AutomaticArticleRepair:
             expected = fingerprint(record)
             try:
                 editor = cycle._repair(self._trace(record, claim))
+                if (editor.contract != claim["contract"]
+                        or editor.prompt_hash != claim["prompts"][repair_prompt_name(claim["contract"])]):
+                    raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
                 proposal = editor.propose(payload["article"], payload["candidate"], payload["feedback"],
                                           rejected_replay_hashes=payload["rejected_replay_hashes"])
                 fresh = cycle._load()
@@ -661,8 +664,8 @@ class AutomaticArticleRepair:
                 repair_raw = inside(self.core.settings.root, claim["repair_trace"]).read_bytes()
                 repair_events = [parse_json(line) for line in repair_raw.decode("utf-8").splitlines()]
                 terminal = "repair_not_repairable" if proposal.get("repairable") is False else "repair_candidate"
-                expected_binding = {"contract": REPAIR_CONTRACT, "model": REPAIR_MODEL,
-                    "prompt_hash": claim["prompts"]["ARTICLE_REPAIR.txt"], "input_hash": claim["input_hash"],
+                expected_binding = {"contract": claim["contract"], "model": REPAIR_MODEL,
+                    "prompt_hash": claim["prompts"][repair_prompt_name(claim["contract"])], "input_hash": claim["input_hash"],
                     "old_candidate_hash": fingerprint(payload["candidate"]),
                     "old_replay_hash": repair_replay_hash(payload["candidate"]),
                     "feedback_hash": fingerprint(payload["feedback"])}
@@ -676,14 +679,14 @@ class AutomaticArticleRepair:
                         or _sha(proposal["raw"].encode("utf-8")) != proposal["evidence"].get("raw_sha256")
                         or proposal["evidence"].get("input_hash") != claim["input_hash"]
                         or proposal["evidence"].get("model") != REPAIR_MODEL
-                        or proposal["evidence"].get("prompt_hash") != claim["prompts"]["ARTICLE_REPAIR.txt"]
+                        or proposal["evidence"].get("prompt_hash") != claim["prompts"][repair_prompt_name(claim["contract"])]
                         or any(type(t) not in {int, float} or not math.isfinite(t) or t < claim["started_at"] for t in times)
                         or times != sorted(times)
                         or repair_events[0].get("binding") != expected_binding
                         or repair_events[1].get("binding") != expected_binding
                         or any(proposal["evidence"].get(k) != v for k, v in expected_binding.items())
-                        or repair_events[0].get("context", {}).get("candidate_untrusted") != payload["candidate"]
-                        or repair_events[0].get("context", {}).get("feedback_untrusted") != payload["feedback"]):
+                        or repair_events[0].get("context") != repair_context(payload["article"],
+                            payload["candidate"], payload["feedback"], contract=claim["contract"])):
                     raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409)
                 proposal_path = f"data/hourly-articles/repair-proposal-{claim_id}.local.json"
                 claim.update(proposal_path=proposal_path,
