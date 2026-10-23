@@ -8,6 +8,7 @@ import re
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .article_attribution import article_footer
 from .article_quality import (
@@ -20,7 +21,9 @@ from .article_quality import (
 from .config import AgentError, fingerprint, parse_json
 from .editorial import numbers
 
-REPAIR_CONTRACT = "article-repair-v3"
+REPAIR_CONTRACT = "article-repair-v4"
+LEGACY_REPAIR_CONTRACT = "article-repair-v3"
+REPAIR_CONTRACTS = frozenset({LEGACY_REPAIR_CONTRACT, REPAIR_CONTRACT})
 REPAIR_MODEL = "proxmox/qwen35-9b"
 MAX_FEEDBACK_BYTES = 128 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024
@@ -123,13 +126,68 @@ def _mapped_boundaries(operations, position):
     return points
 
 
-def _patch_candidate(previous, output, source):
+def _canonical_link_field(value):
+    """Канонизируем лишь плоские HTTP(S)-ссылки с точными подписью и href.
+
+    Общий normalizer переносит URL в конец. До него отсеиваем вложенные,
+    опасные и незавершённые обёртки, которые он не должен молча обходить.
+    Обычные пояснения в квадратных скобках остаются обычным текстом.
+    """
+    code = "ARTICLE_REPAIR_PATCH_INVALID"
+    _require(not re.search(r"(?<!\\)!\[", value), code)
+    opened, index = [], 0
+    while index < len(value):
+        char = value[index]
+        if char == "[":
+            opened.append(index)
+        elif char == "]":
+            start = opened.pop() if opened else None
+            if value[index + 1:index + 2] == "(":
+                _require(start is not None and not opened
+                         and (start == 0 or value[start - 1] not in "!\\")
+                         and value[start + 1:index].strip()
+                         and not any(c in value[start + 1:index] for c in "\r\n"), code)
+                end, depth = index + 2, 0
+                _require(value[end:].startswith(("https://", "http://")), code)
+                while end < len(value):
+                    current = value[end]
+                    _require(not current.isspace() and current not in '<>"[]\\', code)
+                    if current == "(":
+                        depth += 1
+                    elif current == ")":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    end += 1
+                _require(end < len(value), code)
+                try:
+                    destination = urlsplit(value[index + 2:end])
+                    _require(destination.scheme in {"http", "https"} and destination.hostname
+                             and not destination.username and not destination.password, code)
+                    # Обращение проверяет синтаксис порта, но не меняет literal URL.
+                    _ = destination.port
+                except ValueError as exc:
+                    raise AgentError(code, 409) from exc
+                index = end
+        index += 1
+    canonical = normalize_article_links(value.strip())
+    _require(not re.search(r"\]\s*\(", canonical), code)
+    return canonical
+
+
+def _patch_candidate(previous, output, source, *, contract=REPAIR_CONTRACT):
     """Проверить заявленные замены и отдельно собрать полный фактический diff."""
     code = "ARTICLE_REPAIR_PATCH_INVALID"
     _require(isinstance(output, dict), code)
     if set(output) == {"title", "body"}:
         # Основной плоский ответ не требует от модели повторного описания diff.
         candidate, changes = output, []
+        if contract == REPAIR_CONTRACT:
+            # Raw уже ограничен 128 KiB. Размер поста проверяется после
+            # канонизации; сами Markdown-обёртки не являются текстом поста.
+            _text_fields(candidate, title_limit=MAX_RESPONSE_BYTES,
+                         body_limit=MAX_RESPONSE_BYTES, code=code)
+            candidate = {key: _canonical_link_field(value) for key, value in candidate.items()}
     else:
         # Сохранённые корректные nested ответы остаются читаемыми для аудита.
         _require(set(output) == {"candidate", "changes"}, code)
@@ -174,10 +232,13 @@ def _patch_candidate(previous, output, source):
 class ArticleRepair:
     """Вызывающая сторона заранее фиксирует durable claim, источник и известный отказ."""
 
-    def __init__(self, editor, *, prompt_dir=None, trace=None):
+    def __init__(self, editor, *, prompt_dir=None, trace=None, contract=REPAIR_CONTRACT):
         _require(getattr(editor, "model", None) == REPAIR_MODEL, "ARTICLE_REPAIR_MODEL_REQUIRED")
         _require(trace is None or callable(trace), "ARTICLE_REPAIR_TRACE_INVALID")
+        _require(isinstance(contract, str) and contract in REPAIR_CONTRACTS,
+                 "ARTICLE_REPAIR_CONTRACT_INVALID")
         self.editor, self.trace = editor, trace
+        self.contract = contract
         prompts = Path(prompt_dir) if prompt_dir else Path(__file__).resolve().parents[2] / "prompts"
         self.instruction = (prompts / "ARTICLE_REPAIR.txt").read_text(encoding="utf-8")
         self.prompt_hash = hashlib.sha256(self.instruction.encode("utf-8")).hexdigest()
@@ -206,7 +267,9 @@ class ArticleRepair:
         article = _json_data(article, 40000)
         previous = _json_data(candidate, 70000)
         diagnostic = _json_data(feedback, MAX_FEEDBACK_BYTES)
-        binding = {"contract": REPAIR_CONTRACT, "model": REPAIR_MODEL, "prompt_hash": self.prompt_hash,
+        _require(isinstance(self.contract, str) and self.contract in REPAIR_CONTRACTS,
+                 "ARTICLE_REPAIR_CONTRACT_INVALID")
+        binding = {"contract": self.contract, "model": REPAIR_MODEL, "prompt_hash": self.prompt_hash,
                    "input_hash": fingerprint(article), "old_candidate_hash": fingerprint(previous),
                    "old_replay_hash": repair_replay_hash(previous), "feedback_hash": fingerprint(diagnostic)}
         context = {"source_untrusted": {"title": en_title, "body": en_body, "url": url},
@@ -237,7 +300,7 @@ class ArticleRepair:
                 result = {**output, "evidence": evidence, "raw": raw}
                 self._emit("repair_not_repairable", result=result)
                 return result
-            proposed, actual, reported = _patch_candidate(previous, output, source)
+            proposed, actual, reported = _patch_candidate(previous, output, source, contract=self.contract)
             replay = repair_replay_hash(proposed)
             if replay == binding["old_replay_hash"] or replay in rejected_replay_hashes:
                 raise AgentError("ARTICLE_REPAIR_UNCHANGED", 409)
@@ -248,6 +311,14 @@ class ArticleRepair:
             evidence.update(outcome="candidate", new_candidate_hash=fingerprint(proposed),
                             replay_hash=replay, actual_changes_hash=fingerprint(actual),
                             model_changes_hash=fingerprint(reported))
+            if self.contract == REPAIR_CONTRACT and set(output) == {"title", "body"}:
+                # Исторический v3 не получает новых полей. Полные raw и
+                # исходный кандидат v4 позволяют воспроизвести преобразование.
+                evidence["link_normalization"] = {
+                    "contract": "article-links-v1", "raw_candidate": copy.deepcopy(output),
+                    "raw_candidate_hash": fingerprint(output),
+                    "canonical_candidate_hash": fingerprint(proposed),
+                }
             result = {"candidate": proposed, "actual_changes": actual,
                       "model_changes": reported, "evidence": evidence, "raw": raw}
             self._emit("repair_candidate", result=result)

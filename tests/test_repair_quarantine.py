@@ -277,3 +277,190 @@ def test_unknown_editor_network_failure_is_never_quarantined(repair_cycle):
     assert saved["automatic_repair_attempts"][0]["state"] == "failed"
     assert value.cycle.automatic_repair_status(saved)["reason"] == "FAILED"
     assert value.counts["qwen"] == 1 and not value.records
+
+
+NUMBER_REASON = "Адресный карантин полного ответа: редактор удалил исходный диапазон 50–65 миль."
+
+
+@pytest.fixture
+def numeric_repair_cycle(automatic_cycle, monkeypatch):
+    (cycle, _, article, _, _, _, _), _ = automatic_cycle
+    article["original"] += " This layer is 80–105 km (50–65 miles) above sea level."
+    original = cycle._quality
+
+    def numeric_quality(*args, **kwargs):
+        quality = original(*args, **kwargs)
+        quality.translator.value["body"] += " Этот слой находится на высоте 80–105 км (50–65 миль) над уровнем моря."
+        return quality
+
+    monkeypatch.setattr(cycle, "_quality", numeric_quality)
+    value = repair_fixture.__wrapped__(automatic_cycle, monkeypatch)
+    value.controls.output = {"title": "Космический ветер", "body": CORRECT_BODY
+        + " Этот слой находится на высоте 80–105 км над уровнем моря."}
+    return value
+
+
+@pytest.fixture
+def failed_number(numeric_repair_cycle, monkeypatch):
+    value = numeric_repair_cycle
+    factory = value.cycle.repair_factory
+
+    def legacy_factory(trace):
+        editor = factory(trace)
+        editor.contract = "article-repair-v3"
+        return editor
+
+    # Старый failed создаётся под настоящим v3, а не переименованием истории.
+    with monkeypatch.context() as previous:
+        previous.setattr(protocol_module, "QUARANTINE_ERRORS",
+            protocol_module.QUARANTINE_ERRORS - {"TRANSLATION_NUMBER_CHANGED"})
+        previous.setattr(protocol_module, "REPAIR_CONTRACT", "article-repair-v3")
+        previous.setattr(value.cycle, "repair_factory", legacy_factory)
+        with pytest.raises(AgentError, match="TRANSLATION_NUMBER_CHANGED"):
+            value.cycle.repair_rejected(value.initial["id"])
+    saved = current(value)
+    assert saved["automatic_repair_attempts"][-1]["contract"] == "article-repair-v3"
+    assert saved["automatic_repair_attempts"][-1]["state"] == "failed"
+    assert saved["error"] == "TRANSLATION_NUMBER_CHANGED"
+    ServerState(value.core).initialize()
+    return value
+
+
+def number_quarantine(value):
+    return AutomaticArticleRepair(value.cycle).quarantine_failed_number(value.initial["id"], NUMBER_REASON)
+
+
+def test_future_complete_number_failure_is_quarantined_without_more_inference(numeric_repair_cycle):
+    value = numeric_repair_cycle
+    with pytest.raises(AgentError, match="TRANSLATION_NUMBER_CHANGED"):
+        value.cycle.repair_rejected(value.initial["id"])
+    saved = current(value)
+    claim = saved["automatic_repair_attempts"][-1]
+    assert claim["state"] == "not_repairable" and claim["outcome_origin"] == "protocol_guard"
+    assert claim["contract"] == protocol_module.REPAIR_CONTRACT
+    assert claim["error"] == "TRANSLATION_NUMBER_CHANGED"
+    assert saved["error"] == "ARTICLE_QUALITY_REJECTED"
+    assert value.cycle.automatic_repair_status(saved)["reason"] == "NOT_REPAIRABLE"
+    value.stamp[0] += 3600
+    assert value.cycle.automatic_repair_status(current(value))["reason"] == "EXPIRED"
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
+    assert value.trace.read_bytes() == value.initial_trace
+    no_delivery(value)
+
+
+def test_old_v3_number_failure_is_quarantined_once_with_original_evidence(failed_number):
+    value = failed_number
+    before = current(value)
+    previous = before["automatic_repair_attempts"][-1]
+    raw_path = value.core.settings.root / previous["repair_trace"]
+    raw = raw_path.read_bytes()
+    value.stamp[0] += 5 * 3600  # Адресный карантин не восстанавливает просроченный слот.
+    result = number_quarantine(value)
+    saved = current(value)
+    claim = saved["automatic_repair_attempts"][-1]
+    assert result["state"] == claim["state"] == "not_repairable"
+    assert claim["quarantine_previous_failure"] == previous
+    assert claim["contract"] == "article-repair-v3"
+    assert claim["error"] == previous["error"] and claim["finished_at"] == previous["finished_at"]
+    assert saved["slot"] == before["slot"] and saved["url"] == before["url"]
+    assert saved["preparation_attempts"] == before["preparation_attempts"]
+    assert saved["error"] == "ARTICLE_QUALITY_REJECTED"
+    assert value.cycle.automatic_repair_status(saved)["reason"] == "EXPIRED"
+    assert raw_path.read_bytes() == raw and value.trace.read_bytes() == value.initial_trace
+    with value.core.db.session() as session:
+        audit = session.get(Audit, str(uuid5(NAMESPACE_URL, claim["id"] + ":quarantine")))
+        assert audit.details == {"claim_id": claim["id"], "error": "TRANSLATION_NUMBER_CHANGED",
+            "trace_hash": claim["repair_trace_hash"], "snapshot_hash": claim["snapshot_hash"]}
+        receipt = session.get(Audit, str(uuid5(NAMESPACE_URL, claim["id"] + ":number-quarantine")))
+        assert receipt.action == "automatic_article_repair_number_quarantine"
+        assert receipt.details["previous_failure"] == previous and receipt.details["reason"] == NUMBER_REASON
+    with pytest.raises(AgentError):
+        number_quarantine(value)
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
+    no_delivery(value)
+
+
+@pytest.mark.parametrize("damage", ["raw", "raw_code_mismatch", "missing_return", "audit", "binding",
+    "snapshot", "input", "prompt", "policy", "source", "lease", "target", "external",
+    "network", "unknown", "other_code", "contract"])
+def test_number_quarantine_rejects_damage_other_codes_and_unknown_outcomes(failed_number, damage):
+    value = failed_number
+    ledger = value.cycle._load()
+    record = ledger["records"][0]
+    claim = record["automatic_repair_attempts"][-1]
+    path = value.core.settings.root / claim["repair_trace"]
+    if damage in {"raw", "raw_code_mismatch", "missing_return"}:
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        if damage == "raw":
+            events[1]["raw"] += " tampered"
+        elif damage == "raw_code_mismatch":
+            events[1]["raw"] = json.dumps({"title": "Космический ветер", "body": CORRECT_BODY
+                + " Этот слой находится на высоте 80–105 км (50–65 миль) над уровнем моря."})
+        else:
+            events.pop(1)
+        path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+    elif damage == "audit":
+        with value.core.db.session.begin() as session:
+            session.delete(session.get(Audit, claim["id"]))
+    elif damage == "binding":
+        claim["input_hash"] = "0" * 64
+    elif damage in {"snapshot", "input"}:
+        path = value.core.settings.root / (claim["snapshot_path"] if damage == "snapshot" else record["input_file"])
+        path.write_bytes(path.read_bytes() + b" ")
+    elif damage == "prompt":
+        path = value.core.settings.root / "prompts/ARTICLE_REPAIR.txt"
+        path.write_bytes(path.read_bytes() + b" ")
+    elif damage == "policy":
+        path = value.core.settings.root / "data/hourly-article-policy.local.json"
+        policy = json.loads(path.read_text(encoding="utf-8"))
+        policy["owner_instruction"] += " changed"
+        path.write_text(json.dumps(policy), encoding="utf-8")
+    elif damage == "source":
+        value.core.settings.source(record["source_id"])["rights"]["allow_derivative"] = False
+    elif damage == "lease":
+        add_unrelated_lease(value)
+    elif damage == "target":
+        with value.core.db.session.begin() as session:
+            session.get(Target, "max").paused = False
+    elif damage == "external":
+        record["postiz_id"] = "unconfirmed"
+    elif damage in {"network", "unknown", "other_code"}:
+        errors = {"network": "OPENCODE_GENERATION_FAILED", "unknown": "POSTIZ_UNKNOWN",
+                  "other_code": "ARTICLE_POST_TOO_LONG"}
+        record["error"] = claim["error"] = errors[damage]
+    else:
+        claim["contract"] = "unknown-contract"
+    value.cycle._save(ledger)
+    before = current(value)
+    with pytest.raises((AgentError, OSError)):
+        number_quarantine(value)
+    assert current(value) == before
+    with value.core.db.session() as session:
+        assert not session.scalar(select(Audit).where(Audit.action == "automatic_article_repair_quarantined"))
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
+    assert not value.records and not value.writes
+
+
+def test_number_quarantine_durable_claim_blocks_retry_after_lost_save(failed_number, monkeypatch):
+    value = failed_number
+    before = current(value)
+
+    def lost(_ledger):
+        raise OSError("simulated lost number quarantine ledger write")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(value.cycle, "_save", lost)
+        with pytest.raises(OSError, match="lost number quarantine"):
+            number_quarantine(value)
+    assert current(value) == before
+    with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_QUARANTINE_ALREADY_ATTEMPTED"):
+        number_quarantine(value)
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
+    no_delivery(value)
+
+
+def test_number_method_cannot_reclassify_a_reference_failure(failed_reference):
+    before = current(failed_reference)
+    with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_NUMBER_QUARANTINE_NOT_SAFE"):
+        number_quarantine(failed_reference)
+    assert current(failed_reference) == before

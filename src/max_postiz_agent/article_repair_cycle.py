@@ -9,7 +9,7 @@ from uuid import NAMESPACE_URL, uuid5
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from .article_repair import REPAIR_CONTRACT, REPAIR_MODEL, repair_replay_hash
+from .article_repair import REPAIR_CONTRACT, REPAIR_CONTRACTS, REPAIR_MODEL, repair_replay_hash
 from .browser_runtime import profile_lock
 from .config import AgentError, fingerprint, inside, parse_json
 from .db import Audit
@@ -20,7 +20,7 @@ from .server_state import require_running
 
 MAX_AUTOMATIC_REPAIRS = 2
 QUARANTINE_ERRORS = {"ARTICLE_REPAIR_RESPONSE_INVALID", "ARTICLE_REPAIR_PATCH_INVALID",
-                     "TRANSLATION_REFERENCE_CHANGED"}
+                     "TRANSLATION_REFERENCE_CHANGED", "TRANSLATION_NUMBER_CHANGED"}
 _BINDING = ("id", "number", "contract", "model", "input_hash", "policy_hash", "slot",
             "parent_trace_hash", "parent_trace_bytes", "snapshot_hash", "snapshot_path", "prompts", "target_binding_hash",
             "source_config_hash")
@@ -400,7 +400,7 @@ class AutomaticArticleRepair:
         # возвращает уже записанный raw: модели, HTTP и trace writer отсутствуют.
         # Одной надписи repair_failed недостаточно для снятия блокировки claim.
         from .article_repair import ArticleRepair
-        if (claim["contract"] != REPAIR_CONTRACT or claim["model"] != REPAIR_MODEL
+        if (claim["contract"] not in REPAIR_CONTRACTS or claim["model"] != REPAIR_MODEL
                 or fingerprint(self._payload(record)) != fingerprint(snapshot)):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409)
 
@@ -410,7 +410,8 @@ class AutomaticArticleRepair:
             def generate_text(self, _prompt):
                 return events[1]["raw"], {}
 
-        replay = ArticleRepair(SavedResponse(), prompt_dir=self.core.settings.root / "prompts")
+        replay = ArticleRepair(SavedResponse(), prompt_dir=self.core.settings.root / "prompts",
+                               contract=claim["contract"])
         try:
             replay.propose(article, snapshot["candidate"], snapshot["feedback"],
                 rejected_replay_hashes=snapshot["rejected_replay_hashes"])
@@ -436,9 +437,20 @@ class AutomaticArticleRepair:
         или потерянный durable claim сохраняют блокировку. Запуск возможен только
         на общей паузе; исходные failed-поля и доказательства остаются в истории.
         """
+        return self._quarantine_failed(ident, reason, profile="reference")
+
+    def quarantine_failed_number(self, ident, reason):
+        """Адресный карантин полного ответа с доказанным нарушением чисел."""
+        return self._quarantine_failed(ident, reason, profile="number")
+
+    def _quarantine_failed(self, ident, reason, *, profile):
         from .server_models import EditorialControl
         from .server_state import CONTROL_ID
-        error = "ARTICLE_AUTOMATIC_REPAIR_REFERENCE_QUARANTINE_NOT_SAFE"
+        codes = {"reference": "TRANSLATION_REFERENCE_CHANGED", "number": "TRANSLATION_NUMBER_CHANGED"}
+        if profile not in codes:
+            raise AgentError("ARTICLE_AUTOMATIC_REPAIR_QUARANTINE_NOT_SAFE", 409)
+        code = codes[profile]
+        error = "ARTICLE_AUTOMATIC_REPAIR_" + profile.upper() + "_QUARANTINE_NOT_SAFE"
         if not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 2000:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_QUARANTINE_REASON_REQUIRED", 409)
         reason = reason.strip()
@@ -447,11 +459,11 @@ class AutomaticArticleRepair:
             record = self.cycle._record(ledger, ident)
             history, blocked = self._history(record)
             if (blocked != "FAILED" or not history or record.get("state") != "needs_attention"
-                    or record.get("error") != "TRANSLATION_REFERENCE_CHANGED"
+                    or record.get("error") != code
                     or any(claim.get("state") != "rejected" for claim in history[:-1])):
                 raise AgentError(error, 409)
             claim = history[-1]
-            if (claim.get("state") != "failed" or claim.get("error") != "TRANSLATION_REFERENCE_CHANGED"
+            if (claim.get("state") != "failed" or claim.get("error") != code
                     or claim.get("outcome_origin") is not None
                     or any(claim.get(key) is not None for key in ("proposal_path", "candidate_hash"))
                     or any(type(claim.get(key)) not in {int, float} or not math.isfinite(claim[key])
@@ -467,7 +479,7 @@ class AutomaticArticleRepair:
                     or record.get("source_id") != policy["source_id"]):
                 raise AgentError(error, 409)
             key = str(uuid5(NAMESPACE_URL, claim["id"] + ":quarantine"))
-            receipt = str(uuid5(NAMESPACE_URL, claim["id"] + ":reference-quarantine"))
+            receipt = str(uuid5(NAMESPACE_URL, claim["id"] + ":" + profile + "-quarantine"))
             with self.core.db.session() as session:
                 control = session.get(EditorialControl, CONTROL_ID)
                 if control is None or not control.paused:
@@ -476,7 +488,7 @@ class AutomaticArticleRepair:
                     raise AgentError("ARTICLE_AUTOMATIC_REPAIR_QUARANTINE_ALREADY_ATTEMPTED", 409)
             hashed = self._quarantine_proof(record, claim)
             previous = copy.deepcopy(claim)
-            action = {"at": _now(), "action": "quarantine_failed_reference", "reason": reason,
+            action = {"at": _now(), "action": "quarantine_failed_" + profile, "reason": reason,
                 "claim_id": claim["id"], "previous_record_state": record["state"],
                 "previous_record_error": record["error"], "previous_claim_hash": fingerprint(previous),
                 "trace_hash": hashed, "snapshot_hash": claim["snapshot_hash"]}
@@ -494,7 +506,7 @@ class AutomaticArticleRepair:
                         details={"claim_id": claim["id"], "error": claim["error"], "trace_hash": hashed,
                                  "snapshot_hash": claim["snapshot_hash"]}))
                     session.add(Audit(id=receipt, actor="automatic_article_repair",
-                        action="automatic_article_repair_reference_quarantine", entity=ident,
+                        action="automatic_article_repair_" + profile + "_quarantine", entity=ident,
                         details={**action, "previous_failure": previous}))
             except IntegrityError as exc:
                 raise AgentError("ARTICLE_AUTOMATIC_REPAIR_QUARANTINE_ALREADY_ATTEMPTED", 409) from exc

@@ -9,7 +9,10 @@ import httpx
 import pytest
 
 from max_postiz_agent.adapters import OpenCode
+from max_postiz_agent.article_attribution import article_footer
+from max_postiz_agent.article_quality import normalize_article_links
 from max_postiz_agent.article_repair import (
+    LEGACY_REPAIR_CONTRACT,
     MAX_FEEDBACK_BYTES,
     MAX_RESPONSE_BYTES,
     REPAIR_CONTRACT,
@@ -50,10 +53,12 @@ class Editor:
         return (self.value if isinstance(self.value, str) else json.dumps(self.value, ensure_ascii=False)), {}
 
 
-def propose(value, *, article=None, candidate=None, feedback=None, blocked=(), trace=None):
+def propose(value, *, article=None, candidate=None, feedback=None, blocked=(), trace=None,
+            contract=REPAIR_CONTRACT):
     editor = Editor(value)
     events = [] if trace is None else trace
-    repair = ArticleRepair(editor, trace=events.append if isinstance(events, list) else events)
+    repair = ArticleRepair(editor, trace=events.append if isinstance(events, list) else events,
+                           contract=contract)
     result = repair.propose(article or copy.deepcopy(ARTICLE), candidate or copy.deepcopy(CANDIDATE),
                             feedback if feedback is not None else copy.deepcopy(FEEDBACK),
                             rejected_replay_hashes=blocked)
@@ -89,7 +94,7 @@ def test_v3_primary_flat_response_keeps_full_deterministic_audit_without_self_re
     raw = json.dumps(candidate, ensure_ascii=False)
     if fenced:
         raw = "```json\n" + raw + "\n```"
-    result, editor, events = propose(raw)
+    result, editor, events = propose(raw, contract=LEGACY_REPAIR_CONTRACT)
     assert result["candidate"] == candidate and result["model_changes"] == []
     assert result["evidence"]["contract"] == "article-repair-v3"
     assert result["evidence"]["model_changes_hash"] == fingerprint([])
@@ -486,3 +491,135 @@ def test_actual_opencode_adapter_uses_primary_editor_once_and_denies_tools(tmp_p
     assert result["evidence"]["model"] == REPAIR_MODEL
     assert sum(path.endswith("generate") for _, path, _ in requests) == 1
     assert len(requests) == (4 if transport == "session" else 1)
+
+
+def markdown_repair_case():
+    url = "https://science.example.org/catalogue/"
+    article = {**ARTICLE, "original": ARTICLE["original"] + " See [the catalogue](" + url + ")."}
+    output = {**changed()["candidate"],
+              "body": changed()["candidate"]["body"] + " Подробности: [научный каталог](" + url + ")."}
+    return article, output, url
+
+
+def test_v4_normalizes_safe_markdown_before_diff_hashes_and_gates_and_retains_the_full_raw():
+    article, output, url = markdown_repair_case()
+    untouched = copy.deepcopy((article, output, CANDIDATE, FEEDBACK))
+    raw = json.dumps(output, ensure_ascii=False)
+    result, editor, events = propose(raw, article=article)
+    canonical = {key: normalize_article_links(value) for key, value in output.items()}
+    assert result["candidate"] == canonical
+    assert "научный каталог" in canonical["body"] and canonical["body"].endswith(url)
+    assert "](" not in canonical["body"]
+    assert result["raw"] == events[1]["raw"] == raw and len(editor.calls) == 1
+    assert rebuild_from_actual(CANDIDATE, result["actual_changes"]) == canonical
+    evidence = result["evidence"]
+    assert evidence["contract"] == "article-repair-v4"
+    assert evidence["input_hash"] == fingerprint(article)
+    assert evidence["new_candidate_hash"] == fingerprint(canonical) != fingerprint(output)
+    assert evidence["replay_hash"] == repair_replay_hash(canonical) == repair_replay_hash(output)
+    assert evidence["actual_changes_hash"] == fingerprint(result["actual_changes"])
+    assert evidence["raw_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert evidence["link_normalization"] == {
+        "contract": "article-links-v1", "raw_candidate": output,
+        "raw_candidate_hash": fingerprint(output), "canonical_candidate_hash": fingerprint(canonical),
+    }
+    assert (article, output, CANDIDATE, FEEDBACK) == untouched
+    assert not {"approved", "machine_review_status", "postiz_id", "dispatch_id"} & set(result)
+
+
+def test_legacy_v3_keeps_the_same_markdown_response_rejected_without_new_evidence():
+    article, output, _ = markdown_repair_case()
+    editor, events = Editor(output), []
+    with pytest.raises(AgentError, match="ARTICLE_REPAIR_PATCH_INVALID"):
+        ArticleRepair(editor, trace=events.append, contract=LEGACY_REPAIR_CONTRACT).propose(
+            article, CANDIDATE, FEEDBACK)
+    assert len(editor.calls) == 1
+    assert [e["phase"] for e in events] == ["repair_started", "repair_returned", "repair_failed"]
+    assert all(e["binding"]["contract"] == "article-repair-v3" for e in events)
+    assert events[1]["raw"] == json.dumps(output, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("link", [
+    "[подпись](javascript:alert(1))", "[подпись](data:text/html,unsafe)",
+    "[подпись](ftp://science.example.org/)", "[подпись](//science.example.org/)",
+    "[подпись](/relative)", "[подпись](https://)",
+    "[подпись](https://user:secret@science.example.org/)",
+    "[подпись](https://science.example.org:wrong/)",
+    "[подпись](https://science.example.org/", "[подпись] (https://science.example.org/)",
+    "[подпись]( https://science.example.org/)", "[подпись](https://science.example.org/ title)",
+    "[внешняя [внутренняя](https://science.example.org/)]", "[[подпись]](https://science.example.org/)",
+    "![подпись](https://science.example.org/)", "[строка\nподпись](https://science.example.org/)",
+])
+def test_v4_never_discards_unsafe_malformed_nested_or_image_wrappers(link):
+    article, output, url = markdown_repair_case()
+    # Валидный исходный URL уже сохранён: опасная добавка не может скрыться
+    # за успешным сравнением множества HTTP(S)-ссылок после normalizer.
+    output["body"] = changed()["candidate"]["body"] + " " + link + "\n\n" + url
+    editor, events = Editor(output), []
+    with pytest.raises(AgentError, match="ARTICLE_REPAIR_PATCH_INVALID"):
+        ArticleRepair(editor, trace=events.append).propose(article, CANDIDATE, FEEDBACK)
+    assert len(editor.calls) == 1 and events[1]["raw"] == json.dumps(output, ensure_ascii=False)
+    assert events[-1]["phase"] == "repair_failed"
+
+
+@pytest.mark.parametrize("change,error", [
+    ("href", "TRANSLATION_REFERENCE_CHANGED"), ("lost_href", "TRANSLATION_REFERENCE_CHANGED"),
+    ("number", "TRANSLATION_NUMBER_CHANGED"), ("language", "TRANSLATION_NOT_RUSSIAN"),
+])
+def test_v4_canonicalization_preserves_the_existing_source_number_language_and_reference_gates(change, error):
+    article, output, url = markdown_repair_case()
+    previous = CANDIDATE
+    if change == "href":
+        output["body"] = output["body"].replace(url, "https://science.example.org/other/")
+    elif change == "lost_href":
+        output["body"] = changed()["candidate"]["body"]
+    elif change == "number":
+        output["body"] = output["body"].replace("2 измерений", "3 измерений")
+    else:
+        previous = {"title": "Previous English title", "body": "Previous English content with 2 measurements."}
+        output = {"title": article["title"], "body": article["original"]}
+    editor, events = Editor(output), []
+    with pytest.raises(AgentError, match=error):
+        ArticleRepair(editor, trace=events.append).propose(article, previous, FEEDBACK)
+    assert len(editor.calls) == 1 and events[-1]["error"] == error
+    assert not any(event["phase"] == "repair_candidate" for event in events)
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_v4_markdown_and_whitespace_alone_do_not_renew_an_unchanged_or_rejected_candidate(blocked):
+    article, output, _ = markdown_repair_case()
+    canonical = {key: normalize_article_links(value) for key, value in output.items()}
+    previous = CANDIDATE if blocked else canonical
+    output["title"] = "  " + output["title"] + "  "
+    editor, events = Editor(output), []
+    with pytest.raises(AgentError, match="ARTICLE_REPAIR_UNCHANGED"):
+        ArticleRepair(editor, trace=events.append).propose(
+            article, previous, FEEDBACK,
+            rejected_replay_hashes=[repair_replay_hash(canonical)] if blocked else [])
+    assert len(editor.calls) == 1 and events[-1]["phase"] == "repair_failed"
+
+
+def test_v4_length_bounds_apply_to_canonical_text_while_raw_remains_bounded():
+    url = "https://science.example.org/"
+    article = {**ARTICLE, "original": ARTICLE["original"] + " Details: " + url}
+    for count in range(50, 200):
+        output = {**changed()["candidate"], "body": changed()["candidate"]["body"] + " "
+                  + " ".join("[данные](" + url + ")" for _ in range(count))}
+        canonical = normalize_article_links(output["body"])
+        if (len(output["body"]) > 3500
+                and len(output["title"] + "\n\n" + canonical + "\n\n" + article_footer(ARTICLE["url"])) <= 3500):
+            break
+    else:
+        pytest.fail("Fixture must isolate raw-wrapper overhead from the unchanged final-post limit")
+    result, editor, _ = propose(output, article=article)
+    assert len(editor.calls) == 1 and result["candidate"]["body"] == canonical
+    assert len(result["evidence"]["link_normalization"]["raw_candidate"]["body"]) > 3500
+    assert len(result["raw"].encode("utf-8")) <= MAX_RESPONSE_BYTES
+
+
+@pytest.mark.parametrize("contract", [None, False, [], "article-repair-v2", "article-repair-v5"])
+def test_unknown_repair_contract_is_blocked_before_any_editor_request(contract):
+    editor = Editor(changed())
+    with pytest.raises(AgentError, match="ARTICLE_REPAIR_CONTRACT_INVALID"):
+        ArticleRepair(editor, contract=contract)
+    assert not editor.calls
