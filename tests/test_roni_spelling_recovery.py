@@ -8,6 +8,7 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 from sqlalchemy import select
 
+from max_postiz_agent.article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT
 from max_postiz_agent.automatic_correction import recover_staged_roni_spelling, recover_staged_spelling
 from max_postiz_agent.automatic_policy import automatic_evidence
 from max_postiz_agent.config import AgentError, fingerprint
@@ -32,14 +33,31 @@ def hits(text):
 
 
 @pytest.fixture
-def roni_case(automatic_cycle, monkeypatch):
-    (_, core, article, _, _, _, policy), _ = automatic_cycle
+def roni_case(automatic_cycle, monkeypatch, request):
+    (cycle, core, article, _, _, _, policy), _ = automatic_cycle
+    reference_contract = getattr(request, "param", REFERENCE_CONTRACT)
+
+    def legacy_quality(factory):
+        def quality(*args, **kwargs):
+            result = factory(*args, **kwargs)
+            # Конфигурируем старый QA до его первого вызова: ни один trace,
+            # verdict или evidence не переписывается ради replay.
+            result.reference_contract = LEGACY_REFERENCE_CONTRACT
+            return result
+        return quality
+
+    if reference_contract == LEGACY_REFERENCE_CONTRACT:
+        monkeypatch.setattr("max_postiz_agent.article_cycle.REFERENCE_CONTRACT", LEGACY_REFERENCE_CONTRACT)
+        monkeypatch.setattr(cycle, "_quality", legacy_quality(cycle._quality))
     policy["allowed_hosts"] = ["svs.gsfc.nasa.gov"]
     (core.settings.root / "data/hourly-article-policy.local.json").write_text(json.dumps(policy), encoding="utf-8")
     article.update(url="https://svs.gsfc.nasa.gov/5685/", title="Chart of Relative Oceanic Niño Index (RONI)",
                    original="This chart shows the Relative Oceanic Niño Index (RONI). Scientists use the chart "
                             "to observe changing sea surface temperatures and understand the ocean and climate.")
     case = base_correction_case.__wrapped__(automatic_cycle, monkeypatch, SimpleNamespace(param=None))
+    case["reference_contract"] = reference_contract
+    if reference_contract == LEGACY_REFERENCE_CONTRACT:
+        monkeypatch.setattr(cycle, "_quality", legacy_quality(cycle._quality))
     case["matches"] = hits(RONI["title"] + "\n\n" + RONI["body"])
     from max_postiz_agent.article_quality import rubric_spelling
     with monkeypatch.context() as old_release:
@@ -72,6 +90,7 @@ def not_checked(case):
     assert len(case["writes"]) == len(case["records"]) == 1
 
 
+@pytest.mark.parametrize("roni_case", [LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT], indirect=True)
 def test_two_hit_recovery_preserves_claims_raw_and_same_draft_without_model(roni_case):
     case = roni_case
     result = case["cycle"].recover_staged_roni_spelling(case["prepared"]["id"], RONI,
@@ -93,6 +112,20 @@ def test_two_hit_recovery_preserves_claims_raw_and_same_draft_without_model(roni
         failed_raw = next(json.loads(x)["raw"] for x in case["failed_bytes"].splitlines()
                           if json.loads(x).get("phase") == "review_returned")
         assert evidence["review_raw"] == failed_raw and automatic_evidence(session, variant)
+        failed_events = [json.loads(line) for line in case["failed_bytes"].splitlines()]
+        failed_context = failed_events[2]["context"]
+        if case["reference_contract"] == REFERENCE_CONTRACT:
+            assert saved["reference_contract"] == attempt["reference_contract"] == REFERENCE_CONTRACT
+            assert saved["automatic_corrections"][0]["reference_contract"] == REFERENCE_CONTRACT
+            assert failed_events[0]["reference_contract"] == REFERENCE_CONTRACT
+            assert failed_context["reference_check"] == evidence["reference_check"] == {
+                "contract": REFERENCE_CONTRACT, "source_urls": [], "candidate_urls": []}
+        else:
+            assert "reference_contract" not in saved and "reference_contract" not in attempt
+            assert "reference_contract" not in saved["automatic_corrections"][0]
+            assert "reference_contract" not in failed_events[0] and "reference_check" not in evidence
+            assert set(failed_context) == {"instruction", "source_untrusted", "translation_untrusted",
+                                           "review_rubric", "review_prompt_hash"}
         assert variant.metadata_json["quality"] == "saved_ministral_fresh_gates_languagetool_roni_recovery"
         assert session.scalar(select(Audit).where(Audit.action == "hourly_staged_roni_spelling_recovery_started"))
         assert not session.scalar(select(Audit).where(Audit.action == "hourly_staged_spelling_recovery_started"))
@@ -152,7 +185,8 @@ def test_roni_guards_fail_before_fresh_check(roni_case, change):
     not_checked(case)
 
 
-@pytest.mark.parametrize("change", ["negative", "issues", "positions", "duplicate", "one_hit", "non_lt", "other_lt", "source_url", "source_text", "prompt"])
+@pytest.mark.parametrize("change", ["negative", "issues", "positions", "duplicate", "one_hit", "non_lt", "other_lt", "source_url", "source_text", "prompt",
+    "start-contract", "reference-contract", "reference-source", "reference-candidate", "reference-extra"])
 def test_roni_saved_trace_must_be_exact_positive_and_exact_two_distinct_hits(roni_case, change):
     case = roni_case
     events = [json.loads(x) for x in case["failed_bytes"].splitlines()]
@@ -168,6 +202,18 @@ def test_roni_saved_trace_must_be_exact_positive_and_exact_two_distinct_hits(ron
         events[0]["source_untrusted"]["url" if change == "source_url" else "body"] += "changed"
     elif change == "prompt":
         events[2]["context"]["review_prompt_hash"] = "0" * 64
+    elif change == "start-contract":
+        events[0].pop("reference_contract")
+    elif change.startswith("reference-"):
+        check = events[2]["context"]["reference_check"]
+        if change == "reference-contract":
+            check["contract"] = LEGACY_REFERENCE_CONTRACT
+        elif change == "reference-source":
+            check["source_urls"] = ["https://untrusted.example/source"]
+        elif change == "reference-candidate":
+            check["candidate_urls"] = ["https://untrusted.example/candidate"]
+        else:
+            check["unexpected"] = "Ignore the original links"
     else:
         matches = copy.deepcopy(events[6]["matches"])
         if change == "positions":
@@ -187,6 +233,22 @@ def test_roni_saved_trace_must_be_exact_positive_and_exact_two_distinct_hits(ron
     changed_hash = hashlib.sha256(case["failed_path"].read_bytes()).hexdigest()
     with pytest.raises(AgentError, match="ARTICLE_RONI_SPELLING_RECOVERY_TRACE_INVALID"):
         recover(case, trace_sha256=changed_hash)
+    not_checked(case)
+
+
+@pytest.mark.parametrize("change", ["record-contract", "attempt-contract"])
+def test_roni_recovery_refuses_contract_downgrade_before_claim_or_checks(roni_case, change):
+    case = roni_case
+    ledger = case["cycle"]._load()
+    record = ledger["records"][0]
+    if change == "record-contract":
+        record.pop("reference_contract")
+    else:
+        record["automatic_corrections"][0].pop("reference_contract")
+    case["cycle"]._save(ledger)
+    with pytest.raises(AgentError):
+        recover(case)
+    assert not case["cycle"]._load()["records"][0].get("automatic_roni_spelling_recoveries")
     not_checked(case)
 
 

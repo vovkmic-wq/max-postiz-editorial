@@ -9,8 +9,9 @@ from uuid import NAMESPACE_URL, uuid5
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACTS
 from .article_repair import (REPAIR_CONTRACT, REPAIR_CONTRACTS, REPAIR_MODEL,
-                             repair_context, repair_prompt_name, repair_replay_hash)
+                             repair_context, repair_prompt_name, repair_reference_contract, repair_replay_hash)
 from .browser_runtime import profile_lock
 from .config import AgentError, fingerprint, inside, parse_json
 from .db import Audit
@@ -24,7 +25,7 @@ QUARANTINE_ERRORS = {"ARTICLE_REPAIR_RESPONSE_INVALID", "ARTICLE_REPAIR_PATCH_IN
                      "TRANSLATION_REFERENCE_CHANGED", "TRANSLATION_NUMBER_CHANGED"}
 _BINDING = ("id", "number", "contract", "model", "input_hash", "policy_hash", "slot",
             "parent_trace_hash", "parent_trace_bytes", "snapshot_hash", "snapshot_path", "prompts", "target_binding_hash",
-            "source_config_hash")
+            "source_config_hash", "reference_contract")
 
 
 def _now():
@@ -115,7 +116,7 @@ class AutomaticArticleRepair:
         if record.get("state") != "needs_attention" or record.get("error") != "ARTICLE_QUALITY_REJECTED":
             return result
         try:
-            self._payload(record)
+            payload = self._payload(record)
             self.cycle._assert_pre_draft(record)
         except (AgentError, OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
             return {**result, "reason": "TRACE_INVALID"}
@@ -129,7 +130,18 @@ class AutomaticArticleRepair:
             return {**result, "reason": "EXHAUSTED"}
         if self.cycle._policy_for_record(record).get("approval_mode") != "automatic":
             return result
+        if payload.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != repair_reference_contract(REPAIR_CONTRACT):
+            return {**result, "reason": "REFERENCE_CONTRACT_CHANGED"}
         return {**result, "eligible": True, "reason": "READY"}
+
+    @staticmethod
+    def _claim_reference(claim):
+        """Только новый V6 хранит marker; прежние claims остаются без нового поля."""
+        expected = repair_reference_contract(claim["contract"])
+        if ((claim["contract"] == "article-repair-v6") != ("reference_contract" in claim)
+                or claim.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != expected):
+            raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
+        return expected
 
     def _prompts(self, contract=None):
         # Claim привязан к своей версии промпта: новая редакция не переоценивает
@@ -165,7 +177,7 @@ class AutomaticArticleRepair:
         """Читаем полный завершённый отказ, не принимая замечания за инструкции."""
         from .adapters import extract_object
         from .article_attribution import article_footer
-        from .article_quality import (_numeric_feedback, normalize_article_links, normalize_rubric_review,
+        from .article_quality import (_numeric_feedback, article_review_context, normalize_article_links, normalize_rubric_review,
                                       rubric_spelling, rubric_translation_gate, TOPICS)
         from .editorial import numbers
 
@@ -239,6 +251,12 @@ class AutomaticArticleRepair:
             terminal = segment[-1]
             initial = segment[0]["phase"] == "translation_started"
             require(initial == (not bool(attempt.get("candidate_hash"))))
+            start_context = segment[0].get("context") if initial else segment[0]
+            require(isinstance(start_context, dict))
+            reference_contract = start_context.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
+            require(reference_contract in REFERENCE_CONTRACTS
+                    and attempt.get("reference_contract", LEGACY_REFERENCE_CONTRACT) == reference_contract
+                    and record.get("reference_contract", LEGACY_REFERENCE_CONTRACT) == reference_contract)
             require(terminal["phase"] == "rejected" and terminal.get("error") == "ARTICLE_QUALITY_REJECTED"
                     and terminal.get("mode") == (None if initial else "candidate"))
             starts = [i for i, e in enumerate(segment[:-1]) if e["phase"] in {"translation_started", "candidate_started"}]
@@ -260,6 +278,7 @@ class AutomaticArticleRepair:
                     context = block[0].get("context")
                     require(isinstance(context, dict) and context.get("source_untrusted") == source
                             and context.get("instruction") == translation_prompt
+                            and context.get("reference_contract", LEGACY_REFERENCE_CONTRACT) == reference_contract
                             and context.get("numeric_tokens_must_match_exactly") == sorted(numbers(original))
                             and isinstance(block[1].get("raw"), str))
                     candidate = fields(extract_object(block[1]["raw"]))
@@ -269,6 +288,7 @@ class AutomaticArticleRepair:
                     retry = tail.pop()
                 else:
                     require(phases[0] == "candidate_started" and block[0].get("mode") == "candidate"
+                            and block[0].get("reference_contract", LEGACY_REFERENCE_CONTRACT) == reference_contract
                             and block[0].get("source_untrusted") == source)
                     candidate = fields(block[0].get("candidate"))
                     require(block[0]["candidate"] == candidate)
@@ -282,7 +302,8 @@ class AutomaticArticleRepair:
                 full = translated + "\n\n" + article_footer(article["url"])
                 gate_error = None
                 try:
-                    rubric_translation_gate(original, translated, "meaning-first-v1")
+                    rubric_translation_gate(original, translated, "meaning-first-v1",
+                                            reference_contract=reference_contract)
                     if len(full) > 3500:
                         raise AgentError("ARTICLE_POST_TOO_LONG")
                 except AgentError as exc:
@@ -305,9 +326,9 @@ class AutomaticArticleRepair:
                             expected_phases.insert(3, "review_normalized")
                         require(phases == expected_phases)
                         context = tail[1].get("context")
-                        require(isinstance(context, dict) and context == {
-                            "instruction": review_prompt, "source_untrusted": original, "translation_untrusted": translated,
-                            "review_rubric": "meaning-first-v1", "review_prompt_hash": review_hash})
+                        require(isinstance(context, dict) and context == article_review_context(
+                            review_prompt, original, translated, "meaning-first-v1", review_hash,
+                            reference_contract=reference_contract))
                         require(isinstance(tail[2].get("raw"), str))
                         raw_review = extract_object(tail[2]["raw"])
                         reviewed = normalize_rubric_review(raw_review, "meaning-first-v1")
@@ -338,8 +359,11 @@ class AutomaticArticleRepair:
                     rejected.add(repair_replay_hash(value))
             feedback = {"events": [copy.deepcopy(e) for e in segment if e["phase"] in {
                 "gate_rejected", "review_returned", "review_parsed", "spelling_returned", "spelling_adjudicated", "retry", "rejected"}]}
-            return {"article": article, "candidate": candidate, "feedback": feedback,
-                    "parent_trace_hash": _sha(raw), "rejected_replay_hashes": sorted(rejected)}
+            payload = {"article": article, "candidate": candidate, "feedback": feedback,
+                       "parent_trace_hash": _sha(raw), "rejected_replay_hashes": sorted(rejected)}
+            if reference_contract != LEGACY_REFERENCE_CONTRACT:
+                payload["reference_contract"] = reference_contract
+            return payload
         except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError, StopIteration, AgentError, OverflowError) as exc:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409) from exc
 
@@ -379,6 +403,8 @@ class AutomaticArticleRepair:
             "old_candidate_hash": fingerprint(snapshot["candidate"]),
             "old_replay_hash": repair_replay_hash(snapshot["candidate"]),
             "feedback_hash": fingerprint(snapshot["feedback"])}
+        if claim["contract"] == "article-repair-v6":
+            expected["reference_contract"] = self._claim_reference(claim)
         article = snapshot["article"]
         expected_context = repair_context(article, snapshot["candidate"], snapshot["feedback"],
                                           contract=claim["contract"])
@@ -547,7 +573,10 @@ class AutomaticArticleRepair:
     def _files(self, record, claim, article, candidate=None):
         snapshot_raw = inside(self.core.settings.root, claim["snapshot_path"]).read_bytes()
         snapshot = parse_json(snapshot_raw.decode("utf-8"))
-        if _sha(snapshot_raw) != claim["snapshot_hash"] or snapshot["article"] != article:
+        references = self._claim_reference(claim)
+        if (_sha(snapshot_raw) != claim["snapshot_hash"] or snapshot["article"] != article
+                or snapshot.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != references
+                or record.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != references):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         if record.get("input_file"):
             original = inside(self.core.settings.root, record["input_file"]).read_bytes()
@@ -615,6 +644,8 @@ class AutomaticArticleRepair:
                 raise AgentError("ARTICLE_AUTOMATIC_REPAIR_" + status["reason"], 409)
             source, target = self._quiet(record, policy)
             payload = self._payload(record)
+            if payload.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != repair_reference_contract(REPAIR_CONTRACT):
+                raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
             cycle._article(payload["article"], policy, source, target)
             cycle._protocol_source_novel(record, ledger, payload["article"])
             number = status["attempts"] + 1
@@ -630,6 +661,8 @@ class AutomaticArticleRepair:
                 "source_config_hash": fingerprint(source),
                 "repair_trace": f"data/hourly-articles/repair-{claim_id}.local.jsonl",
                 "owner_authorization": "2026-10-22 bounded automatic translation corrections"}
+            if REPAIR_CONTRACT == "article-repair-v6":
+                claim["reference_contract"] = payload["reference_contract"]
             try:
                 with self.core.db.session.begin() as session:
                     require_running(self.core, session, lock=True)
@@ -669,6 +702,8 @@ class AutomaticArticleRepair:
                     "old_candidate_hash": fingerprint(payload["candidate"]),
                     "old_replay_hash": repair_replay_hash(payload["candidate"]),
                     "feedback_hash": fingerprint(payload["feedback"])}
+                if claim["contract"] == "article-repair-v6":
+                    expected_binding["reference_contract"] = self._claim_reference(claim)
                 times = [e.get("at") for e in repair_events]
                 if (not 0 < len(repair_raw) <= 512 * 1024
                         or [e.get("phase") for e in repair_events] != ["repair_started", "repair_returned", terminal]

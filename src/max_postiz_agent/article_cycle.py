@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .adapters import OpenCode
 from .article_attribution import article_footer
+from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT, REFERENCE_CONTRACTS
 from .browser_runtime import profile_lock
 from .config import AgentError, fingerprint, inside, parse_json
 from .db import Audit, Draft, DraftRevision, Material, Story, now, uid
@@ -208,11 +209,36 @@ class HourlyArticleCycle:
 
         return write_event
 
+    def _quality_reference_contract(self, trace_id):
+        """Найти версию только по durable владельцу записи или отдельного trace."""
+        expected = f"data/hourly-articles/quality-{trace_id}.local.jsonl"
+        owners = []
+        for item in self._load()["records"]:
+            owned = trace_id is not None and (item["id"] == trace_id or item.get("quality_trace") == expected)
+            for name in ("review_protocol_recoveries", "automatic_corrections",
+                         "automatic_spelling_recoveries", "automatic_roni_spelling_recoveries"):
+                history = item.get(name, [])
+                if not isinstance(history, list) or any(not isinstance(entry, dict) for entry in history):
+                    raise AgentError("ARTICLE_LEDGER_INVALID", 409)
+                owned |= trace_id is not None and any(entry.get("quality_trace") == expected for entry in history)
+            if owned:
+                owners.append(item)
+        if len(owners) > 1:
+            raise AgentError("ARTICLE_REFERENCE_CONTRACT_INVALID", 409)
+        # Старые записи и отдельные recovery traces не получают новую семантику
+        # ссылок только из-за обновления приложения.
+        record = owners[0] if owners else {}
+        reference_contract = record.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
+        if not isinstance(reference_contract, str) or reference_contract not in REFERENCE_CONTRACTS:
+            raise AgentError("ARTICLE_REFERENCE_CONTRACT_INVALID", 409)
+        return reference_contract
+
     def _quality(self, record_id=None, review_only=False):
         if self.quality_factory:
             return self.quality_factory()
         from .article_quality import ArticleQuality
         from .translation import DedicatedTranslator, configured_translator
+        reference_contract = self._quality_reference_contract(record_id)
         with ExitStack() as cleanup:
             if review_only:
                 from .human_review import CandidateOnlyTranslator
@@ -237,7 +263,8 @@ class HourlyArticleCycle:
             quality = ArticleQuality(translator, reviewer, prompt_dir=self.core.settings.root / "prompts",
                                      trace=self._trace_writer(record_id) if record_id else None,
                                      allow_human_rejection=human_mode,
-                                     review_rubric="meaning-first-v1" if mode == "automatic" else "legacy")
+                                     review_rubric="meaning-first-v1" if mode == "automatic" else "legacy",
+                                     reference_contract=reference_contract)
             cleanup.pop_all()
             return quality
 
@@ -341,6 +368,10 @@ class HourlyArticleCycle:
     def _legacy_candidate_hashes(self, record, attempt, hashes, *, replay=False):
         """Read one old checked candidate; missing provenance cannot permit a retry."""
         try:
+            reference_contract = record.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
+            if (not isinstance(reference_contract, str) or reference_contract not in REFERENCE_CONTRACTS
+                    or attempt.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract):
+                raise ValueError
             expected = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
             if record.get("quality_trace") != expected:
                 raise ValueError
@@ -360,7 +391,8 @@ class HourlyArticleCycle:
                     continue
                 candidate, source = event.get("candidate"), event.get("source_untrusted", {})
                 if (not isinstance(candidate, dict) or set(candidate) != {"title", "body"}
-                        or any(not isinstance(value, str) or not value.strip() for value in candidate.values())):
+                        or any(not isinstance(value, str) or not value.strip() for value in candidate.values())
+                        or event.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract):
                     raise ValueError
                 supplied = event.get("candidate_raw", candidate)
                 if fingerprint(candidate) not in hashes and fingerprint(supplied) not in hashes:
@@ -388,10 +420,14 @@ class HourlyArticleCycle:
     def _load_canonical_initial_candidates(self, record, attempt, article=None):
         """Доказать исходные отклонённые тексты, не запрашивая модель повторно."""
         from .adapters import extract_object
-        from .article_quality import normalize_article_links
+        from .article_quality import article_review_context, normalize_article_links
         from .editorial import numbers
 
         try:
+            reference_contract = record.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
+            if (not isinstance(reference_contract, str) or reference_contract not in REFERENCE_CONTRACTS
+                    or attempt.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract):
+                raise ValueError
             expected = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
             if (record.get("quality_trace") != expected
                     or not re.fullmatch(r"[a-f0-9-]{36}", record["id"])
@@ -487,6 +523,7 @@ class HourlyArticleCycle:
                         or source != {"url": bound_article["url"], "title": bound_article["title"].strip(),
                                       "body": bound_article["original"].strip()}
                         or context.get("instruction") != prompt
+                        or context.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract
                         or context.get("numeric_tokens_must_match_exactly") != sorted(numbers(source["title"] + "\n\n" + source["body"]))):
                     raise ValueError
                 if not isinstance(block[1].get("raw"), str):
@@ -515,6 +552,14 @@ class HourlyArticleCycle:
                     if (not isinstance(review, dict) or review.get("source_untrusted") != source["title"] + "\n\n" + source["body"]
                             or review.get("translation_untrusted") != translated["title"] + "\n\n" + translated["body"]):
                         raise ValueError
+                    if reference_contract == REFERENCE_CONTRACT:
+                        review_prompt = (self.core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt").read_text(encoding="utf-8")
+                        if review != article_review_context(review_prompt,
+                                source["title"] + "\n\n" + source["body"],
+                                translated["title"] + "\n\n" + translated["body"], "meaning-first-v1",
+                                hashlib.sha256(review_prompt.encode("utf-8")).hexdigest(),
+                                reference_contract=reference_contract):
+                            raise ValueError
                 if terminal["attempt"] == number and terminal.get("feedback") != block[-1].get("feedback"):
                     raise ValueError
                 found.add(self._initial_replay_hash(translated))
@@ -640,6 +685,10 @@ class HourlyArticleCycle:
                           "url": article["url"], "original_hash": original_hash, "policy_hash": fingerprint(policy),
                           "target_id": target.id, "source_id": source["id"], "source_published_at": article["published_at"],
                           "input_hash": fingerprint(article), "preparation_attempts": []}
+                # Версия контракта закрепляется до Hy и сохраняется при любой
+                # последующей коррекции; старые записи без поля остаются V1.
+                if policy.get("approval_mode") == "automatic" and REFERENCE_CONTRACT != LEGACY_REFERENCE_CONTRACT:
+                    record["reference_contract"] = REFERENCE_CONTRACT
                 ledger["records"].append(record)
                 from .article_repair_cycle import capture_input
                 capture_input(self, record, article)
@@ -654,6 +703,11 @@ class HourlyArticleCycle:
                 self._guard_candidate_replay(ledger, record, candidate, "prepare_candidate", article)
             attempt = {"number": len(record["preparation_attempts"]) + 1,
                        "started_at": now(), "state": "preparing", "operator_retry": bool(retry_record) and not repair_claim}
+            if "reference_contract" in record:
+                if (not isinstance(record["reference_contract"], str)
+                        or record["reference_contract"] not in REFERENCE_CONTRACTS):
+                    raise AgentError("ARTICLE_REFERENCE_CONTRACT_INVALID", 409)
+                attempt["reference_contract"] = record["reference_contract"]
             if candidate is not None:
                 attempt.update(candidate_hash=self._candidate_hash(candidate), operator_correction=not bool(repair_claim),
                                candidate_normalization="article-links-v1",
@@ -674,7 +728,9 @@ class HourlyArticleCycle:
                         operator_retry=attempt["operator_retry"], source_hash=original_hash,
                         input_hash=record["input_hash"], policy_hash=record["policy_hash"],
                         candidate_hash=attempt.get("candidate_hash"), operator_correction=attempt.get("operator_correction", False),
-                        automatic_repair_claim=automatic_repair_claim)
+                        automatic_repair_claim=automatic_repair_claim,
+                        **({"reference_contract": attempt["reference_contract"]}
+                           if "reference_contract" in attempt else {}))
                 quality = self._quality(record["id"])
                 prepared = (quality.check_candidate(candidate["title"], candidate["body"], article["title"],
                     article["original"], article["url"]) if candidate is not None else
@@ -714,6 +770,9 @@ class HourlyArticleCycle:
         material_hash = fingerprint(" ".join(article["original"].casefold().split()))
         if prepared["url"] != article["url"]:
             raise AgentError("ARTICLE_SOURCE_CHANGED", 409)
+        if (record.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
+                != prepared.get("reference_contract", LEGACY_REFERENCE_CONTRACT)):
+            raise AgentError("ARTICLE_REFERENCE_CONTRACT_INVALID", 409)
         translation_hash = text_hash(prepared["translation"])
         if any(item.get("translation_hash") == translation_hash for item in ledger["records"]):
             raise AgentError("ARTICLE_DUPLICATE_TRANSLATION", 409)
@@ -775,7 +834,9 @@ class HourlyArticleCycle:
                     "body": candidate_body(variant, {"url": article["url"]})}),
                 machine_review_status=variant.metadata_json.get("machine_review_status", "passed"),
                 machine_review_evidence_hash=variant.metadata_json.get("machine_review_evidence_hash"),
-                operator_correction=bool(attempt.get("operator_correction")))
+                operator_correction=bool(attempt.get("operator_correction")),
+                **({"reference_contract": record["reference_contract"]}
+                   if "reference_contract" in record else {}))
         if policy.get("approval_mode") in {"human", "automatic"}:
             reviewed = self._snapshot(record)
             record["state"] = "staging_human_draft" if policy["approval_mode"] == "human" else "staging_automatic_draft"
@@ -940,6 +1001,8 @@ class HourlyArticleCycle:
                        "candidate_normalization": "article-links-v1",
                        "candidate_replay_hash": self._initial_replay_hash(correction),
                        "candidate_raw_hash": fingerprint(correction)}
+            if "reference_contract" in record:
+                attempt["reference_contract"] = record["reference_contract"]
             record.setdefault("correction_attempts", []).append(attempt)
             record.update(state="revising", correction_blocked=True)
             self._save(ledger)
@@ -1042,7 +1105,7 @@ class HourlyArticleCycle:
 
     def _saved_review_protocol(self, record, article, candidate, trace_sha256):
         from .adapters import extract_object
-        from .article_quality import normalize_article_links, protocol_recovery_review
+        from .article_quality import article_review_context, normalize_article_links, protocol_recovery_review
         error = "ARTICLE_REVIEW_PROTOCOL_NOT_RECOVERABLE"
         try:
             expected = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
@@ -1055,6 +1118,10 @@ class HourlyArticleCycle:
             if not isinstance(attempts, list) or not attempts or not all(isinstance(item, dict) for item in attempts):
                 raise ValueError
             attempt = attempts[-1]
+            reference_contract = record.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
+            if (not isinstance(reference_contract, str) or reference_contract not in REFERENCE_CONTRACTS
+                    or attempt.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract):
+                raise ValueError
             if (type(attempt.get("number")) is not int or attempt["number"] != len(attempts)
                     or attempt.get("operator_correction") is not True
                     or attempt.get("error") != "ARTICLE_QUALITY_REJECTED"
@@ -1094,6 +1161,7 @@ class HourlyArticleCycle:
             if (first.get("mode") != "candidate" or first.get("candidate") != canonical
                     or first.get("candidate_raw", first.get("candidate")) != candidate
                     or first.get("source_untrusted") != source
+                    or first.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract
                     or gate.get("characters") != len(translation + "\n\n" + article_footer(article["url"]))
                     or context.get("instruction") != prompt or context.get("review_prompt_hash") != prompt_hash
                     or context.get("review_rubric") != "meaning-first-v1"
@@ -1101,6 +1169,10 @@ class HourlyArticleCycle:
                     or invalid.get("error") != "ARTICLE_REVIEW_SCHEMA_INVALID"
                     or rejected.get("mode") != "candidate" or rejected.get("error") != "ARTICLE_QUALITY_REJECTED"
                     or rejected.get("feedback")):
+                raise ValueError
+            if reference_contract == REFERENCE_CONTRACT and context != article_review_context(
+                    prompt, original, translation, "meaning-first-v1", prompt_hash,
+                    reference_contract=reference_contract):
                 raise ValueError
             # Another verdict for this exact EN/RU pair is never upgraded by a
             # protocol repair, including an earlier substantive refusal.

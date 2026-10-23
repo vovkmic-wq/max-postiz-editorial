@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from max_postiz_agent import article_repair_cycle as protocol_module
+from max_postiz_agent.article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT
 from max_postiz_agent.article_repair import ArticleRepair, repair_prompt_name
 from max_postiz_agent.article_repair_cycle import AutomaticArticleRepair
 from max_postiz_agent.config import AgentError
@@ -36,6 +37,26 @@ def contract_factory(value, contract):
     return create
 
 
+def legacy_preparation(automatic_cycle, monkeypatch):
+    """Создать историческую QA v1 до первого Hy, не переписывая отказ задним числом."""
+    (cycle, _, _, _, _, _, _), _ = automatic_cycle
+    monkeypatch.setattr("max_postiz_agent.article_cycle.REFERENCE_CONTRACT", LEGACY_REFERENCE_CONTRACT)
+    quality_factory = cycle._quality
+
+    def quality(*args, **kwargs):
+        value = quality_factory(*args, **kwargs)
+        value.reference_contract = LEGACY_REFERENCE_CONTRACT
+        return value
+
+    monkeypatch.setattr(cycle, "_quality", quality)
+
+
+@pytest.fixture
+def legacy_repair_cycle(automatic_cycle, monkeypatch):
+    legacy_preparation(automatic_cycle, monkeypatch)
+    return repair_fixture.__wrapped__(automatic_cycle, monkeypatch)
+
+
 @pytest.fixture
 def linked_repair_cycle(automatic_cycle, monkeypatch):
     (cycle, _, article, _, _, _, _), _ = automatic_cycle
@@ -55,14 +76,18 @@ def linked_repair_cycle(automatic_cycle, monkeypatch):
 
 
 @pytest.fixture
-def failed_reference(linked_repair_cycle, monkeypatch):
-    value = linked_repair_cycle
+def legacy_linked_repair_cycle(automatic_cycle, monkeypatch):
+    legacy_preparation(automatic_cycle, monkeypatch)
+    return linked_repair_cycle.__wrapped__(automatic_cycle, monkeypatch)
+
+
+def legacy_reference_failure(value, monkeypatch, contract):
     # Воспроизводим сохранённый результат прежней версии протокола.
     with monkeypatch.context() as previous:
         previous.setattr(protocol_module, "QUARANTINE_ERRORS",
             protocol_module.QUARANTINE_ERRORS - {"TRANSLATION_REFERENCE_CHANGED"})
-        previous.setattr(protocol_module, "REPAIR_CONTRACT", "article-repair-v4")
-        previous.setattr(value.cycle, "repair_factory", contract_factory(value, "article-repair-v4"))
+        previous.setattr(protocol_module, "REPAIR_CONTRACT", contract)
+        previous.setattr(value.cycle, "repair_factory", contract_factory(value, contract))
         with pytest.raises(AgentError, match="TRANSLATION_REFERENCE_CHANGED"):
             value.cycle.repair_rejected(value.initial["id"])
     saved = current(value)
@@ -70,6 +95,16 @@ def failed_reference(linked_repair_cycle, monkeypatch):
     assert saved["error"] == "TRANSLATION_REFERENCE_CHANGED"
     ServerState(value.core).initialize()
     return value
+
+
+@pytest.fixture
+def failed_reference(legacy_linked_repair_cycle, monkeypatch):
+    return legacy_reference_failure(legacy_linked_repair_cycle, monkeypatch, "article-repair-v4")
+
+
+@pytest.fixture
+def failed_v5_reference(legacy_linked_repair_cycle, monkeypatch):
+    return legacy_reference_failure(legacy_linked_repair_cycle, monkeypatch, "article-repair-v5")
 
 
 def quarantine(value):
@@ -316,8 +351,14 @@ def numeric_repair_cycle(automatic_cycle, monkeypatch):
 
 
 @pytest.fixture
-def failed_number(numeric_repair_cycle, monkeypatch):
-    value = numeric_repair_cycle
+def legacy_numeric_repair_cycle(automatic_cycle, monkeypatch):
+    legacy_preparation(automatic_cycle, monkeypatch)
+    return numeric_repair_cycle.__wrapped__(automatic_cycle, monkeypatch)
+
+
+@pytest.fixture
+def failed_number(legacy_numeric_repair_cycle, monkeypatch):
+    value = legacy_numeric_repair_cycle
 
     # Старый failed создаётся под настоящим v3, а не переименованием истории.
     with monkeypatch.context() as previous:
@@ -478,6 +519,7 @@ def test_number_method_cannot_reclassify_a_reference_failure(failed_reference):
 @pytest.mark.parametrize("fixture_name,quarantiner,contract", [
     ("failed_reference", quarantine, "article-repair-v4"),
     ("failed_number", number_quarantine, "article-repair-v3"),
+    ("failed_v5_reference", quarantine, "article-repair-v5"),
 ])
 def test_legacy_failed_claim_uses_its_old_prompt_and_context_after_v5_upgrade(
         request, fixture_name, quarantiner, contract):
@@ -485,17 +527,21 @@ def test_legacy_failed_claim_uses_its_old_prompt_and_context_after_v5_upgrade(
     before = current(value)
     claim = before["automatic_repair_attempts"][-1]
     assert claim["contract"] == contract
-    prompts = {"ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt", "ARTICLE_REPAIR.txt"}
+    prompts = {"ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt", repair_prompt_name(contract)}
     assert set(claim["prompts"]) == prompts
+    assert "reference_contract" not in claim
     old_prompt_hashes = copy.deepcopy(claim["prompts"])
     trace = value.core.settings.root / claim["repair_trace"]
     original = trace.read_bytes()
     events = [json.loads(line) for line in original.decode("utf-8").splitlines()]
-    assert set(events[0]["context"]) == {"source_untrusted", "candidate_untrusted",
-        "feedback_untrusted", "numeric_tokens_must_match_exactly"}
+    context_keys = {"source_untrusted", "candidate_untrusted", "feedback_untrusted", "numeric_tokens_must_match_exactly"}
+    if contract == "article-repair-v5":
+        context_keys.add("reference_url_manifest")
+        assert events[0]["context"]["reference_url_manifest"]["contract"] == LEGACY_REFERENCE_CONTRACT
+    assert set(events[0]["context"]) == context_keys
     # Даже другой новый промпт не изменяет чистое воспроизведение старого ответа.
-    v5_prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V5.txt"
-    v5_prompt.write_bytes(v5_prompt.read_bytes() + b"\nFuture-only prompt revision.\n")
+    future_prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V6.txt"
+    future_prompt.write_bytes(future_prompt.read_bytes() + b"\nFuture-only prompt revision.\n")
     assert AutomaticArticleRepair(value.cycle)._prompts(contract) == old_prompt_hashes
     quarantiner(value)
     saved = current(value)
@@ -507,36 +553,37 @@ def test_legacy_failed_claim_uses_its_old_prompt_and_context_after_v5_upgrade(
     no_delivery(value)
 
 
-def test_new_claim_binds_v5_prompt_and_exact_reference_manifest(linked_repair_cycle):
+def test_new_claim_binds_v6_prompt_and_exact_reference_manifest(linked_repair_cycle):
     value = linked_repair_cycle
     with pytest.raises(AgentError, match="TRANSLATION_REFERENCE_CHANGED"):
         value.cycle.repair_rejected(value.initial["id"])
     saved = current(value)
     claim = saved["automatic_repair_attempts"][-1]
-    assert claim["contract"] == "article-repair-v5"
+    assert claim["contract"] == "article-repair-v6" and claim["reference_contract"] == REFERENCE_CONTRACT
     assert set(claim["prompts"]) == {"ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt",
-                                     "ARTICLE_REPAIR_V5.txt"}
+                                     "ARTICLE_REPAIR_V6.txt"}
     assert claim["prompts"] == AutomaticArticleRepair(value.cycle)._prompts()
     events = [json.loads(line) for line in
               (value.core.settings.root / claim["repair_trace"]).read_text(encoding="utf-8").splitlines()]
-    assert events[0]["binding"]["prompt_hash"] == claim["prompts"]["ARTICLE_REPAIR_V5.txt"]
-    assert events[0]["context"]["reference_url_manifest"] == {"contract": "article-links-v1",
+    assert events[0]["binding"]["prompt_hash"] == claim["prompts"]["ARTICLE_REPAIR_V6.txt"]
+    assert events[0]["binding"]["reference_contract"] == REFERENCE_CONTRACT
+    assert events[0]["context"]["reference_url_manifest"] == {"contract": REFERENCE_CONTRACT,
         "required_urls": [REFERENCE], "current_urls": [REFERENCE], "missing_urls": [], "unexpected_urls": []}
     assert value.cycle.automatic_repair_status(saved)["reason"] == "NOT_REPAIRABLE"
     old_prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR.txt"
     old_prompt.write_bytes(old_prompt.read_bytes() + b"\nUnrelated legacy prompt revision.\n")
     assert value.cycle.automatic_repair_status(saved)["reason"] == "NOT_REPAIRABLE"
-    prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V5.txt"
-    prompt.write_bytes(prompt.read_bytes() + b"\nChanged after saved v5 claim.\n")
+    prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V6.txt"
+    prompt.write_bytes(prompt.read_bytes() + b"\nChanged after saved v6 claim.\n")
     assert value.cycle.automatic_repair_status(saved)["reason"] == "TRACE_INVALID"
     assert current(value) == saved
     assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
     no_delivery(value)
 
 
-@pytest.mark.parametrize("contract", ["article-repair-v3", "article-repair-v4"])
-def test_old_no_change_is_not_resampled_with_v5_prompt(repair_cycle, monkeypatch, contract):
-    value = repair_cycle
+@pytest.mark.parametrize("contract", ["article-repair-v3", "article-repair-v4", "article-repair-v5"])
+def test_old_no_change_is_not_resampled_with_v6_prompt(legacy_repair_cycle, monkeypatch, contract):
+    value = legacy_repair_cycle
     value.controls.output = lambda context: context["candidate_untrusted"]
     with monkeypatch.context() as previous:
         previous.setattr(protocol_module, "REPAIR_CONTRACT", contract)
@@ -547,10 +594,10 @@ def test_old_no_change_is_not_resampled_with_v5_prompt(repair_cycle, monkeypatch
     claim = before["automatic_repair_attempts"][-1]
     assert claim["contract"] == contract and claim["state"] == "no_change"
     assert set(claim["prompts"]) == {"ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt",
-                                     "ARTICLE_REPAIR.txt"}
+                                     repair_prompt_name(contract)}
     trace = value.core.settings.root / claim["repair_trace"]
     raw = trace.read_bytes()
-    prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V5.txt"
+    prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V6.txt"
     prompt.write_bytes(prompt.read_bytes() + b"\nFuture-only prompt revision.\n")
     assert value.cycle.automatic_repair_status(before)["reason"] == "NO_CHANGE"
     with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_NO_CHANGE"):
@@ -561,7 +608,7 @@ def test_old_no_change_is_not_resampled_with_v5_prompt(repair_cycle, monkeypatch
 
 
 @pytest.mark.parametrize("damage", ["source", "manifest"])
-def test_v5_complete_proposal_with_changed_context_is_blocked_before_fresh_quality(repair_cycle, damage):
+def test_v6_complete_proposal_with_changed_context_is_blocked_before_fresh_quality(repair_cycle, damage):
     value = repair_cycle
 
     def tamper_started_context():
@@ -587,7 +634,7 @@ def test_v5_complete_proposal_with_changed_context_is_blocked_before_fresh_quali
     no_delivery(value)
 
 
-def test_v5_cached_quarantine_does_not_trust_a_changed_url_manifest(linked_repair_cycle):
+def test_v6_cached_quarantine_does_not_trust_a_changed_url_manifest(linked_repair_cycle):
     value = linked_repair_cycle
 
     def tamper_started_manifest():
@@ -606,5 +653,60 @@ def test_v5_cached_quarantine_does_not_trust_a_changed_url_manifest(linked_repai
     assert value.cycle.automatic_repair_status(saved)["reason"] == "FAILED"
     with value.core.db.session() as session:
         assert not session.scalar(select(Audit).where(Audit.action == "automatic_article_repair_quarantined"))
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
+    no_delivery(value)
+
+
+@pytest.mark.parametrize("damage", ["start", "attempt", "record"])
+def test_v6_requires_consistent_frozen_quality_reference_markers_before_reserving_a_claim(repair_cycle, damage):
+    value = repair_cycle
+    ledger = value.cycle._load()
+    record = ledger["records"][0]
+    assert record["reference_contract"] == REFERENCE_CONTRACT
+    if damage == "start":
+        path = value.core.settings.root / record["quality_trace"]
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        assert events[0]["context"]["reference_contract"] == REFERENCE_CONTRACT
+        events[0]["context"]["reference_contract"] = LEGACY_REFERENCE_CONTRACT
+        path.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n", encoding="utf-8")
+    elif damage == "attempt":
+        record["preparation_attempts"][-1]["reference_contract"] = LEGACY_REFERENCE_CONTRACT
+        value.cycle._save(ledger)
+    else:
+        record["reference_contract"] = LEGACY_REFERENCE_CONTRACT
+        value.cycle._save(ledger)
+    before = current(value)
+    assert value.cycle.automatic_repair_status(before)["reason"] == "TRACE_INVALID"
+    with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID"):
+        value.cycle.repair_rejected(before["id"])
+    assert current(value) == before
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 0}
+    no_delivery(value)
+
+
+@pytest.mark.parametrize("damage", ["claim", "context", "snapshot"])
+def test_v6_reference_contract_binding_cannot_be_downgraded_after_quarantine(linked_repair_cycle, damage):
+    value = linked_repair_cycle
+    with pytest.raises(AgentError, match="TRANSLATION_REFERENCE_CHANGED"):
+        value.cycle.repair_rejected(value.initial["id"])
+    ledger = value.cycle._load()
+    record = ledger["records"][0]
+    claim = record["automatic_repair_attempts"][-1]
+    if damage == "claim":
+        claim.pop("reference_contract")
+        value.cycle._save(ledger)
+    else:
+        path = value.core.settings.root / (claim["repair_trace"] if damage == "context" else claim["snapshot_path"])
+        if damage == "context":
+            events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            events[0]["context"]["reference_url_manifest"]["contract"] = LEGACY_REFERENCE_CONTRACT
+            path.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n", encoding="utf-8")
+        else:
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+            snapshot.pop("reference_contract")
+            path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    before = current(value)
+    assert value.cycle.automatic_repair_status(before)["reason"] in {"CLAIM_LOST", "TRACE_INVALID"}
+    assert current(value) == before
     assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
     no_delivery(value)

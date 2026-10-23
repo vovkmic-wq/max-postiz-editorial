@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 import httpx
 
 from .article_attribution import article_footer
+from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT, reference_urls
 from .adapters import extract_object
 from .collectors import detect_language
 from .config import AgentError, fingerprint
@@ -164,18 +165,41 @@ def protocol_recovery_provenance(raw_review, review_prompt_hash):
 
 
 def article_reference_urls(text):
-    """Read literal reference URLs without dereferencing or rewriting them."""
-    return {value.rstrip(".,;") for value in re.findall(r"https?://[^\s<>\"\]\)]+", text)}
+    """Исторический V1: сохранён для точного воспроизведения старых traces."""
+    return reference_urls(text, contract=LEGACY_REFERENCE_CONTRACT)
 
 
-def rubric_translation_gate(original, translated, rubric):
+def rubric_translation_gate(original, translated, rubric, *, reference_contract=LEGACY_REFERENCE_CONTRACT):
     """Keep numerical/language constraints and preserve every embedded reference."""
     if not isinstance(rubric, str) or rubric not in REVIEW_RUBRICS:
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
+    source_urls = reference_urls(original, contract=reference_contract)
+    candidate_urls = reference_urls(translated, contract=reference_contract)
     translation_gate(original, translated)
     if (rubric == MEANING_FIRST_REVIEW_RUBRIC
-            and article_reference_urls(original) != article_reference_urls(translated)):
+            and source_urls != candidate_urls):
         raise AgentError("TRANSLATION_REFERENCE_CHANGED")
+
+
+def article_review_context(instruction, source, translation, rubric, prompt_hash,
+                           *, reference_contract=LEGACY_REFERENCE_CONTRACT):
+    """Старый контекст неизменен; V2 явно связывает диагностику с literal URL.
+
+    Manifest вычисляется из тех же EN/RU, которые проверяет hard gate. Он не
+    меняет текст и не является самостоятельным подтверждением качества.
+    """
+    if not isinstance(rubric, str) or rubric not in REVIEW_RUBRICS:
+        raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
+    source_urls = reference_urls(source, contract=reference_contract)
+    candidate_urls = reference_urls(translation, contract=reference_contract)
+    context = {"instruction": instruction, "source_untrusted": source,
+               "translation_untrusted": translation}
+    if rubric != LEGACY_REVIEW_RUBRIC:
+        context.update(review_rubric=rubric, review_prompt_hash=prompt_hash)
+    if reference_contract == REFERENCE_CONTRACT:
+        context["reference_check"] = {"contract": reference_contract,
+            "source_urls": sorted(source_urls), "candidate_urls": sorted(candidate_urls)}
+    return context
 
 
 def _numeric_feedback(original, translated):
@@ -394,7 +418,7 @@ def _validated_source(title, original):
 class ArticleQuality:
     def __init__(self, translator, reviewer, spelling_url=SPELLING_URL, transport=None,
                  prompt_dir=None, trace=None, allow_human_rejection=False,
-                 review_rubric=LEGACY_REVIEW_RUBRIC):
+                 review_rubric=LEGACY_REVIEW_RUBRIC, reference_contract=None):
         if (translator is reviewer or (
                 getattr(translator, "model", None) and getattr(reviewer, "model", None)
                 and translator.model == reviewer.model)):
@@ -411,6 +435,12 @@ class ArticleQuality:
         if not isinstance(review_rubric, str) or review_rubric not in REVIEW_RUBRICS:
             raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
         self.review_rubric = review_rubric
+        if reference_contract is None:
+            reference_contract = (REFERENCE_CONTRACT if review_rubric == MEANING_FIRST_REVIEW_RUBRIC
+                                  else LEGACY_REFERENCE_CONTRACT)
+        # Исторический cycle передаёт V1 явно: обновление кода не меняет replay.
+        reference_urls("", contract=reference_contract)
+        self.reference_contract = reference_contract
         prompts = Path(prompt_dir) if prompt_dir else Path(__file__).resolve().parents[2] / "prompts"
         self.translation_prompt = (prompts / "ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8")
         review_file = ("ARTICLE_REVIEW_MEANING_FIRST_V1.txt"
@@ -459,6 +489,12 @@ class ArticleQuality:
                     parser_contract=review_parser_contract(raw))
                 if fresh_spelling is True:
                     prepared["machine_review_evidence"]["fresh_spelling_contract"] = FRESH_SPACETIME_SPELLING_CONTRACT
+            if self.reference_contract == REFERENCE_CONTRACT:
+                prepared["reference_contract"] = self.reference_contract
+                prepared["machine_review_evidence"]["reference_check"] = article_review_context(
+                    self.review_prompt, title + "\n\n" + original, prepared["translation"],
+                    self.review_rubric, self.review_prompt_hash,
+                    reference_contract=self.reference_contract)["reference_check"]
         return prepared
 
     def prepare(self, title, original, url):
@@ -467,6 +503,8 @@ class ArticleQuality:
         context = {"instruction": self.translation_prompt,
                    "source_untrusted": {"title": title, "body": original, "url": url},
                    "numeric_tokens_must_match_exactly": sorted(numbers(source))}
+        if self.reference_contract == REFERENCE_CONTRACT:
+            context["reference_contract"] = self.reference_contract
         immutable_candidates = getattr(self.translator, "immutable_candidates", False) is True
         rejected_candidates = {}
         # Неизменяемый переводчик не исправляет feedback: повтор вернул бы тот же
@@ -503,7 +541,8 @@ class ArticleQuality:
             full = text + "\n\n" + article_footer(url)
             context["previous_translation"] = translated
             try:
-                rubric_translation_gate(source, text, self.review_rubric)
+                rubric_translation_gate(source, text, self.review_rubric,
+                                        reference_contract=self.reference_contract)
                 if len(full) > 3500:
                     raise AgentError("ARTICLE_POST_TOO_LONG")
             except AgentError as exc:
@@ -520,11 +559,8 @@ class ArticleQuality:
                 self._emit("candidate_repeated", attempt, feedback=context["repair_feedback"])
                 self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
-            review_context = {"instruction": self.review_prompt,
-                              "source_untrusted": source, "translation_untrusted": text}
-            if self.review_rubric != LEGACY_REVIEW_RUBRIC:
-                review_context.update(review_rubric=self.review_rubric,
-                                      review_prompt_hash=self.review_prompt_hash)
+            review_context = article_review_context(self.review_prompt, source, text,
+                self.review_rubric, self.review_prompt_hash, reference_contract=self.reference_contract)
             self._emit("review_started", attempt, context=review_context)
             raw_review = None
             try:
@@ -606,10 +642,13 @@ class ArticleQuality:
         full = text + "\n\n" + article_footer(url)
         self._emit("candidate_started", 1, mode="candidate", candidate={"title": title, "body": body},
                    source_untrusted={"title": original_title, "body": original, "url": url},
+                   **({"reference_contract": self.reference_contract}
+                      if self.reference_contract == REFERENCE_CONTRACT else {}),
                    **({"candidate_raw": candidate_raw}
                       if candidate_raw != {"title": title, "body": body} else {}))
         try:
-            rubric_translation_gate(source, text, self.review_rubric)
+            rubric_translation_gate(source, text, self.review_rubric,
+                                    reference_contract=self.reference_contract)
             if len(full) > 3500:
                 raise AgentError("ARTICLE_POST_TOO_LONG")
         except AgentError as exc:
@@ -617,11 +656,8 @@ class ArticleQuality:
             self._emit("rejected", 1, mode="candidate", error=exc.code)
             raise
         self._emit("gate_passed", 1, characters=len(full))
-        review_context = {"instruction": self.review_prompt,
-                          "source_untrusted": source, "translation_untrusted": text}
-        if self.review_rubric != LEGACY_REVIEW_RUBRIC:
-            review_context.update(review_rubric=self.review_rubric,
-                                  review_prompt_hash=self.review_prompt_hash)
+        review_context = article_review_context(self.review_prompt, source, text,
+            self.review_rubric, self.review_prompt_hash, reference_contract=self.reference_contract)
         self._emit("review_started", 1, context=review_context)
         raw_review = None
         try:
@@ -695,12 +731,15 @@ class ArticleQuality:
         protocol = protocol_recovery_provenance(raw_review, self.review_prompt_hash)
         self._emit("protocol_recovery_started", 1, protocol=protocol, raw=raw_review,
                    candidate={"title": title, "body": body},
-                   source_untrusted={"title": en_title, "body": en_body, "url": url})
+                   source_untrusted={"title": en_title, "body": en_body, "url": url},
+                   **({"reference_contract": self.reference_contract}
+                      if self.reference_contract == REFERENCE_CONTRACT else {}))
         self._emit("protocol_recovery_validated", 1, protocol=protocol, review=reviewed)
         text = title + "\n\n" + body
         full = text + "\n\n" + article_footer(url)
         try:
-            rubric_translation_gate(source, text, self.review_rubric)
+            rubric_translation_gate(source, text, self.review_rubric,
+                                    reference_contract=self.reference_contract)
             if len(full) > 3500:
                 raise AgentError("ARTICLE_POST_TOO_LONG")
         except AgentError as exc:
@@ -754,12 +793,15 @@ class ArticleQuality:
         self._emit("saved_review_recovery_started", 1, kind="scientific_spelling", raw=raw_review,
                    candidate={"title": title, "body": body},
                    source_untrusted={"title": en_title, "body": en_body, "url": url},
-                   review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash)
+                   review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash,
+                   **({"reference_contract": self.reference_contract}
+                      if self.reference_contract == REFERENCE_CONTRACT else {}))
         self._emit("saved_review_recovery_validated", 1, kind="scientific_spelling", review=reviewed)
         text = title + "\n\n" + body
         full = text + "\n\n" + article_footer(url)
         try:
-            rubric_translation_gate(source, text, self.review_rubric)
+            rubric_translation_gate(source, text, self.review_rubric,
+                                    reference_contract=self.reference_contract)
             if len(full) > 3500:
                 raise AgentError("ARTICLE_POST_TOO_LONG")
         except AgentError as exc:
@@ -809,12 +851,15 @@ class ArticleQuality:
         self._emit("saved_review_recovery_started", 1, kind="roni_spelling", raw=raw_review,
                    candidate={"title": title, "body": body},
                    source_untrusted={"title": en_title, "body": en_body, "url": url},
-                   review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash)
+                   review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash,
+                   **({"reference_contract": self.reference_contract}
+                      if self.reference_contract == REFERENCE_CONTRACT else {}))
         self._emit("saved_review_recovery_validated", 1, kind="roni_spelling", review=reviewed)
         text = title + "\n\n" + body
         full = text + "\n\n" + article_footer(url)
         try:
-            rubric_translation_gate(source, text, self.review_rubric)
+            rubric_translation_gate(source, text, self.review_rubric,
+                                    reference_contract=self.reference_contract)
             if len(full) > 3500:
                 raise AgentError("ARTICLE_POST_TOO_LONG")
         except AgentError as exc:

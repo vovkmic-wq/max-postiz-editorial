@@ -12,6 +12,7 @@ from uuid import NAMESPACE_URL, uuid5
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT
 from .automatic_policy import automatic_evidence, machine_metadata
 from .browser_runtime import profile_lock
 from .config import AgentError, fingerprint, inside
@@ -164,6 +165,8 @@ def _correct(cycle, ident, correction, reviewed_hash, reason):
                "previous_trace_hash": old_hash, "previous_snapshot_backup": backup.relative_to(core.settings.root).as_posix(),
                "previous_trace_backup": trace_backup.relative_to(core.settings.root).as_posix(),
                "quality_trace": trace, "policy_hash": fingerprint(policy), "postiz_id": captured["post_id"]}
+    if record.get("reference_contract", LEGACY_REFERENCE_CONTRACT) == REFERENCE_CONTRACT:
+        attempt["reference_contract"] = REFERENCE_CONTRACT
     with core.db.session.begin() as session:
         try:
             if fingerprint(_capture(cycle, session, record, policy, "automatic_ready")) != fingerprint(captured):
@@ -193,6 +196,9 @@ def _finish_correction(cycle, ledger, record, policy, captured, claimed, attempt
     operation, trace = attempt["id"], attempt["quality_trace"]
     ident, claim_id = record["id"], attempt["claim_id"]
     try:
+        reference_contract = cycle._quality_reference_contract(operation)
+        if attempt.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract:
+            raise AgentError("ARTICLE_AUTOMATIC_CORRECTION_INPUT_CHANGED", 409)
         remote_before = _remote(cycle, captured, snapshot["body"])
         prompt = core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt"
         prompt_hash = hashlib.sha256(prompt.read_text(encoding="utf-8").encode()).hexdigest()
@@ -200,7 +206,8 @@ def _finish_correction(cycle, ledger, record, policy, captured, claimed, attempt
             raise AgentError("ARTICLE_AUTOMATIC_CORRECTION_INPUT_CHANGED", 409)
         quality = cycle._quality(operation, review_only=True)
         try:
-            if quality.review_rubric != RUBRIC or quality.review_prompt_hash != prompt_hash:
+            if (quality.review_rubric != RUBRIC or quality.review_prompt_hash != prompt_hash
+                    or quality.reference_contract != reference_contract):
                 raise AgentError("ARTICLE_AUTOMATIC_RUBRIC_REQUIRED", 409)
             if saved_review is None:
                 checked = quality.check_candidate(correction["title"], correction["body"],
@@ -215,6 +222,7 @@ def _finish_correction(cycle, ledger, record, policy, captured, claimed, attempt
             close_quality(quality, close_models=not cycle.quality_factory)
         if (checked.get("machine_review_status") != "passed" or checked.get("title") != correction["title"]
                 or checked.get("url") != source["url"]
+                or checked.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract
                 or checked.get("original") != source["title"].strip() + "\n\n" + source["body"].strip()):
             raise AgentError("ARTICLE_AUTOMATIC_QUALITY_REJECTED", 409)
         metadata = machine_metadata(checked, source, inside(core.settings.root, trace))
@@ -328,7 +336,8 @@ def _recovery_trace_current(cycle, attempt):
 
 def _saved_spelling_review(cycle, attempt, correction, source, expected_sha, *, profile="mur"):
     """Read one complete failed candidate trace, never a detached positive reply."""
-    from .article_quality import multiscale_spelling_evidence, rubric_spelling, scientific_spelling_review
+    from .article_quality import (article_review_context, multiscale_spelling_evidence,
+                                  rubric_spelling, scientific_spelling_review)
     error = "ARTICLE_RONI_SPELLING_RECOVERY_TRACE_INVALID" if profile == "roni" else "ARTICLE_SPELLING_RECOVERY_TRACE_INVALID"
     path = attempt.get("quality_trace")
     if path != f"data/hourly-articles/quality-{attempt['id']}.local.jsonl":
@@ -337,6 +346,11 @@ def _saved_spelling_review(cycle, attempt, correction, source, expected_sha, *, 
     if not 0 < len(raw) <= 2 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != expected_sha:
         raise AgentError(error, 409)
     try:
+        # Контракт берётся из durable владельца trace, а не из полей самого
+        # ответа. Старый V1 сохраняет прежние пять полей reviewer context.
+        reference_contract = cycle._quality_reference_contract(attempt["id"])
+        if attempt.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract:
+            raise ValueError
         events = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
         phases = ["candidate_started", "gate_passed", "review_started", "review_returned", "review_parsed",
                   "spelling_started", "spelling_returned", "spelling_adjudicated", "rejected"]
@@ -362,10 +376,11 @@ def _saved_spelling_review(cycle, attempt, correction, source, expected_sha, *, 
         if (events[0].get("mode") != "candidate" or events[0].get("candidate") != correction
                 or events[0].get("candidate_raw", correction) != correction
                 or events[0].get("source_untrusted") != canonical_source
+                or events[0].get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract
                 or events[1].get("characters") != len(text + "\n\nИсточник: " + source["url"]
                                                         + "\nПеревод и редактура с помощью нейросетей.")
-                or events[2].get("context") != {"instruction": instruction, "source_untrusted": source_text,
-                    "translation_untrusted": text, "review_rubric": RUBRIC, "review_prompt_hash": prompt_hash}):
+                or events[2].get("context") != article_review_context(instruction, source_text,
+                    text, RUBRIC, prompt_hash, reference_contract=reference_contract)):
             raise ValueError
         raw_review = events[3]["raw"]
         review = scientific_spelling_review(raw_review)
@@ -458,7 +473,8 @@ def _recover_staged_spelling(cycle, ident, correction, reviewed_hash, trace_sha2
                     or not audit or audit.actor != ACTOR or audit.action != STARTED or audit.entity != ident
                     or any(audit.details.get(key) != failed.get(key) for key in (
                         "id", "claim_id", "candidate_hash", "previous_content_hash", "previous_trace",
-                        "previous_trace_hash", "previous_snapshot_backup", "previous_trace_backup", "quality_trace", "policy_hash", "postiz_id"))):
+                        "previous_trace_hash", "previous_snapshot_backup", "previous_trace_backup", "quality_trace",
+                        "policy_hash", "postiz_id", "reference_contract"))):
                 raise AgentError(error, 409)
         try:
             before_path = inside(core.settings.root, failed["previous_snapshot_backup"])
@@ -499,6 +515,8 @@ def _recover_staged_spelling(cycle, ident, correction, reviewed_hash, trace_sha2
             "quality_trace": trace, "policy_hash": fingerprint(policy), "postiz_id": captured["post_id"],
             "review_prompt_hash": prompt_hash, "original_correction_claim": original_claim,
             "no_model_call": True, "kind": "source_bound_roni_spelling" if roni else "source_bound_scientific_spelling"}
+        if record.get("reference_contract", LEGACY_REFERENCE_CONTRACT) == REFERENCE_CONTRACT:
+            recovery["reference_contract"] = REFERENCE_CONTRACT
         with core.db.session.begin() as session:
             if fingerprint(_capture(cycle, session, record, policy, "needs_attention")) != fingerprint(captured):
                 raise AgentError("REVISION_CONFLICT", 409)

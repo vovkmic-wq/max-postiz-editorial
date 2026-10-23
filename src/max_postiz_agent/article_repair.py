@@ -11,10 +11,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .article_attribution import article_footer
+from .article_links import LEGACY_REFERENCE_CONTRACT, reference_urls
 from .article_quality import (
     MEANING_FIRST_REVIEW_RUBRIC,
     _validated_source,
-    article_reference_urls,
     canonical_article_url,
     normalize_article_links,
     rubric_translation_gate,
@@ -22,9 +22,9 @@ from .article_quality import (
 from .config import AgentError, fingerprint, parse_json
 from .editorial import numbers
 
-REPAIR_CONTRACT = "article-repair-v5"
+REPAIR_CONTRACT = "article-repair-v6"
 LEGACY_REPAIR_CONTRACT = "article-repair-v3"
-_LINK_CANONICAL_CONTRACTS = frozenset({"article-repair-v4", "article-repair-v5"})
+_LINK_CANONICAL_CONTRACTS = frozenset({"article-repair-v4", "article-repair-v5", "article-repair-v6"})
 REPAIR_CONTRACTS = frozenset({LEGACY_REPAIR_CONTRACT, *_LINK_CANONICAL_CONTRACTS})
 REPAIR_MODEL = "proxmox/qwen35-9b"
 MAX_FEEDBACK_BYTES = 128 * 1024
@@ -47,7 +47,14 @@ def repair_prompt_name(contract):
     """Старые claims используют прежний неизменённый файл промпта."""
     _require(isinstance(contract, str) and contract in REPAIR_CONTRACTS,
              "ARTICLE_REPAIR_CONTRACT_INVALID")
-    return "ARTICLE_REPAIR_V5.txt" if contract == "article-repair-v5" else "ARTICLE_REPAIR.txt"
+    return {"article-repair-v5": "ARTICLE_REPAIR_V5.txt",
+            "article-repair-v6": "ARTICLE_REPAIR_V6.txt"}.get(contract, "ARTICLE_REPAIR.txt")
+
+
+def repair_reference_contract(contract):
+    """Новый extractor не меняет воспроизведение прежних трёх протоколов."""
+    repair_prompt_name(contract)
+    return "article-links-v2" if contract == "article-repair-v6" else LEGACY_REFERENCE_CONTRACT
 
 
 def repair_context(article, candidate, feedback, *, contract=REPAIR_CONTRACT):
@@ -59,13 +66,14 @@ def repair_context(article, candidate, feedback, *, contract=REPAIR_CONTRACT):
                "candidate_untrusted": copy.deepcopy(candidate),
                "feedback_untrusted": copy.deepcopy(feedback),
                "numeric_tokens_must_match_exactly": sorted(numbers(source))}
-    if contract == "article-repair-v5":
+    if contract in {"article-repair-v5", "article-repair-v6"}:
         # Диагностика использует тот же literal parser, что и hard gate.
         # Список помогает редактору; код не дописывает ссылки в его ответ.
-        required = article_reference_urls(source)
-        current = article_reference_urls(candidate["title"] + "\n\n" + candidate["body"])
+        references = repair_reference_contract(contract)
+        required = reference_urls(source, contract=references)
+        current = reference_urls(candidate["title"] + "\n\n" + candidate["body"], contract=references)
         context["reference_url_manifest"] = {
-            "contract": "article-links-v1", "required_urls": sorted(required),
+            "contract": references, "required_urls": sorted(required),
             "current_urls": sorted(current), "missing_urls": sorted(required - current),
             "unexpected_urls": sorted(current - required),
         }
@@ -303,6 +311,8 @@ class ArticleRepair:
         binding = {"contract": self.contract, "model": REPAIR_MODEL, "prompt_hash": self.prompt_hash,
                    "input_hash": fingerprint(article), "old_candidate_hash": fingerprint(previous),
                    "old_replay_hash": repair_replay_hash(previous), "feedback_hash": fingerprint(diagnostic)}
+        if self.contract == "article-repair-v6":
+            binding["reference_contract"] = repair_reference_contract(self.contract)
         context = repair_context(article, previous, diagnostic, contract=self.contract)
         prompt = self.instruction + "\n\nUNTRUSTED_JSON_DATA:\n" + json.dumps(context, ensure_ascii=False)
         self._emit("repair_started", binding=binding, context=context)
@@ -334,7 +344,8 @@ class ArticleRepair:
             if replay == binding["old_replay_hash"] or replay in rejected_replay_hashes:
                 raise AgentError("ARTICLE_REPAIR_UNCHANGED", 409)
             text = proposed["title"] + "\n\n" + proposed["body"]
-            rubric_translation_gate(source, text, MEANING_FIRST_REVIEW_RUBRIC)
+            rubric_translation_gate(source, text, MEANING_FIRST_REVIEW_RUBRIC,
+                                    reference_contract=repair_reference_contract(self.contract))
             _require(len(text + "\n\n" + article_footer(url)) <= 3500,
                      "ARTICLE_POST_TOO_LONG")
             evidence.update(outcome="candidate", new_candidate_hash=fingerprint(proposed),

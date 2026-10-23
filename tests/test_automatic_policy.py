@@ -467,3 +467,117 @@ def test_default_status_prefers_older_active_migrated_record_to_latest_completed
     assert result["state"] == "pending"
     with core.db.session() as session:
         assert not session.get(Target, "max").paused
+
+
+def test_reference_v2_is_bound_before_translation_through_policy_approval(automatic_cycle):
+    from max_postiz_agent.article_links import REFERENCE_CONTRACT
+    (cycle, core, article, _, _, _, _), _ = automatic_cycle
+    prepared = cycle.prepare(article)
+    record = cycle._load()["records"][0]
+    assert record["reference_contract"] == record["preparation_attempts"][-1]["reference_contract"] == REFERENCE_CONTRACT
+    with core.db.session() as session:
+        variant = session.get(Variant, prepared["variant_id"])
+        evidence = variant.metadata_json["machine_review_evidence"]
+        assert variant.metadata_json["reference_contract"] == REFERENCE_CONTRACT
+        assert evidence["reference_check"] == {"contract": REFERENCE_CONTRACT,
+                                               "source_urls": [], "candidate_urls": []}
+        audit = session.scalar(select(Audit).where(Audit.entity == record["id"],
+            Audit.action == "hourly_article_prepare_attempt"))
+        assert audit.details["reference_contract"] == REFERENCE_CONTRACT
+    assert cycle.publish(prepared["id"], prepared["content_hash"])["state"] == "pending"
+
+
+@pytest.mark.parametrize("damage", ["evidence", "manifest", "metadata", "record", "attempt", "audit", "all_but_audit"])
+def test_reference_v2_cannot_be_removed_or_downgraded_before_remote_scheduling(automatic_cycle, damage):
+    (cycle, core, article, records, calls, _, _), _ = automatic_cycle
+    prepared = cycle.prepare(article)
+    ledger = cycle._load()
+    record = ledger["records"][0]
+    with core.db.session.begin() as session:
+        variant = session.get(Variant, prepared["variant_id"])
+        meta = copy.deepcopy(variant.metadata_json)
+        evidence = meta["machine_review_evidence"]
+        if damage in {"evidence", "all_but_audit"}:
+            evidence.pop("reference_check")
+        elif damage == "manifest":
+            evidence["reference_check"]["candidate_urls"] = ["https://example.org/invented"]
+        if damage in {"metadata", "all_but_audit"}:
+            meta.pop("reference_contract")
+        if damage in {"record", "all_but_audit"}:
+            record.pop("reference_contract")
+        if damage in {"attempt", "all_but_audit"}:
+            record["preparation_attempts"][-1].pop("reference_contract")
+        if damage == "audit":
+            audit = session.scalar(select(Audit).where(Audit.entity == record["id"],
+                Audit.action == "hourly_article_prepare_attempt"))
+            audit.details = {key: value for key, value in audit.details.items() if key != "reference_contract"}
+        meta["machine_review_evidence_hash"] = fingerprint(evidence)
+        variant.metadata_json = meta
+    cycle._save(ledger)
+    with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_RECHECK_REQUIRED"):
+        cycle.publish(prepared["id"], prepared["content_hash"])
+    assert len(calls) == 1 and records[prepared["postiz_id"]]["state"] == "DRAFT"
+    with core.db.session() as session:
+        assert session.query(TargetApproval).count() == session.query(Dispatch).count() == 0
+
+
+@pytest.mark.parametrize("suffix", ["", "/wrong", "?changed=yes", "#changed"])
+def test_historical_reference_evidence_stays_v1_but_v2_detects_the_full_damaged_url(suffix):
+    from max_postiz_agent.article_attribution import article_footer
+    from max_postiz_agent.article_links import REFERENCE_CONTRACT, reference_urls
+    from max_postiz_agent.automatic_policy import _validate
+    from max_postiz_agent.human_review import text_hash
+    full = "https://en.wikipedia.org/wiki/Asterism_(astronomy)"
+    damaged = full[:-1] if not suffix else full + suffix
+    source = {"title": "Scientists studied a distant stellar cluster",
+              "body": "Scientists carefully studied the distant stellar cluster and compared its structure "
+                      "with other clusters. They described the observed pattern as [an asterism](" + full + ").",
+              "url": "https://svs.gsfc.nasa.gov/9999/"}
+    title = "Исследование далёкого звёздного скопления"
+    text = "Учёные внимательно изучили далёкое звёздное скопление и сравнили его строение с другими скоплениями. Они описали наблюдаемый рисунок как астеризм.\n\n" + damaged
+    body = title + "\n\n" + text + "\n\n" + article_footer(source["url"])
+    review = {"approved": True, "topic": "science", "issues": [], "warnings": []}
+    evidence = {"review_raw": json.dumps(review), "review": review, "spelling_matches": [],
+                "spelling_adjudicated": [], "spelling_unresolved": [], "hard_gates_passed": True,
+                "text_hash": text_hash(title, body), "source_hash": fingerprint(source),
+                "review_rubric": "meaning-first-v1", "review_prompt_hash": "a" * 64, "trace_hash": "b" * 64}
+    before = copy.deepcopy(evidence)
+    assert _validate(evidence, title, body, source) == review
+    assert evidence == before  # Историческая запись не переоформляется задним числом.
+    evidence["reference_check"] = {"contract": REFERENCE_CONTRACT,
+        "source_urls": sorted(reference_urls(source["title"] + "\n\n" + source["body"], contract=REFERENCE_CONTRACT)),
+        "candidate_urls": sorted(reference_urls(title + "\n\n" + text, contract=REFERENCE_CONTRACT))}
+    with pytest.raises(AgentError, match="TRANSLATION_REFERENCE_CHANGED"):
+        _validate(evidence, title, body, source)
+
+
+@pytest.mark.parametrize("damage", ["none", "integer", "mapping", "string", "missing_number",
+                                   "boolean_number", "wrong_number", "missing_audit_number", "boolean_audit_number"])
+def test_reference_binding_rejects_malformed_or_non_strict_attempt_numbers(automatic_cycle, damage):
+    from max_postiz_agent.automatic_policy import _reference_binding
+    (cycle, core, article, _, _, _, _), _ = automatic_cycle
+    prepared = cycle.prepare(article)
+    record = copy.deepcopy(cycle._load()["records"][0])
+    replacements = {"none": None, "integer": 1, "mapping": {}, "string": "attempt"}
+    if damage in replacements:
+        record["preparation_attempts"] = replacements[damage]
+    elif damage == "missing_number":
+        record["preparation_attempts"][-1].pop("number")
+    elif damage == "boolean_number":
+        record["preparation_attempts"][-1]["number"] = True
+    elif damage == "wrong_number":
+        record["preparation_attempts"][-1]["number"] = 2
+    with core.db.session.begin() as session:
+        if damage in {"missing_audit_number", "boolean_audit_number"}:
+            audit = session.scalar(select(Audit).where(Audit.entity == record["id"],
+                Audit.action == "hourly_article_prepare_attempt"))
+            details = copy.deepcopy(audit.details)
+            if damage == "missing_audit_number":
+                details.pop("attempt")
+            else:
+                details["attempt"] = True
+            audit.details = details
+            session.flush()
+        variant = session.get(Variant, prepared["variant_id"])
+        with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_RECHECK_REQUIRED"):
+            _reference_binding(session, variant, record)

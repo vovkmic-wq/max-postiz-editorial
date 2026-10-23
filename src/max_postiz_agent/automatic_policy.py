@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from .adapters import extract_object
+from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT, reference_urls
 from .config import AgentError, fingerprint, inside
 from .db import Audit, Material, now
 from .hub_models import BridgePost, Dispatch, RemoteDraft, Target, TargetApproval
@@ -25,7 +26,7 @@ def _validate(evidence, title, body, source):
                                   review_parser_contract, rubric_spelling, rubric_translation_gate)
     required = {"review_raw", "review", "spelling_matches", "spelling_adjudicated", "spelling_unresolved",
                 "hard_gates_passed", "text_hash", "source_hash", "review_rubric", "review_prompt_hash", "trace_hash"}
-    optional = {"parser_contract", "protocol_recovery", "fresh_spelling_contract"}
+    optional = {"parser_contract", "protocol_recovery", "fresh_spelling_contract", "reference_check"}
     if (not isinstance(evidence, dict) or not required <= set(evidence) <= required | optional
             or evidence["review_rubric"] != MEANING_FIRST_REVIEW_RUBRIC
             or evidence["hard_gates_passed"] is not True
@@ -58,7 +59,17 @@ def _validate(evidence, title, body, source):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     candidate = title + "\n\n" + candidate_body(SimpleNamespace(title=title, body=body), source)
     original = source["title"] + "\n\n" + source["body"]
-    rubric_translation_gate(original, candidate, rubric)
+    reference_contract = LEGACY_REFERENCE_CONTRACT
+    if "reference_check" in evidence:
+        reference_contract = REFERENCE_CONTRACT
+        expected = {"contract": reference_contract,
+                    "source_urls": sorted(reference_urls(original, contract=reference_contract)),
+                    "candidate_urls": sorted(reference_urls(candidate, contract=reference_contract))}
+        if evidence["reference_check"] != expected:
+            raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
+    # Сохранённое доказательство воспроизводится своим историческим валидатором.
+    # Перед будущей отправкой eligibility отдельно требует строгую новую проверку.
+    rubric_translation_gate(original, candidate, rubric, reference_contract=reference_contract)
     if len(body) > 3500 or source["url"] not in body:
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     matches = evidence["spelling_matches"]
@@ -86,10 +97,15 @@ def machine_metadata(prepared, source, trace_path):
             or evidence["review_prompt_hash"] != hashlib.sha256((trace_path.parents[2] /
                 "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt").read_text(encoding="utf-8").encode("utf-8")).hexdigest()):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
+    reference_contract = evidence.get("reference_check", {}).get("contract", LEGACY_REFERENCE_CONTRACT)
+    if prepared.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract:
+        raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     return {"machine_review_status": "passed", "machine_review_issues": [],
             "machine_review_warnings": review["warnings"], "machine_review_evidence": evidence,
             "machine_review_evidence_hash": fingerprint(evidence), "review_rubric": evidence["review_rubric"],
-            "review_prompt_hash": evidence["review_prompt_hash"]}
+            "review_prompt_hash": evidence["review_prompt_hash"],
+            **({"reference_contract": reference_contract}
+               if reference_contract != LEGACY_REFERENCE_CONTRACT else {})}
 
 
 def automatic_evidence(session, variant):
@@ -103,7 +119,9 @@ def automatic_evidence(session, variant):
         hashed = fingerprint(evidence)
         if (hashed != variant.metadata_json.get("machine_review_evidence_hash")
                 or variant.metadata_json.get("review_rubric") != evidence["review_rubric"]
-                or variant.metadata_json.get("review_prompt_hash") != evidence["review_prompt_hash"]):
+                or variant.metadata_json.get("review_prompt_hash") != evidence["review_prompt_hash"]
+                or variant.metadata_json.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
+                != evidence.get("reference_check", {}).get("contract", LEGACY_REFERENCE_CONTRACT)):
             return None
         return {"evidence_hash": hashed, "review": copy.deepcopy(review), "warnings": review["warnings"]}
     except (AgentError, ValueError, TypeError, KeyError):
@@ -118,6 +136,36 @@ def eligible(core, session, variant):
         raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
     policy = cycle._policy_for_record(record)
     return _eligible_record(cycle, session, variant, policy, record)
+
+
+def _reference_binding(session, variant, record):
+    """Новый контракт нельзя удалить из ledger/evidence и выдать за старую проверку."""
+    audits = list(session.scalars(select(Audit).where(
+        Audit.entity == record["id"], Audit.action == "hourly_article_prepare_attempt")))
+    evidence = variant.metadata_json.get("machine_review_evidence", {})
+    check = evidence.get("reference_check", {}) if isinstance(evidence, dict) else {}
+    attempts = record.get("preparation_attempts", [])
+    if not isinstance(attempts, list) or any(not isinstance(item, dict) for item in attempts):
+        raise AgentError("ARTICLE_AUTOMATIC_RECHECK_REQUIRED", 409)
+    markers = [record.get("reference_contract"), variant.metadata_json.get("reference_contract"),
+               check.get("contract") if isinstance(check, dict) else None]
+    markers += [item.get("reference_contract") for item in attempts if isinstance(item, dict)]
+    markers += [item.details.get("reference_contract") for item in audits if isinstance(item.details, dict)]
+    if not any(marker is not None for marker in markers):
+        return  # Исторический v1 остаётся историческим; запись не переписывается.
+    if not attempts or any(type(item.get("number")) is not int or item["number"] != number
+                           for number, item in enumerate(attempts, 1)):
+        raise AgentError("ARTICLE_AUTOMATIC_RECHECK_REQUIRED", 409)
+    last = attempts[-1]
+    matching = [item for item in audits if isinstance(item.details, dict)
+                and type(item.details.get("attempt")) is int
+                and item.details["attempt"] == last["number"]]
+    if (record.get("reference_contract") != REFERENCE_CONTRACT
+            or last.get("reference_contract") != REFERENCE_CONTRACT
+            or variant.metadata_json.get("reference_contract") != REFERENCE_CONTRACT
+            or not isinstance(check, dict) or check.get("contract") != REFERENCE_CONTRACT
+            or len(matching) != 1 or matching[0].details.get("reference_contract") != REFERENCE_CONTRACT):
+        raise AgentError("ARTICLE_AUTOMATIC_RECHECK_REQUIRED", 409)
 
 
 def _eligible_record(cycle, session, variant, policy, record):
@@ -149,6 +197,13 @@ def _eligible_record(cycle, session, variant, policy, record):
         raise AgentError("STALE_SOURCE", 409)
     if automatic_evidence(session, variant) is None:
         raise AgentError("ARTICLE_AUTOMATIC_RECHECK_REQUIRED", 409)
+    _reference_binding(session, variant, record)
+    from .article_quality import rubric_translation_gate
+    source = source_data(session, variant)
+    # Даже старый прошедший DRAFT не может отправить повреждённый literal URL.
+    rubric_translation_gate(source["title"] + "\n\n" + source["body"],
+        variant.title + "\n\n" + candidate_body(variant, source), "meaning-first-v1",
+        reference_contract=REFERENCE_CONTRACT)
     prompt_hash = hashlib.sha256((core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt")
                                 .read_text(encoding="utf-8").encode("utf-8")).hexdigest()
     if variant.metadata_json.get("review_prompt_hash") != prompt_hash:
