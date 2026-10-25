@@ -283,3 +283,27 @@ LanguageTool gate этим fragment-стендом не заменяется.
 или отправки и не меняют рабочий маршрут Hy/паузы. Результаты, ограничения
 формата замечаний и смешанного профиля памяти описаны в
 [отчёте](../../docs/ARGOS_CASCADE_EVALUATION.md).
+
+## Causal-позиции MADLAD в Candle
+
+Для MADLAD-400-3B на pinned Candle
+`12bb5d1f6350f4ea9827d9086f213feec1f0af6a` необходим
+[патч](candle-t5-causal-position.patch): исходный quantized T5 применяет
+двунаправленные relative-position buckets также к декодеру. Эталонный
+[Transformers T5](https://github.com/huggingface/transformers/blob/v4.57.1/src/transformers/models/t5/modeling_t5.py)
+различает энкодер и декодер. При расстоянии 16 исходный decoder выбирает bucket
+10 вместо 16; это влияет на inference и делает старые замеры этого backend
+непригодными для оценки качества MADLAD.
+
+Применяйте патч из корня отдельной копии Candle, сохранив исходную сборку:
+
+```bash
+git apply --check /path/to/max-postiz/deployment/translation/candle-t5-causal-position.patch
+git apply /path/to/max-postiz/deployment/translation/candle-t5-causal-position.patch
+cargo test --locked --release -p candle-transformers --lib max_postiz_bucket_contract --no-default-features
+```
+
+Патч проверяет 1026 значений по формуле эталона и отдельный causal-контрпример.
+После сборки фиксируйте новый SHA бинарника и отдельный профиль эксперимента.
+Прежние raw и отказы сохраняются; их нельзя переписать успешными ответами новой
+сборки. Это исправление изолированного стенда, рабочий переводчик не переключается.
