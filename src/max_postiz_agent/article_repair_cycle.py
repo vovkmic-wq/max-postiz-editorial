@@ -22,7 +22,8 @@ from .server_state import require_running
 
 MAX_AUTOMATIC_REPAIRS = 2
 QUARANTINE_ERRORS = {"ARTICLE_REPAIR_RESPONSE_INVALID", "ARTICLE_REPAIR_PATCH_INVALID",
-                     "TRANSLATION_REFERENCE_CHANGED", "TRANSLATION_NUMBER_CHANGED"}
+                     "TRANSLATION_REFERENCE_CHANGED", "TRANSLATION_NUMBER_CHANGED",
+                     "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"}
 _BINDING = ("id", "number", "contract", "model", "input_hash", "policy_hash", "slot",
             "parent_trace_hash", "parent_trace_bytes", "snapshot_hash", "snapshot_path", "prompts", "target_binding_hash",
             "source_config_hash", "reference_contract")
@@ -63,7 +64,7 @@ def _write_json(path, value):
 
 
 def capture_input(cycle, record, article):
-    """Первичный вход сохраняется до Hy, включая пробелы и исходный тип даты."""
+    """Первичный вход сохраняется до переводчика, включая пробелы и тип даты."""
     relative = f"data/hourly-articles/input-{record['id']}.local.json"
     record.update(input_file=relative, input_file_hash=_write_json(inside(cycle.core.settings.root, relative), article))
 
@@ -469,10 +470,19 @@ class AutomaticArticleRepair:
         """Адресный карантин полного ответа с доказанным нарушением чисел."""
         return self._quarantine_failed(ident, reason, profile="number")
 
+    def quarantine_failed_latin_mask(self, ident, reason):
+        """Отложить полный ответ с подменой алфавита, сохранив прежний failed claim.
+
+        Чистый replay обязан подтвердить тот же запрет. Нового перевода, QA,
+        согласования и отправки нет; неполный или неизвестный исход не снимается.
+        """
+        return self._quarantine_failed(ident, reason, profile="latin_mask")
+
     def _quarantine_failed(self, ident, reason, *, profile):
         from .server_models import EditorialControl
         from .server_state import CONTROL_ID
-        codes = {"reference": "TRANSLATION_REFERENCE_CHANGED", "number": "TRANSLATION_NUMBER_CHANGED"}
+        codes = {"reference": "TRANSLATION_REFERENCE_CHANGED", "number": "TRANSLATION_NUMBER_CHANGED",
+                 "latin_mask": "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"}
         if profile not in codes:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_QUARANTINE_NOT_SAFE", 409)
         code = codes[profile]

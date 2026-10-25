@@ -8,6 +8,9 @@ import pytest
 from max_postiz_agent.config import AgentError
 from max_postiz_agent.translation import (
     DedicatedTranslator,
+    MADLAD_ARTIFACT_SHA256,
+    MADLAD_BACKEND_CONTRACT,
+    MADLAD_MODEL,
     configured_translator,
     restore_numeric_spelling,
     segments,
@@ -132,7 +135,11 @@ def test_article_cycle_keeps_a_separate_reviewer(tmp_path, monkeypatch, enabled)
 
     monkeypatch.setattr(article_cycle, 'OpenCode', EditorialModel)
     core = SimpleNamespace(settings=SimpleNamespace(root=tmp_path))
-    check = article_cycle.HourlyArticleCycle(core)._quality()
+    cycle = article_cycle.HourlyArticleCycle(core)
+    # Эта фикстура проверяет wiring, а не PostgreSQL: старый SimpleNamespace
+    # не содержит обязательной БД нового серверного ledger.
+    monkeypatch.setattr(cycle, '_load', lambda: {'records': []})
+    check = cycle._quality()
     try:
         assert isinstance(check.translator, DedicatedTranslator) is enabled
         assert check.translator.model == ('hy-mt2-1.8b-q8' if enabled else 'proxmox/qwen35-9b')
@@ -146,7 +153,8 @@ def test_article_cycle_keeps_a_separate_reviewer(tmp_path, monkeypatch, enabled)
 
 
 @pytest.mark.parametrize('approved', [False, True])
-def test_dedicated_translation_obeys_independent_review_and_spelling(approved):
+@pytest.mark.parametrize('model', ['hy-mt2-1.8b-q8', MADLAD_MODEL])
+def test_dedicated_translation_obeys_independent_review_and_spelling(approved, model):
     from max_postiz_agent.article_quality import ArticleQuality
 
     source_title = 'A small telescope studies the night sky'
@@ -162,7 +170,9 @@ def test_dedicated_translation_obeys_independent_review_and_spelling(approved):
         value = json.loads(request.content)
         calls.append(value)
         text = translated_title if value['text'] == source_title else translated_body
-        return httpx.Response(200, json={'model': value['model'], 'complete': True, 'text': text})
+        return httpx.Response(200, json={'model': value['model'], 'complete': True, 'text': text,
+            **({'metrics': {'backend_contract': MADLAD_BACKEND_CONTRACT,
+                            'artifact_sha256': MADLAD_ARTIFACT_SHA256}} if model == MADLAD_MODEL else {})})
 
     class Reviewer:
         model = 'independent-reviewer'
@@ -177,7 +187,7 @@ def test_dedicated_translation_obeys_independent_review_and_spelling(approved):
         return httpx.Response(200, json={'matches': []})
 
     translator = DedicatedTranslator(
-        {'model': 'hy-mt2-1.8b-q8', 'base_url': 'http://127.0.0.1:8094'},
+        {'model': model, 'base_url': 'http://127.0.0.1:8094'},
         transport=httpx.MockTransport(translate))
     check = ArticleQuality(translator, Reviewer(), transport=httpx.MockTransport(spell),
         prompt_dir=Path(__file__).resolve().parents[1] / 'prompts')

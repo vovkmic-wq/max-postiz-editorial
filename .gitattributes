@@ -11,3 +11,4 @@
 *.txt text eol=lf
 *.conf text eol=lf
 Dockerfile* text eol=lf
+deployment/translation/candle-t5-causal-position.patch text eol=lf -whitespace

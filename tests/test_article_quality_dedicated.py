@@ -7,7 +7,8 @@ import pytest
 
 from max_postiz_agent.article_quality import ArticleQuality
 from max_postiz_agent.config import AgentError
-from max_postiz_agent.translation import DedicatedTranslator
+from max_postiz_agent.translation import (DedicatedTranslator, MADLAD_ARTIFACT_SHA256,
+                                          MADLAD_BACKEND_CONTRACT, MADLAD_MODEL)
 
 TITLE = "A classroom experiment records cooling"
 ORIGINAL = (
@@ -36,7 +37,7 @@ class Reviewer:
         return response if isinstance(response, str) else json.dumps(response, ensure_ascii=False), {}
 
 
-def dedicated_quality(reviewer, events, *, translation=None, matches=None):
+def dedicated_quality(reviewer, events, *, translation=None, matches=None, model="hy-mt2-7b-q8"):
     translations, spelling = [], []
     translation = TRANSLATION if translation is None else translation
 
@@ -44,14 +45,16 @@ def dedicated_quality(reviewer, events, *, translation=None, matches=None):
         value = json.loads(request.content)
         translations.append(value)
         return httpx.Response(200, json={"model": value["model"], "complete": True,
-            "text": translation["title"] if value["text"] == TITLE else translation["body"]})
+            "text": translation["title"] if value["text"] == TITLE else translation["body"],
+            **({"metrics": {"backend_contract": MADLAD_BACKEND_CONTRACT,
+                            "artifact_sha256": MADLAD_ARTIFACT_SHA256}} if model == MADLAD_MODEL else {})})
 
     def spell(request):
         spelling.append(request)
         return httpx.Response(200, json={"matches": [] if matches is None else matches})
 
     translator = DedicatedTranslator(
-        {"model": "hy-mt2-7b-q8", "base_url": "http://127.0.0.1:8094"},
+        {"model": model, "base_url": "http://127.0.0.1:8094"},
         transport=httpx.MockTransport(translate))
     check = ArticleQuality(translator, reviewer, trace=events.append,
                            transport=httpx.MockTransport(spell))
@@ -90,11 +93,12 @@ def test_unverifiable_dedicated_review_cannot_be_replaced_by_later_approval(inva
     assert not capsys.readouterr().out
 
 
-def test_negative_dedicated_review_keeps_findings_and_spelling_without_resampling():
+@pytest.mark.parametrize("model", ["hy-mt2-7b-q8", MADLAD_MODEL])
+def test_negative_dedicated_review_keeps_findings_and_spelling_without_resampling(model):
     issue = "The candidate changes a fact in the source."
     rejection = {"approved": False, "topic": "science", "issues": [{"issue": issue}]}
     reviewer, events = Reviewer(rejection, APPROVAL), []
-    check, translations, spelling = dedicated_quality(reviewer, events)
+    check, translations, spelling = dedicated_quality(reviewer, events, model=model)
     try:
         with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
             check.prepare(TITLE, ORIGINAL, URL)
@@ -134,7 +138,8 @@ def test_mutable_changed_candidate_after_unverifiable_review_requires_its_own_re
 
 
 @pytest.mark.parametrize("failure", ["number_gate", "negative_review", "spelling"])
-def test_immutable_known_failure_stops_after_one_call_and_retains_all_evidence(failure):
+@pytest.mark.parametrize("model", ["hy-mt2-7b-q8", MADLAD_MODEL])
+def test_immutable_known_failure_stops_after_one_call_and_retains_all_evidence(failure, model):
     import copy
 
     translation = copy.deepcopy(TRANSLATION)
@@ -151,7 +156,7 @@ def test_immutable_known_failure_stops_after_one_call_and_retains_all_evidence(f
                              "category": {"id": "TYPOS"}}}]
     events, generate_calls = [], []
     check, translations, spelling = dedicated_quality(
-        reviewer, events, translation=translation, matches=matches)
+        reviewer, events, translation=translation, matches=matches, model=model)
     generate = check.translator.generate_text
 
     def counted(prompt):
@@ -184,10 +189,11 @@ def test_immutable_known_failure_stops_after_one_call_and_retains_all_evidence(f
 
 @pytest.mark.parametrize("code", ["OPENCODE_PROVIDER_UNAVAILABLE", "INVALID_EDITOR_RESULT"])
 @pytest.mark.parametrize("phase", ["prepare", "candidate"])
-def test_infrastructure_503_propagates_without_quality_rejection_or_retry(code, phase):
+@pytest.mark.parametrize("model", ["hy-mt2-7b-q8", MADLAD_MODEL])
+def test_infrastructure_503_propagates_without_quality_rejection_or_retry(code, phase, model):
     unavailable = AgentError(code, 503)
     reviewer, events = Reviewer(unavailable, APPROVAL), []
-    check, translations, spelling = dedicated_quality(reviewer, events)
+    check, translations, spelling = dedicated_quality(reviewer, events, model=model)
     try:
         with pytest.raises(AgentError) as failure:
             if phase == "prepare":

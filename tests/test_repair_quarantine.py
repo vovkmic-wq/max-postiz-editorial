@@ -1,4 +1,4 @@
-"""Карантин полного ответа с потерянной ссылкой не превращает отказ в одобрение."""
+"""Карантин полного ответа с protocol guard не превращает отказ в одобрение."""
 
 import copy
 import json
@@ -23,6 +23,7 @@ pytest_plugins = ["test_automatic_article_repair"]
 
 REFERENCE = "https://science.example.org/first-look/"
 REASON = "Адресный карантин полного сохранённого ответа: редактор потерял исходную научную ссылку."
+LATIN_REASON = "Адресный карантин полного сохранённого ответа: редактор подменил русское слово латинским."
 
 
 def contract_factory(value, contract):
@@ -111,6 +112,56 @@ def quarantine(value):
     return AutomaticArticleRepair(value.cycle).quarantine_failed_reference(value.initial["id"], REASON)
 
 
+@pytest.fixture
+def latin_repair_cycle(automatic_cycle, monkeypatch):
+    (cycle, _, article, _, _, _, _), _ = automatic_cycle
+    article["original"] += " The Niño term is a scientific name."
+    original_quality = cycle._quality
+
+    def quality(*args, **kwargs):
+        result = original_quality(*args, **kwargs)
+        result.translator.value["body"] += " Термин Ниньо сохранён."
+        return result
+
+    monkeypatch.setattr(cycle, "_quality", quality)
+    value = repair_fixture.__wrapped__(automatic_cycle, monkeypatch)
+    value.controls.output = {"title": "Космический ветер", "body": CORRECT_BODY + " Термин Niño сохранён."}
+    return value
+
+
+@pytest.fixture
+def failed_latin_mask(latin_repair_cycle, monkeypatch):
+    value = latin_repair_cycle
+    # Воспроизводим прежний failed до добавления адресного quarantine-пути.
+    with monkeypatch.context() as previous:
+        previous.setattr(protocol_module, "QUARANTINE_ERRORS",
+                        protocol_module.QUARANTINE_ERRORS - {"ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"})
+        with pytest.raises(AgentError, match="ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"):
+            value.cycle.repair_rejected(value.initial["id"])
+    assert current(value)["automatic_repair_attempts"][-1]["state"] == "failed"
+    ServerState(value.core).initialize()
+    return value
+
+
+def latin_quarantine(value):
+    return AutomaticArticleRepair(value.cycle).quarantine_failed_latin_mask(value.initial["id"], LATIN_REASON)
+
+
+def test_future_complete_latin_mask_is_quarantined_without_more_qa(latin_repair_cycle):
+    value = latin_repair_cycle
+    with pytest.raises(AgentError, match="ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"):
+        value.cycle.repair_rejected(value.initial["id"])
+    saved = current(value)
+    claim = saved["automatic_repair_attempts"][-1]
+    assert claim["state"] == "not_repairable" and claim["outcome_origin"] == "protocol_guard"
+    assert claim["error"] == "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"
+    assert saved["error"] == "ARTICLE_QUALITY_REJECTED"
+    assert value.cycle.automatic_repair_status(saved)["reason"] == "NOT_REPAIRABLE"
+    assert value.trace.read_bytes() == value.initial_trace
+    assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
+    no_delivery(value)
+
+
 def test_future_complete_lost_reference_is_quarantined_without_more_qa(linked_repair_cycle):
     value = linked_repair_cycle
     with pytest.raises(AgentError, match="TRANSLATION_REFERENCE_CHANGED"):
@@ -131,15 +182,20 @@ def test_future_complete_lost_reference_is_quarantined_without_more_qa(linked_re
     no_delivery(value)
 
 
-def test_old_failure_has_one_durable_quarantine_and_preserves_all_original_fields(failed_reference):
-    value = failed_reference
+@pytest.mark.parametrize("fixture_name,quarantiner,profile,reason", [
+    ("failed_reference", quarantine, "reference", REASON),
+    ("failed_latin_mask", latin_quarantine, "latin_mask", LATIN_REASON),
+])
+def test_old_failure_has_one_durable_quarantine_and_preserves_all_original_fields(
+        request, fixture_name, quarantiner, profile, reason):
+    value = request.getfixturevalue(fixture_name)
     before = current(value)
     previous = before["automatic_repair_attempts"][-1]
     trace = value.core.settings.root / previous["repair_trace"]
     old_raw = trace.read_bytes()
     assert value.cycle.automatic_repair_status(before)["reason"] == "FAILED"
     assert current(value) == before  # status не выполняет адресное восстановление.
-    result = quarantine(value)
+    result = quarantiner(value)
     saved = current(value)
     claim = saved["automatic_repair_attempts"][-1]
     assert result["state"] == claim["state"] == "not_repairable"
@@ -154,11 +210,11 @@ def test_old_failure_has_one_durable_quarantine_and_preserves_all_original_field
         assert audit.details == {"claim_id": claim["id"], "error": previous["error"],
             "trace_hash": claim["repair_trace_hash"], "snapshot_hash": claim["snapshot_hash"]}
         receipt = session.scalar(select(Audit).where(
-            Audit.action == "automatic_article_repair_reference_quarantine"))
-        assert receipt.details["reason"] == REASON and receipt.details["previous_failure"] == previous
+            Audit.action == "automatic_article_repair_" + profile + "_quarantine"))
+        assert receipt.details["reason"] == reason and receipt.details["previous_failure"] == previous
     assert value.cycle.automatic_repair_status(saved)["reason"] == "NOT_REPAIRABLE"
     with pytest.raises(AgentError):
-        quarantine(value)
+        quarantiner(value)
     value.stamp[0] += 3600
     assert value.cycle.automatic_repair_status(current(value))["reason"] == "EXPIRED"
     assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
@@ -166,10 +222,13 @@ def test_old_failure_has_one_durable_quarantine_and_preserves_all_original_field
 
 
 @pytest.mark.parametrize("damage", ["claim_audit", "claim_ledger", "binding", "trace", "raw_valid",
-    "raw_wrong_error", "missing_return", "snapshot", "input", "prompt", "policy", "source",
-    "record_input", "lease", "target", "external", "running", "other_error", "unknown", "finished"])
-def test_damaged_or_uncertain_failure_cannot_be_quarantined(failed_reference, damage):
-    value = failed_reference
+    "raw_wrong_error", "partial_raw", "missing_return", "snapshot", "input", "prompt", "policy", "source",
+    "record_input", "lease", "target", "external", "running", "other_error", "unknown", "network", "finished"])
+@pytest.mark.parametrize("fixture_name,quarantiner", [
+    ("failed_reference", quarantine), ("failed_latin_mask", latin_quarantine),
+])
+def test_damaged_or_uncertain_failure_cannot_be_quarantined(request, fixture_name, quarantiner, damage):
+    value = request.getfixturevalue(fixture_name)
     ledger = value.cycle._load()
     record = ledger["records"][0]
     claim = record["automatic_repair_attempts"][-1]
@@ -181,7 +240,7 @@ def test_damaged_or_uncertain_failure_cannot_be_quarantined(failed_reference, da
         record.pop("automatic_repair_attempts")
     elif damage == "binding":
         claim["input_hash"] = "0" * 64
-    elif damage in {"trace", "raw_valid", "raw_wrong_error", "missing_return"}:
+    elif damage in {"trace", "raw_valid", "raw_wrong_error", "partial_raw", "missing_return"}:
         events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
         if damage == "trace":
             events[0]["context"]["numeric_tokens_must_match_exactly"] = ["123"]
@@ -190,6 +249,8 @@ def test_damaged_or_uncertain_failure_cannot_be_quarantined(failed_reference, da
                 + " Подробности: " + REFERENCE})
         elif damage == "raw_wrong_error":
             events[1]["raw"] = json.dumps({"title": "Космический ветер", "body": CORRECT_BODY + " 123"})
+        elif damage == "partial_raw":
+            events[1]["raw"] = events[1]["raw"][:-1]
         else:
             events.pop(1)
         trace.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
@@ -218,14 +279,15 @@ def test_damaged_or_uncertain_failure_cannot_be_quarantined(failed_reference, da
     elif damage == "running":
         store = ServerState(value.core)
         store.control("start", store.read()["revision"], "owner")
-    elif damage in {"other_error", "unknown"}:
-        record["error"] = claim["error"] = "TRANSLATION_NUMBER_CHANGED" if damage == "other_error" else "POSTIZ_UNKNOWN"
+    elif damage in {"other_error", "unknown", "network"}:
+        record["error"] = claim["error"] = {"other_error": "TRANSLATION_NUMBER_CHANGED",
+            "unknown": "POSTIZ_UNKNOWN", "network": "OPENCODE_GENERATION_FAILED"}[damage]
     elif damage == "finished":
         claim["finished_at"] = claim["started_at"] - 1
     value.cycle._save(ledger)
     expected = copy.deepcopy(current(value))
     with pytest.raises((AgentError, OSError)):
-        quarantine(value)
+        quarantiner(value)
     assert current(value) == expected
     with value.core.db.session() as session:
         assert not session.scalar(select(Audit).where(Audit.action == "automatic_article_repair_quarantined"))
@@ -233,8 +295,11 @@ def test_damaged_or_uncertain_failure_cannot_be_quarantined(failed_reference, da
     assert not value.records and not value.writes
 
 
-def test_audit_before_failed_save_blocks_unknown_recovery_retry(failed_reference, monkeypatch):
-    value = failed_reference
+@pytest.mark.parametrize("fixture_name,quarantiner", [
+    ("failed_reference", quarantine), ("failed_latin_mask", latin_quarantine),
+])
+def test_audit_before_failed_save_blocks_unknown_recovery_retry(request, fixture_name, quarantiner, monkeypatch):
+    value = request.getfixturevalue(fixture_name)
     before = current(value)
 
     def lost(_ledger):
@@ -243,10 +308,10 @@ def test_audit_before_failed_save_blocks_unknown_recovery_retry(failed_reference
     with monkeypatch.context() as failure:
         failure.setattr(value.cycle, "_save", lost)
         with pytest.raises(OSError, match="lost quarantine"):
-            quarantine(value)
+            quarantiner(value)
     assert current(value) == before
     with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_QUARANTINE_ALREADY_ATTEMPTED"):
-        quarantine(value)
+        quarantiner(value)
     assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
     no_delivery(value)
 

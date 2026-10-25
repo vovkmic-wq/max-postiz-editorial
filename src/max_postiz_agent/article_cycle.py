@@ -237,7 +237,7 @@ class HourlyArticleCycle:
         if self.quality_factory:
             return self.quality_factory()
         from .article_quality import ArticleQuality
-        from .translation import DedicatedTranslator, configured_translator
+        from .translation import AUTOMATIC_TRANSLATION_MODELS, DedicatedTranslator, configured_translator
         reference_contract = self._quality_reference_contract(record_id)
         with ExitStack() as cleanup:
             if review_only:
@@ -250,9 +250,14 @@ class HourlyArticleCycle:
             policy_path = self.core.settings.root / "data/hourly-article-policy.local.json"
             mode = self._policy(enabled=False).get("approval_mode") if policy_path.exists() else "legacy"
             human_mode = mode == "human"
-            if (mode in {"human", "automatic"} and not review_only and (not isinstance(translator, DedicatedTranslator)
-                                                  or translator.model != "hy-mt2-7b-q8")):
-                raise AgentError("HUMAN_HY_TRANSLATOR_REQUIRED", 409)
+            if mode in {"human", "automatic"} and not review_only:
+                # Новый автоматический маршрут требует явной конфигурации исправленного
+                # MADLAD либо прежнего Hy; человеческий маршрут сохраняет свой контракт.
+                allowed = AUTOMATIC_TRANSLATION_MODELS if mode == "automatic" else {"hy-mt2-7b-q8"}
+                if not isinstance(translator, DedicatedTranslator) or translator.model not in allowed:
+                    code = ("ARTICLE_AUTOMATIC_TRANSLATOR_REQUIRED" if mode == "automatic"
+                            else "HUMAN_HY_TRANSLATOR_REQUIRED")
+                    raise AgentError(code, 409)
             if translator is None:
                 translator = OpenCode(self.core.settings)
                 translator.model = "proxmox/qwen35-9b"

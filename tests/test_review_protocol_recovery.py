@@ -6,7 +6,8 @@ import json
 import httpx
 import pytest
 
-from max_postiz_agent.article_quality import ArticleQuality
+from max_postiz_agent.article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT
+from max_postiz_agent.article_quality import ArticleQuality, article_review_context
 from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.db import Audit, Draft, Material, Story
 from max_postiz_agent.hub_models import BridgePost, Dispatch, RemoteDraft, Target, TargetApproval, Variant
@@ -34,10 +35,15 @@ class UnusedReviewer:
         pass
 
 
-@pytest.fixture
-def protocol_failure(automatic_cycle, monkeypatch):
+@pytest.fixture(params=[LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT], ids=["legacy-v1", "exact-v2"])
+def protocol_failure(automatic_cycle, monkeypatch, request):
     value, _ = automatic_cycle
     cycle, core, article, records, calls, stamp, policy = value
+    reference_contract = request.param
+    if reference_contract == LEGACY_REFERENCE_CONTRACT:
+        # Исторический V1 закрепляется ДО создания record/attempt. Готовую
+        # историю не переписываем под текущий V2 и не ослабляем saved replay.
+        monkeypatch.setattr("max_postiz_agent.article_cycle.REFERENCE_CONTRACT", LEGACY_REFERENCE_CONTRACT)
 
     class InitialFailure:
         def __init__(self):
@@ -56,6 +62,8 @@ def protocol_failure(automatic_cycle, monkeypatch):
     original = article["title"].strip() + "\n\n" + article["original"].strip()
     text = CANDIDATE["title"] + "\n\n" + CANDIDATE["body"]
     prompt = (core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt").read_text(encoding="utf-8")
+    context = article_review_context(prompt, original, text, "meaning-first-v1",
+        hashlib.sha256(prompt.encode()).hexdigest(), reference_contract=reference_contract)
     raw_review = "```json\n" + json.dumps(REVIEW, ensure_ascii=False) + "\n```"
 
     class HistoricalFailure(InitialFailure):
@@ -63,12 +71,11 @@ def protocol_failure(automatic_cycle, monkeypatch):
             trace = cycle._trace_writer(record["id"])
             for event in [
                 {"phase": "candidate_started", "mode": "candidate", "candidate": copy.deepcopy(CANDIDATE),
-                 "source_untrusted": {"title": article["title"].strip(), "body": article["original"].strip(), "url": article["url"]}},
+                 "source_untrusted": {"title": article["title"].strip(), "body": article["original"].strip(), "url": article["url"]},
+                 **({"reference_contract": reference_contract} if reference_contract == REFERENCE_CONTRACT else {})},
                 {"phase": "gate_passed", "characters": len(text + "\n\nИсточник: " + article["url"] +
                     "\nПеревод и редактура с помощью нейросетей.")},
-                {"phase": "review_started", "context": {"instruction": prompt, "source_untrusted": original,
-                 "translation_untrusted": text, "review_rubric": "meaning-first-v1",
-                 "review_prompt_hash": hashlib.sha256(prompt.encode()).hexdigest()}},
+                {"phase": "review_started", "context": copy.deepcopy(context)},
                 {"phase": "review_returned", "raw": raw_review},
                 {"phase": "review_invalid", "error": "ARTICLE_REVIEW_SCHEMA_INVALID", "review": copy.deepcopy(REVIEW)},
                 {"phase": "rejected", "mode": "candidate", "error": "ARTICLE_QUALITY_REJECTED"},
@@ -86,6 +93,7 @@ def protocol_failure(automatic_cycle, monkeypatch):
     path = core.settings.root / record["quality_trace"]
     state = {"value": value, "record": copy.deepcopy(record), "article": copy.deepcopy(article),
              "candidate": copy.deepcopy(CANDIDATE), "trace": path, "bytes": path.read_bytes(),
+             "reference_contract": reference_contract,
              "lt_calls": [], "matches": [], "status": 200, "callback": None}
 
     def transport(request):
@@ -98,7 +106,8 @@ def protocol_failure(automatic_cycle, monkeypatch):
         assert review_only is True and ident != record["id"]
         return ArticleQuality(CandidateOnlyTranslator(), UnusedReviewer(),
             prompt_dir=core.settings.root / "prompts", trace=cycle._trace_writer(ident),
-            review_rubric="meaning-first-v1", transport=httpx.MockTransport(transport))
+            review_rubric="meaning-first-v1", reference_contract=reference_contract,
+            transport=httpx.MockTransport(transport))
 
     monkeypatch.setattr(cycle, "_quality", quality)
     monkeypatch.setattr(core, "approve_hourly_policy", lambda *args, **kwargs: pytest.fail("Recovery creates no approval"))
@@ -140,7 +149,8 @@ def test_explicit_protocol_recovery_preserves_old_refusal_and_all_warnings_witho
         assert session.query(Audit).filter_by(action="hourly_article_review_protocol_completed").count() == 1
 
 
-@pytest.mark.parametrize("change", ["sha", "candidate", "source", "prompt", "policy", "slot", "marker", "lt_phase", "prior_verdict"])
+@pytest.mark.parametrize("change", ["sha", "candidate", "source", "prompt", "policy", "slot", "marker",
+                                   "reference_contract", "lt_phase", "prior_verdict"])
 def test_unsafe_or_nonexact_protocol_recovery_fails_before_lt_and_claim(protocol_failure, change):
     state = protocol_failure
     cycle, core, _, records, calls, stamp, policy = state["value"]
@@ -162,6 +172,12 @@ def test_unsafe_or_nonexact_protocol_recovery_fails_before_lt_and_claim(protocol
         ledger = cycle._load()
         ledger["records"][0]["preparation_attempts"][-1].pop("candidate_normalization")
         cycle._save(ledger)
+    elif change == "reference_contract":
+        def wrong_contract(events):
+            first = next(event for event in events if event.get("phase") == "candidate_started")
+            first["reference_contract"] = (LEGACY_REFERENCE_CONTRACT
+                if state["reference_contract"] == REFERENCE_CONTRACT else REFERENCE_CONTRACT)
+        rewrite(state, wrong_contract)
     elif change == "lt_phase":
         rewrite(state, lambda events: events.insert(-1, {**events[-1], "phase": "spelling_started"}))
     else:

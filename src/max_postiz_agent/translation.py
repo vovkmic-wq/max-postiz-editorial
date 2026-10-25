@@ -12,7 +12,16 @@ import httpx
 
 from .config import AgentError
 
-MODELS = {"hy-mt2-1.8b-q8", "hy-mt2-7b-q8", "translategemma-12b-q4", "opus-mt-en-ru-int8"}
+MADLAD_MODEL = "madlad400-3b-q4k-causal-v2"
+MADLAD_BACKEND_CONTRACT = "madlad400-candle-causal-v2"
+MADLAD_ARTIFACT_SHA256 = {
+    "worker": "7b3fd9c77e130992a9b233c30b26a0245b9bb4386a5ecc7250f244d90d4e97cd",
+    "model": "ea6e5531a3e95213c7f0635988d119e078a655c09306e47851e15d4c0c3f9c37",
+    "tokenizer": "a2799ccc696b752ba00c34f58726bfe253a04921ceb6cfc620400f560474790b",
+    "config": "cad399cab799b99409a6ec2d90d72552257c2bb752861261d2016691e0643e7c",
+}
+AUTOMATIC_TRANSLATION_MODELS = frozenset({"hy-mt2-7b-q8", MADLAD_MODEL})
+MODELS = {"hy-mt2-1.8b-q8", "hy-mt2-7b-q8", "translategemma-12b-q4", "opus-mt-en-ru-int8", MADLAD_MODEL}
 _NUMBER = re.compile(r"(?P<sign>[+\-−][ \t]*)?(?P<number>\d+(?:(?:[.,]\d+)|(?:[ \u00a0\u202f]\d{3}))*)")
 _SPACE = r"[ \u00a0\u202f]"
 
@@ -150,7 +159,8 @@ def segments(text, limit=1400):
 
 
 def translation_messages(model, text, prompt):
-    if model not in MODELS - {"opus-mt-en-ru-int8"}:
+    # MADLAD — encoder-decoder T5 с собственным Candle worker, а не chat backend.
+    if model not in MODELS - {"opus-mt-en-ru-int8", MADLAD_MODEL}:
         raise AgentError("TRANSLATION_MODEL_INVALID")
     if model == "translategemma-12b-q4":
         return [{"role": "user", "content": [{"type": "text", "source_lang_code": "en",
@@ -201,9 +211,16 @@ class DedicatedTranslator:
                     or value.get("model") != self.model or value.get("complete") is not True
                     or not isinstance(value.get("text"), str) or not value["text"].strip()):
                 raise AgentError("TRANSLATION_RESPONSE_INVALID", 503)
+            segment_metrics = value.get("metrics", {})
+            # Один alias не отличает исправленную сборку от прежнего T5 backend.
+            # Сверяем закреплённые артефакты каждого сегмента до форматирования.
+            if self.model == MADLAD_MODEL and (
+                    not isinstance(segment_metrics, dict)
+                    or segment_metrics.get("backend_contract") != MADLAD_BACKEND_CONTRACT
+                    or segment_metrics.get("artifact_sha256") != MADLAD_ARTIFACT_SHA256):
+                raise AgentError("TRANSLATION_RESPONSE_INVALID", 503)
             restored, count = restore_numeric_spelling(part, value["text"].strip())
             output.append(restored)
-            segment_metrics = value.get("metrics", {})
             metrics.append({**(segment_metrics if isinstance(segment_metrics, dict) else {}),
                             "numeric_spelling_restored": count})
         return "".join(output), metrics
