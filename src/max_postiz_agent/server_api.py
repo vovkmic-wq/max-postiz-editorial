@@ -46,6 +46,8 @@ def reddit_capability(core):
 
 
 def public_state(core, store):
+    from .article_reserve import ArticleReserveStore
+    from .server_state import validate_settings
     value = store.read()
     runtime = value["runtime"]
     cycle = HourlyArticleCycle(core)
@@ -62,11 +64,17 @@ def public_state(core, store):
                 "url": record.get("url"), "postiz_id": record.get("postiz_id"), "error": record.get("error")})
         active = list(session.scalars(select(Dispatch).where(
             Dispatch.state.in_({"pending", "sending", "unknown", "scheduled", "retry_wait"}))))
+    reserve = ArticleReserveStore(core).status()
+    options = validate_settings(value["settings"])["reserve"]
+    reserve.update({**options, "ready": sum(r["state"] == "quality_ready" for r in records)})
+    preparation = runtime.get("preparation", {})
     return {"version": __version__, "revision": value["revision"], "paused": value["paused"],
         "phase": "paused" if value["paused"] else runtime.get("phase", "idle"),
         "updated_at": value["updated_at"], "heartbeat_at": runtime.get("heartbeat_at"),
         "next_run_at": runtime.get("next_run_at"), "last_error": runtime.get("last_error"),
         "recent": recent, "active_dispatches": len(active),
+        "reserve": reserve,
+        "preparation": {k: preparation.get(k) for k in ("phase", "heartbeat_at", "last_error", "next_run_at")},
         "capabilities": {"reddit": reddit_capability(core)}}
 
 
@@ -106,8 +114,9 @@ def editorial_app(core, store=None):
 
     @app.get("/internal/editorial/settings", dependencies=[Depends(owner)])
     def settings():
+        from .server_state import validate_settings
         value = store.read()
-        return {"revision": value["revision"], "settings": value["settings"]}
+        return {"revision": value["revision"], "settings": validate_settings(value["settings"])}
 
     owner_dependency = Depends(owner)
 

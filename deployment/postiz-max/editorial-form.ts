@@ -1,12 +1,14 @@
 export type EditorialSettings = {
   interval_seconds?: number; source?: string;
   nasa?: Record<string, unknown>; reddit?: Record<string, unknown>;
+  reserve?: Record<string, unknown>;
   [key: string]: unknown;
 };
 export type EditorialForm = {
   source: string; interval: string; nasaKeywords: string; nasaAuthors: string;
   nasaRating: string; subreddits: string; redditAuthors: string; redditKeywords: string; redditRating: string;
   redditComments: string; redditAge: string; redditLimit: string; redditSort: string; redditPeriod: string;
+  reserveEnabled: string; reserveTarget: string; reserveLow: string; reserveMaximum: string; reserveBatch: string;
 };
 const listText = (value: unknown) => Array.isArray(value) ? value.join('\n') : '';
 export const splitList = (value: string) => [...new Set(value.split(/[,\n]/).map(item => item.trim()).filter(Boolean))];
@@ -20,11 +22,17 @@ export function formFromSettings(settings: EditorialSettings): EditorialForm {
     redditComments: String(settings.reddit?.min_comments ?? 0), redditAge: String(settings.reddit?.max_age_hours ?? 72),
     redditLimit: String(settings.reddit?.limit ?? 25), redditSort: String(settings.reddit?.sort ?? 'top'),
     redditPeriod: String(settings.reddit?.time_filter ?? 'week'),
+    reserveEnabled: String(settings.reserve?.enabled ?? false), reserveTarget: String(settings.reserve?.target ?? 6),
+    reserveLow: String(settings.reserve?.low ?? 3), reserveMaximum: String(settings.reserve?.maximum ?? 12),
+    reserveBatch: String(settings.reserve?.batch ?? 3),
   };
 }
 export function settingsFromForm(settings: EditorialSettings, form: EditorialForm): EditorialSettings {
   const minutes = Number(form.interval), nasaRating = Number(form.nasaRating), redditRating = Number(form.redditRating);
   const comments = Number(form.redditComments), age = Number(form.redditAge), limit = Number(form.redditLimit);
+  const target = Number(form.reserveTarget), low = Number(form.reserveLow), maximum = Number(form.reserveMaximum), batch = Number(form.reserveBatch);
+  if (!['true', 'false'].includes(form.reserveEnabled) || ![target, low, maximum, batch].every(Number.isSafeInteger) ||
+      low < 1 || low >= target || target > maximum || maximum > 24 || batch < 1 || batch > 3) throw new Error('EDITORIAL_FORM_INVALID');
   if (!['nasa_svs', 'open_science', 'reddit'].includes(form.source) || !Number.isSafeInteger(minutes) || minutes < 60 || minutes > 1440 ||
       nasaRating !== 0 || !Number.isSafeInteger(redditRating) || redditRating < 0 || redditRating > 1000000 ||
       !Number.isSafeInteger(comments) || comments < 0 || comments > 1000000 || !Number.isSafeInteger(age) || age < 1 || age > 8760 ||
@@ -38,6 +46,9 @@ export function settingsFromForm(settings: EditorialSettings, form: EditorialFor
   // Не теряем дополнительные серверные настройки при сохранении видимых полей.
   return {
     ...settings, source: form.source, interval_seconds: minutes * 60,
+    ...((settings.reserve || form.reserveEnabled === 'true') ? { reserve: {
+      enabled: form.reserveEnabled === 'true', target, low, maximum, batch,
+    } } : {}),
     nasa: { ...settings.nasa, keywords: lists[0], authors: lists[1], min_rating: nasaRating },
     reddit: { ...settings.reddit, subreddits: lists[2], authors: lists[3], keywords: lists[4], min_score: redditRating,
       min_comments: comments, max_age_hours: age, limit, sort: form.redditSort, time_filter: form.redditPeriod },

@@ -28,11 +28,47 @@ from .reddit import text_hash
 class HourlyArticleCycle:
     """A private durable ledger stops interrupted operations instead of replaying them."""
 
-    def __init__(self, core, quality_factory=None, repair_factory=None):
+    def __init__(self, core, quality_factory=None, repair_factory=None, *, reserve_mode=False):
         self.core, self.quality_factory, self.repair_factory = core, quality_factory, repair_factory
+        self.reserve_mode = reserve_mode
         self.directory = inside(core.settings.root, "data/hourly-articles")
         self.directory.mkdir(parents=True, exist_ok=True)
         self.ledger_path = self.directory / "ledger.local.json"
+
+    def _preparation_lock(self):
+        # Долгие модели резерва не удерживают короткую блокировку отправителя.
+        return self.directory / ("reserve-preparation.lock" if self.reserve_mode else "cycle.lock")
+
+    def _reserve_record(self, record, *, active=False, session=None):
+        """Marker не даёт прав сам по себе: проверяем постоянный claim и Audit."""
+        if session is None:
+            with self.core.db.session.begin() as own:
+                return self._reserve_record(record, active=active, session=own)
+        if record.get("reserve_contract") != "article-reserve-v1":
+            raise AgentError("ARTICLE_RESERVE_BINDING_INVALID", 409)
+        if active and not self.reserve_mode:
+            raise AgentError("ARTICLE_RESERVE_MODE_REQUIRED", 409)
+        from .article_reserve import ArticleReserveStore
+        claim = record.get("reserve_claim")
+        ArticleReserveStore(self.core).require_preparation(claim, record["id"], active=active, session=session)
+        binding = {key: record.get(key) for key in ("id", "reserve_contract", "reserve_claim", "input_hash",
+            "policy_hash", "target_id", "source_id", "original_hash", "source_published_at")}
+        hashed = fingerprint(binding)
+        audit = session.get(Audit, str(uuid5(NAMESPACE_URL, "max-postiz:reserve-binding:" + record["id"])))
+        if (not audit or audit.actor != "article_reserve" or audit.entity != record["id"]
+                or audit.action != "article_reserve_preparation_binding"
+                or audit.details != {"binding": binding, "binding_hash": hashed}
+                or record.get("reserve_binding_hash") != hashed):
+            raise AgentError("ARTICLE_RESERVE_BINDING_INVALID", 409)
+        return claim
+
+    def _reserve_other_safe(self, record):
+        # Неизвестные модели/внешние операции не превращаются в свободный источник.
+        if record.get("reserve_contract") != "article-reserve-v1":
+            return False
+        self._reserve_record(record)
+        return record.get("state") in {"quality_ready", "automatic_ready", "pending", "published",
+                                        "failed", "cancelled", "rejected"}
 
     def _policy(self, enabled=True):
         path = inside(self.core.settings.root, "data/hourly-article-policy.local.json")
@@ -626,30 +662,52 @@ class HourlyArticleCycle:
                     source_hash=record["original_hash"], error="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED")
             raise AgentError("ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED", 409)
 
-    def prepare(self, article, retry_record=None, candidate=None, automatic_repair_claim=None):
+    def prepare(self, article, retry_record=None, candidate=None, automatic_repair_claim=None,
+                *, reserve_claim=None):
+        if reserve_claim is not None and not self.reserve_mode:
+            raise AgentError("ARTICLE_RESERVE_MODE_REQUIRED", 409)
         if automatic_repair_claim and (not retry_record or candidate is None):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_CLAIM_LOST", 409)
         if candidate is not None:
             if not retry_record:
                 raise AgentError("ARTICLE_CANDIDATE_RETRY_REQUIRED", 409)
             self._validate_correction(candidate)
-        with profile_lock(self.directory / "cycle.lock"):
+        with profile_lock(self._preparation_lock()):
             from .server_state import require_running
             require_running(self.core)
             policy = self._policy_for_article(article)
             source, target = self._source_target(policy)
             article = self._article(article, policy, source, target)
-            self._clear_outstanding(target.id)
-            self._cadence(policy, now(), check_gap=False)
+            if self.reserve_mode:
+                from .article_reserve import ArticleReserveStore
+                if policy.get("approval_mode") != "automatic":
+                    raise AgentError("ARTICLE_AUTOMATIC_POLICY_REQUIRED", 409)
+                if retry_record:
+                    old = self._record(self._load(), retry_record)
+                    reserve_claim = self._reserve_record(old, active=True)
+                ArticleReserveStore(self.core).require_preparation(reserve_claim)
+                # Подготовка не назначает дату и может идти при известной QUEUE.
+                if not retry_record:
+                    with self.core.db.session() as session:
+                        if (session.scalar(select(Dispatch).where(Dispatch.state.in_({"sending", "unknown"})
+                                | Dispatch.owner.is_not(None) | (Dispatch.lease_until != 0)))
+                                or session.scalar(select(BridgePost).where(BridgePost.mutation_owner.is_not(None)
+                                    | (BridgePost.mutation_until != 0) | BridgePost.mutation_until.is_(None)))):
+                            raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
+            else:
+                self._clear_outstanding(target.id)
+                self._cadence(policy, now(), check_gap=False)
             ledger, slot = self._load(), int(now() // 3600)
             original_hash = text_hash(article["original"])
             material_hash = fingerprint(" ".join(article["original"].casefold().split()))
             if retry_record:
                 record = self._record(ledger, retry_record)
+                if record.get("reserve_contract") is not None and not self.reserve_mode:
+                    raise AgentError("ARTICLE_RESERVE_MODE_REQUIRED", 409)
                 if (record["state"] not in {"needs_attention", "rejected", "failed"}
                         or any(record.get(key) for key in ("variant_id", "postiz_id", "dispatch_id", "due_at", "prepared_hash"))):
                     raise AgentError("ARTICLE_RETRY_NOT_SAFE", 409)
-                if record["slot"] != slot:
+                if record["slot"] != slot and not self.reserve_mode:
                     raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
                 if (record["url"] != article["url"] or record["original_hash"] != original_hash
                         or record["policy_hash"] != fingerprint(policy)
@@ -667,16 +725,17 @@ class HourlyArticleCycle:
                     raise AgentError("ARTICLE_CORRECTION_CANDIDATE_REQUIRED", 409)
             else:
                 record = None
-                if any(item["slot"] == slot or item.get("automatic_slot") == slot for item in ledger["records"]):
+                if not self.reserve_mode and any(item["slot"] == slot or item.get("automatic_slot") == slot for item in ledger["records"]):
                     raise AgentError("ARTICLE_SLOT_ALREADY_CLAIMED", 409)
             other_records = [item for item in ledger["records"] if item is not record]
             if (policy.get("approval_mode") in {"human", "automatic"}
-                    and sum(item["state"] in {"awaiting_human_review", "automatic_ready", "pending", "sending",
+                    and sum(item["state"] in {"awaiting_human_review", "quality_ready", "automatic_ready", "pending", "sending",
                                               "unknown", "awaiting_postiz"} for item in other_records) >= 24):
                 raise AgentError("ARTICLE_AUTOMATIC_BACKLOG" if policy["approval_mode"] == "automatic"
                                  else "ARTICLE_HUMAN_REVIEW_BACKLOG", 409)
             if any(item["state"] not in {"published", "failed", "cancelled", "rejected", "awaiting_human_review"}
                    and not (item["state"] == "automatic_ready" and item.get("automatic_enrolled"))
+                   and not (self.reserve_mode and self._reserve_other_safe(item))
                    for item in other_records):
                 raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
             if any(item.get("url") == article["url"] or item.get("original_hash") == original_hash for item in other_records):
@@ -690,6 +749,17 @@ class HourlyArticleCycle:
                           "url": article["url"], "original_hash": original_hash, "policy_hash": fingerprint(policy),
                           "target_id": target.id, "source_id": source["id"], "source_published_at": article["published_at"],
                           "input_hash": fingerprint(article), "preparation_attempts": []}
+                if self.reserve_mode:
+                    from .article_reserve import ArticleReserveStore
+                    ArticleReserveStore(self.core).bind_preparation(reserve_claim, record["id"])
+                    record.update(reserve_contract="article-reserve-v1", reserve_claim=copy.deepcopy(reserve_claim))
+                    binding = {key: record.get(key) for key in ("id", "reserve_contract", "reserve_claim", "input_hash",
+                        "policy_hash", "target_id", "source_id", "original_hash", "source_published_at")}
+                    record["reserve_binding_hash"] = fingerprint(binding)
+                    with self.core.db.session.begin() as session:
+                        session.add(Audit(id=str(uuid5(NAMESPACE_URL, "max-postiz:reserve-binding:" + record["id"])),
+                            actor="article_reserve", action="article_reserve_preparation_binding", entity=record["id"],
+                            details={"binding": binding, "binding_hash": record["reserve_binding_hash"]}))
                 # Версия контракта закрепляется до Hy и сохраняется при любой
                 # последующей коррекции; старые записи без поля остаются V1.
                 if policy.get("approval_mode") == "automatic" and REFERENCE_CONTRACT != LEGACY_REFERENCE_CONTRACT:
@@ -740,7 +810,9 @@ class HourlyArticleCycle:
                 prepared = (quality.check_candidate(candidate["title"], candidate["body"], article["title"],
                     article["original"], article["url"]) if candidate is not None else
                     quality.prepare(article["title"], article["original"], article["url"]))
-                if record["slot"] != int(now() // 3600):
+                if self.reserve_mode:
+                    self._reserve_record(record, active=True)
+                elif record["slot"] != int(now() // 3600):
                     raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
                 provenance = self._quality_provenance(quality, operator_candidate=candidate is not None)
                 if repair_claim:
@@ -749,7 +821,7 @@ class HourlyArticleCycle:
                         "automatic_repair_claim": repair_claim["id"], "repair_contract": repair_claim["contract"],
                         "repair_model": repair_claim["model"], "repair_evidence": copy.deepcopy(repair_claim["evidence"])}
                 return self._store_prepared(article, prepared, record, ledger, policy, source, target,
-                    provenance, attempt)
+                    provenance, attempt, check_slot=not self.reserve_mode)
             except Exception as exc:
                 record.update(state="needs_attention", error=exc.code if isinstance(exc, AgentError) else "ARTICLE_PREPARATION_INTERRUPTED")
                 attempt.update(state="needs_attention", error=record["error"], finished_at=now())
@@ -811,6 +883,9 @@ class HourlyArticleCycle:
                 media=[], source_revision=1, config_hash=self.core.settings.hash,
                 binding_hash=target.binding_hash, metadata_json={"origin": "hourly_article_test",
                     "record_id": record["id"], "rights_evidence": policy["rights_evidence"],
+                    **({"reserve_contract": record["reserve_contract"],
+                        "reserve_binding_hash": record["reserve_binding_hash"]}
+                       if record.get("reserve_contract") == "article-reserve-v1" else {}),
                     **provenance,
                     "approval_mode": policy.get("approval_mode", "legacy"),
                     "policy_hash": record["policy_hash"],
@@ -842,7 +917,10 @@ class HourlyArticleCycle:
                 operator_correction=bool(attempt.get("operator_correction")),
                 **({"reference_contract": record["reference_contract"]}
                    if "reference_contract" in record else {}))
-        if policy.get("approval_mode") in {"human", "automatic"}:
+        if self.reserve_mode and record.get("reserve_contract") == "article-reserve-v1":
+            self._reserve_record(record, active=True)
+            record.update(state="quality_ready", quality_ready_at=now(), reserve_prepared_hash=record["prepared_hash"])
+        elif policy.get("approval_mode") in {"human", "automatic"}:
             reviewed = self._snapshot(record)
             record["state"] = "staging_human_draft" if policy["approval_mode"] == "human" else "staging_automatic_draft"
             self._save(ledger)
@@ -859,6 +937,186 @@ class HourlyArticleCycle:
         record.pop("error", None)
         self._save(ledger)
         return self._view(record)
+
+    def _validate_reserve(self, record, *, due_at=None):
+        """Повторная локальная проверка перед единственным внешним DRAFT."""
+        from .article_reserve import ArticleReserveStore
+        from .automatic_policy import _eligible_record, automatic_evidence
+        from .human_review import source_data
+        from .server_state import require_running
+        require_running(self.core)
+        self._reserve_record(record)
+        claim = ArticleReserveStore(self.core).require_preparation(record["reserve_claim"], record["id"], active=False)
+        if (claim["state"] != "quality_ready" or record.get("state") != "quality_ready"
+                or any(record.get(key) is not None for key in ("postiz_id", "dispatch_id", "due_at"))):
+            raise AgentError("ARTICLE_RESERVE_NOT_READY", 409)
+        policy = self._policy_for_record(record)
+        if due_at is not None:
+            if (type(due_at) not in {int, float} or not math.isfinite(due_at)
+                    or not now() + 30 <= due_at <= now() + 3700):
+                raise AgentError("ARTICLE_AUTOMATIC_DATE_INVALID", 409)
+            self._cadence(policy, due_at)
+        with self.core.db.session() as session:
+            require_running(self.core, session, lock=True)
+            variant, target = self._unpublished_variant(session, record)
+            snapshot = copy.deepcopy(self.core.snapshot(variant, target))
+            if (record.get("prepared_hash") != fingerprint(snapshot)
+                    or variant.metadata_json.get("reserve_contract") != record["reserve_contract"]
+                    or variant.metadata_json.get("reserve_binding_hash") != record["reserve_binding_hash"]
+                    or session.scalar(select(TargetApproval).where(TargetApproval.variant_id == variant.id))):
+                raise AgentError("ARTICLE_REVIEW_HASH_MISMATCH", 409)
+            _eligible_record(self, session, variant, policy, {**record, "state": "automatic_ready"},
+                             reserve_unassigned=True)
+            evidence = automatic_evidence(session, variant)
+            source = source_data(session, variant)
+            material = session.get(Material, variant.sources[0]["id"])
+            if due_at is not None and material.published_at < due_at - policy["max_source_age_hours"] * 3600:
+                raise AgentError("STALE_SOURCE", 409)
+            article = {"title": source["title"], "original": source["body"], "url": source["url"],
+                       "published_at": material.published_at}
+            # Сравниваем сохранённый исходник, не сокращая и не нормализуя его.
+            raw = inside(self.core.settings.root, record.get("input_file", "")).read_bytes()
+            saved = parse_json(raw.decode("utf-8"))
+            if (hashlib.sha256(raw).hexdigest() != record.get("input_file_hash")
+                    or fingerprint(saved) != record.get("input_hash")
+                    or saved != article or text_hash(article["original"]) != record.get("original_hash")):
+                raise AgentError("ARTICLE_RESERVE_INPUT_CHANGED", 409)
+            configured_source, configured_target = self._source_target(policy)
+            self._article(saved, policy, configured_source, configured_target)
+            trace = inside(self.core.settings.root, record.get("quality_trace", ""))
+            if (trace != self.directory / ("quality-" + record["id"] + ".local.jsonl")
+                    or hashlib.sha256(trace.read_bytes()).hexdigest()
+                        != variant.metadata_json["machine_review_evidence"]["trace_hash"]):
+                raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
+            self.core._quality(session, variant, target)
+            if due_at is not None:
+                self.core._check_schedule_limits(session, variant, target, due_at, automatic_policy=policy)
+        return snapshot, evidence
+
+    def validate_reserve(self, ident, *, due_at=None):
+        record = self._record(self._load(), ident)
+        _, evidence = self._validate_reserve(record, due_at=due_at)
+        return {**self._view(record), "reserve_evidence_hash": evidence["evidence_hash"]}
+
+    def invalidate_reserve(self, ident, reason, *, due_at=None):
+        """Убрать только доказанно просроченный локальный текст, сохранив QA/raw."""
+        from .automatic_policy import automatic_evidence
+        from .article_repair_cycle import AutomaticArticleRepair
+        from .human_review import source_data
+        from .server_models import PublicationSlot
+        from .server_state import require_running
+        if reason != "STALE_SOURCE":
+            raise AgentError("ARTICLE_RESERVE_INVALIDATION_NOT_SAFE", 409)
+        if due_at is not None and (type(due_at) not in {int, float} or not math.isfinite(due_at)
+                or not now() + 30 <= due_at <= now() + 3700):
+            raise AgentError("ARTICLE_RESERVE_INVALIDATION_NOT_SAFE", 409)
+        with profile_lock(self.directory / "cycle.lock"):
+            ledger = self._load()
+            record = self._record(ledger, ident)
+            policy = self._policy_for_record(record)
+            if due_at is not None:
+                self._cadence(policy, due_at)
+            with self.core.db.session.begin() as session:
+                require_running(self.core, session, lock=True)
+                self._reserve_record(record, session=session)
+                variant = self.core._variant(session, record.get("variant_id"), True)
+                target = session.scalar(select(Target).where(Target.id == variant.target_id).with_for_update())
+                evidence = automatic_evidence(session, variant)
+                source = source_data(session, variant)
+                material = session.get(Material, variant.sources[0]["id"])
+                snapshot = self.core.snapshot(variant, target)
+                unsafe = (record.get("state") != "quality_ready"
+                    or any(record.get(key) is not None for key in ("postiz_id", "dispatch_id", "due_at"))
+                    or session.scalar(select(PublicationSlot).where(PublicationSlot.record_id == ident))
+                    or session.get(RemoteDraft, variant.id)
+                    or session.scalar(select(BridgePost).where(BridgePost.variant_id == variant.id))
+                    or session.scalar(select(Dispatch).where(Dispatch.variant_id == variant.id))
+                    or session.scalar(select(TargetApproval).where(TargetApproval.variant_id == variant.id))
+                    or target.id != record.get("target_id")
+                    or variant.metadata_json.get("record_id") != ident
+                    or variant.metadata_json.get("reserve_contract") != record.get("reserve_contract")
+                    or variant.metadata_json.get("reserve_binding_hash") != record.get("reserve_binding_hash")
+                    or fingerprint(policy) != record.get("policy_hash")
+                    or fingerprint(snapshot) != record.get("prepared_hash")
+                    or fingerprint(snapshot) != record.get("reserve_prepared_hash")
+                    or variant.metadata_json.get("review_prompt_hash") != hashlib.sha256(
+                        (self.core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt")
+                        .read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+                    or evidence is None or material.published_at is None
+                    or material.published_at != record.get("source_published_at")
+                    or material.published_at >= (now() if due_at is None else due_at)
+                        - policy["max_source_age_hours"] * 3600)
+                if unsafe:
+                    raise AgentError("ARTICLE_RESERVE_INVALIDATION_NOT_SAFE", 409)
+                raw = inside(self.core.settings.root, record.get("input_file", "")).read_bytes()
+                article = {"title": source["title"], "original": source["body"], "url": source["url"],
+                           "published_at": material.published_at}
+                saved_input = parse_json(raw.decode("utf-8"))
+                trace = inside(self.core.settings.root, record.get("quality_trace", ""))
+                if (hashlib.sha256(raw).hexdigest() != record.get("input_file_hash")
+                        or saved_input != article or fingerprint(saved_input) != record.get("input_hash")
+                        or text_hash(source["body"]) != record.get("original_hash")
+                        or trace != self.directory / ("quality-" + ident + ".local.jsonl")
+                        or hashlib.sha256(trace.read_bytes()).hexdigest()
+                            != variant.metadata_json["machine_review_evidence"]["trace_hash"]):
+                    raise AgentError("ARTICLE_RESERVE_INVALIDATION_NOT_SAFE", 409)
+                self._source_target(policy)
+                self.core._quality(session, variant, target)
+                if due_at is not None:
+                    self.core._check_schedule_limits(session, variant, target, due_at, automatic_policy=policy)
+                AutomaticArticleRepair(self).assert_complete(record, session)
+                action = {"at": now(), "action": "reserve_expired", "reason": reason,
+                          "due_at": due_at,
+                          "previous_state": record["state"], "prepared_hash": record["prepared_hash"],
+                          "evidence_hash": evidence["evidence_hash"]}
+                audit_id = str(uuid5(NAMESPACE_URL, "max-postiz:reserve-expired:" + ident))
+                previous = session.get(Audit, audit_id)
+                if previous is not None:
+                    if (previous.actor != "article_reserve" or previous.action != "article_reserve_expired"
+                            or previous.entity != ident or not isinstance(previous.details, dict)
+                            or {k: v for k, v in previous.details.items() if k != "at"}
+                                != {k: v for k, v in action.items() if k != "at"}):
+                        raise AgentError("ARTICLE_RESERVE_INVALIDATION_NOT_SAFE", 409)
+                    action = copy.deepcopy(previous.details)
+                else:
+                    session.add(Audit(id=audit_id, actor="article_reserve", action="article_reserve_expired",
+                                      entity=ident, details=copy.deepcopy(action)))
+            record.setdefault("preparation_actions", []).append(action)
+            record.update(state="cancelled", error=reason, cancelled_at=action["at"])
+            self._save(ledger)
+            return self._view(record)
+
+    def stage_reserve(self, ident):
+        """Резерв не получает DRAFT до постоянного назначения слота отправителем."""
+        from .article_reserve import ArticleReserveStore
+        with profile_lock(self.directory / "cycle.lock"):
+            ledger = self._load()
+            record = self._record(ledger, ident)
+            assignment = ArticleReserveStore(self.core).require_assignment(ident)
+            snapshot, evidence = self._validate_reserve(record, due_at=assignment["due_at"])
+            if (assignment["text_hash"] != fingerprint(snapshot)
+                    or assignment["evidence_hash"] != evidence["evidence_hash"]):
+                raise AgentError("ARTICLE_RESERVE_ASSIGNMENT_CHANGED", 409)
+            self._clear_outstanding(record["target_id"])
+            record.update(state="staging_reserve_draft", publication_slot_id=assignment["id"])
+            self._save(ledger)
+            # Marker durable до запроса. Timeout/падение оставляет сверяемую операцию;
+            # повтор stage_reserve уже не пройдет проверку quality_ready.
+            try:
+                external = self.core.stage_remote(record["variant_id"])
+                fresh = self._snapshot(record)
+                if (self._reviewed_fields(fresh) != self._reviewed_fields(snapshot)
+                        or fresh["revision"] != snapshot["revision"] + 1
+                        or fresh["metadata"].get("postiz_state") != "DRAFT"):
+                    raise AgentError("ARTICLE_REMOTE_CHANGED", 409)
+                record.update(state="automatic_ready", postiz_id=external, prepared_hash=fingerprint(fresh))
+                self._save(ledger)
+                return self._view(record)
+            except Exception as exc:
+                record.update(state="needs_attention", error=exc.code if isinstance(exc, AgentError)
+                              else "ARTICLE_RESERVE_STAGE_INTERRUPTED")
+                self._save(ledger)
+                raise
 
     def stage_rejected(self, ident, article, *, restore_cancelled=False, reason=""):
         """Recover exact completed negative evidence, never re-run or approve the model."""
@@ -931,9 +1189,11 @@ class HourlyArticleCycle:
     def cancel_preparation(self, ident, reason="Operator reconciled and abandoned pre-draft preparation"):
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
             raise AgentError("ARTICLE_CANCELLATION_REASON_INVALID")
-        with profile_lock(self.directory / "cycle.lock"):
+        with profile_lock(self._preparation_lock()):
             ledger = self._load()
             record = self._record(ledger, ident)
+            if self.reserve_mode:
+                self._reserve_record(record, active=True)
             from .article_repair_cycle import AutomaticArticleRepair
             _, repair_block = AutomaticArticleRepair(self)._history(record)
             if repair_block:
@@ -1217,13 +1477,17 @@ class HourlyArticleCycle:
 
     def _protocol_source_novel(self, record, ledger, article):
         others = [item for item in ledger["records"] if item.get("id") != record["id"]]
-        if any(item["slot"] == record["slot"] or item.get("automatic_slot") == record["slot"] for item in others):
+        reserved = self.reserve_mode and record.get("reserve_contract") == "article-reserve-v1"
+        if reserved:
+            self._reserve_record(record, active=True)
+        if not reserved and any(item["slot"] == record["slot"] or item.get("automatic_slot") == record["slot"] for item in others):
             raise AgentError("ARTICLE_SLOT_ALREADY_CLAIMED", 409)
-        if sum(item["state"] in {"awaiting_human_review", "automatic_ready", "pending", "sending", "unknown", "awaiting_postiz"}
+        if sum(item["state"] in {"awaiting_human_review", "quality_ready", "automatic_ready", "pending", "sending", "unknown", "awaiting_postiz"}
                for item in others) >= 24:
             raise AgentError("ARTICLE_AUTOMATIC_BACKLOG", 409)
         if any(item["state"] not in {"published", "failed", "cancelled", "rejected", "awaiting_human_review"}
-               and not (item["state"] == "automatic_ready" and item.get("automatic_enrolled")) for item in others):
+               and not (item["state"] == "automatic_ready" and item.get("automatic_enrolled"))
+               and not (reserved and self._reserve_other_safe(item)) for item in others):
             raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
         if any(item.get("url") == article["url"] or item.get("original_hash") == record["original_hash"] for item in others):
             raise AgentError("ARTICLE_DUPLICATE_SOURCE", 409)

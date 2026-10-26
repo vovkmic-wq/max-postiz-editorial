@@ -362,6 +362,8 @@ class Database:
             "hub_reddit_submissions",
             "editorial_control",
             "editorial_article_ledger",
+            "publication_slots",
+            "editorial_preparation_claims",
         }:
             raise AgentError("BACKUP_SCHEMA_MISMATCH")
         data = {name: data.get(name, []) for name in Base.metadata.tables}

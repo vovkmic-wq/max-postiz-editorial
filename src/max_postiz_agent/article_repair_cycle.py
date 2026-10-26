@@ -72,6 +72,7 @@ def capture_input(cycle, record, article):
 class AutomaticArticleRepair:
     def __init__(self, cycle):
         self.cycle, self.core = cycle, cycle.core
+        self._reserve_context = False
 
     def _history(self, record):
         history = record.get("automatic_repair_attempts", [])
@@ -109,6 +110,13 @@ class AutomaticArticleRepair:
         result = {"eligible": False, "reason": blocked or "NOT_ELIGIBLE", "attempts": len(history)}
         if blocked:
             return result
+        reserved = self.cycle.reserve_mode and record.get("reserve_contract") == "article-reserve-v1"
+        if reserved:
+            try:
+                self.cycle._reserve_record(record, active=True)
+            except AgentError:
+                return {**result, "reason": "CLAIM_LOST"}
+        self._reserve_context = reserved
         if history and history[-1].get("outcome_origin") == "protocol_guard":
             try:
                 self._quarantine_proof(record, history[-1], saved=True)
@@ -121,9 +129,9 @@ class AutomaticArticleRepair:
             self.cycle._assert_pre_draft(record)
         except (AgentError, OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
             return {**result, "reason": "TRACE_INVALID"}
-        if record.get("slot") < int(_now() // 3600):
+        if not reserved and record.get("slot") < int(_now() // 3600):
             return {**result, "reason": "EXPIRED"}
-        if record.get("slot") != int(_now() // 3600):
+        if not reserved and record.get("slot") != int(_now() // 3600):
             return result
         if history and history[-1]["state"] in {"not_repairable", "no_change", "expired", "passed"}:
             return {**result, "reason": {"not_repairable": "NOT_REPAIRABLE", "no_change": "NO_CHANGE"}.get(history[-1]["state"], "EXHAUSTED")}
@@ -155,7 +163,11 @@ class AutomaticArticleRepair:
     def _quiet(self, record, policy):
         require_running(self.core)
         self.cycle._assert_pre_draft(record)
-        if (record["slot"] != int(_now() // 3600)
+        reserved = self.cycle.reserve_mode and record.get("reserve_contract") == "article-reserve-v1"
+        if reserved:
+            self.cycle._reserve_record(record, active=True)
+        self._reserve_context = reserved
+        if ((not reserved and record["slot"] != int(_now() // 3600))
                 or fingerprint(self.cycle._policy_for_record(record)) != record["policy_hash"]
                 or record["policy_hash"] != fingerprint(policy)):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
@@ -167,6 +179,12 @@ class AutomaticArticleRepair:
         return source, target
 
     def _quiet_session(self, session):
+        if self._reserve_context:
+            # Claim/исходник/политика и отсутствие внешнего состояния ЭТОГО
+            # кандидата уже проверены _quiet/_quarantine_proof. Готовый текст
+            # сохраняется локально, даже если независимый отправитель начал Send.
+            # Право stage/approval этим не выдаётся: там свои target/lease gates.
+            return
         if (any(not target.paused for target in session.scalars(select(Target)))
                 or session.scalar(select(Dispatch).where(Dispatch.state.in_(ACTIVE)
                     | Dispatch.owner.is_not(None) | (Dispatch.lease_until != 0)))
@@ -645,9 +663,11 @@ class AutomaticArticleRepair:
 
     def run(self, ident):
         cycle, editor, claim = self.cycle, None, None
-        with profile_lock(cycle.directory / "cycle.lock"):
+        with profile_lock(cycle._preparation_lock()):
             ledger = cycle._load()
             record = cycle._record(ledger, ident)
+            if cycle.reserve_mode:
+                cycle._reserve_record(record, active=True)
             policy = cycle._policy_for_record(record)
             status = self.status(record)
             if not status["eligible"]:
@@ -786,7 +806,7 @@ class AutomaticArticleRepair:
         try:
             result = cycle.prepare(payload["article"], retry_record=ident, candidate=candidate, automatic_repair_claim=claim_id)
         except Exception as exc:
-            with profile_lock(cycle.directory / "cycle.lock"):
+            with profile_lock(cycle._preparation_lock()):
                 ledger = cycle._load()
                 record, claim = self._matching(ledger, ident, claim_id)
                 code = exc.code if isinstance(exc, AgentError) else "ARTICLE_AUTOMATIC_REPAIR_INTERRUPTED"
@@ -795,7 +815,7 @@ class AutomaticArticleRepair:
                 claim.update(state="rejected" if known else "failed", error=code, finished_at=_now())
                 cycle._save(ledger)
             raise
-        with profile_lock(cycle.directory / "cycle.lock"):
+        with profile_lock(cycle._preparation_lock()):
             ledger = cycle._load()
             record, claim = self._matching(ledger, ident, claim_id)
             claim.update(state="passed", finished_at=_now(), prepared_hash=record["prepared_hash"])

@@ -38,7 +38,7 @@ def main(argv=None):
             print(json.dumps(public_state(core, store), ensure_ascii=False))
         else:
             import uvicorn
-            from .server_cycle import ServerCycle
+            from .hourly_reserve import PreparationState, ReserveServerCycle
             store.read()
             if DatabaseArticleLedger(HourlyArticleCycle(core)).load() is None:
                 raise AgentError("EDITORIAL_MIGRATION_REQUIRED", 409)
@@ -52,10 +52,12 @@ def main(argv=None):
                 app = editorial_app(core, store)
                 app.state.worker_mode = "autonomous"
                 stop = threading.Event()
-                controller = ServerCycle(core, state=store)
+                # Разные экземпляры журнала: долгий prepare не владеет снимком отправителя.
+                controller = ReserveServerCycle(core, state=store)
+                preparer = ReserveServerCycle(core, state=PreparationState(store))
 
                 def worker():
-                    # В процессе ровно один обработчик: сначала доставка, затем подготовка.
+                    # Только этот поток выполняет внешние изменения Postiz/MAX.
                     while not stop.is_set():
                         try:
                             core.dispatch_tick()
@@ -69,16 +71,31 @@ def main(argv=None):
                                 logging.getLogger(__name__).error("EDITORIAL_STATE_UNAVAILABLE")
                         stop.wait(5)
 
+                def prepare_worker():
+                    while not stop.is_set():
+                        try:
+                            preparer.prepare_once()
+                        except Exception as exc:
+                            code = exc.code if isinstance(exc, AgentError) else "EDITORIAL_PREPARATION_ERROR"
+                            try:
+                                store.progress("preparation", "blocked", last_error={"code": code})
+                            except Exception:
+                                logging.getLogger(__name__).error("EDITORIAL_STATE_UNAVAILABLE")
+                        stop.wait(5)
+
                 @asynccontextmanager
                 async def lifespan(application):
                     thread = threading.Thread(target=worker, name="editorial-cycle", daemon=True)
+                    preparation = threading.Thread(target=prepare_worker, name="editorial-preparation", daemon=True)
                     thread.start()
+                    preparation.start()
                     try:
                         yield
                     finally:
                         stop.set()
                         # Принудительный обрыв не вызывает повтор неизвестной операции.
                         thread.join(timeout=10)
+                        preparation.join(timeout=10)
 
                 app.router.lifespan_context = lifespan
                 uvicorn.run(app, host=args.host, port=args.port, access_log=False, log_level="warning")

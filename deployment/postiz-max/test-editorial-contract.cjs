@@ -161,6 +161,19 @@ test('new UI/controller modules pass strict semantic TypeScript with installed R
 const initial = { source: 'nasa_svs', interval_seconds: 3600, opaque_server_option: 'keep',
   nasa: { authors: [], keywords: [], min_rating: 0, max_words: 500 },
   reddit: { subreddits: [], authors: [], keywords: [], min_score: 0, min_comments: 0, max_age_hours: 72, limit: 25, sort: 'top', time_filter: 'week', max_pages: 3 } };
+
+test('reserve controls preserve explicit bounds and reject unsafe budgets', () => {
+  const settings = { ...initial, reserve: { enabled: true, target: 6, low: 3, maximum: 12, batch: 3 } };
+  const form = formApi.formFromSettings(settings);
+  assert.deepEqual(JSON.parse(JSON.stringify(formApi.settingsFromForm(settings, form))), settings);
+  form.reserveTarget = '8'; form.reserveLow = '2'; form.reserveBatch = '2';
+  assert.deepEqual(JSON.parse(JSON.stringify(formApi.settingsFromForm(settings, form).reserve)),
+    { enabled: true, target: 8, low: 2, maximum: 12, batch: 2 });
+  for (const [field, value] of [['reserveBatch', '4'], ['reserveMaximum', '25'], ['reserveLow', '8'], ['reserveTarget', '1.5']]) {
+    const invalid = { ...form, [field]: value };
+    assert.throws(() => formApi.settingsFromForm(settings, invalid), /EDITORIAL_FORM_INVALID/);
+  }
+});
 test('structured form roundtrip preserves server-only bounds and maps Russian rating to min_score', () => {
   const form = formApi.formFromSettings(initial); form.source = 'reddit'; form.subreddits = 'science, space\nscience'; form.redditRating = '150';
   const result = formApi.settingsFromForm(initial, form);

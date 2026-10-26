@@ -5,6 +5,7 @@ import math
 import re
 
 from sqlalchemy import or_, select, update
+from sqlalchemy.exc import SQLAlchemyError
 
 from .adapters import Delivery
 from .config import AgentError, fingerprint, inside, parse_json, validate_schema
@@ -675,11 +676,38 @@ class HubService(Service):
                         error = "RETRY_REQUIRES_OPERATOR"
                 row.error, row.owner, row.lease_until = error, None, 0
                 self._variant(s, row.variant_id).state = row.state
-                s.add(DispatchAttempt(dispatch_id=row.id, result=row.state, error=error, created_at=now()))
+                attempt = DispatchAttempt(dispatch_id=row.id, result=row.state, error=error, created_at=now())
+                s.add(attempt)
                 from .human_review import hourly
                 if row.state == "published" and row.verified and hourly(self._variant(s, row.variant_id)):
                     self._target(s, self._variant(s, row.variant_id).target_id).paused = True
+                    # Факт MAX и время попытки сохраняются вместе со слотом, даже
+                    # если последующий GET Postiz ещё не подтвердил PUBLISHED.
+                    s.flush()
+                    self._record_reserve_delivery(s, row, attempt)
         return completed
+
+    def _record_reserve_delivery(self, session, dispatch, attempt):
+        variant = self._variant(session, dispatch.variant_id)
+        if variant.metadata_json.get("reserve_contract") != "article-reserve-v1":
+            return
+        from .article_reserve import ArticleReserveStore
+        from .server_models import PublicationSlot
+        try:
+            # Ошибка учёта резерва не должна откатить уже известную доставку.
+            # Активный слот остаётся занят; контроллер сверит ту же отправку.
+            with session.begin_nested():
+                slot = session.scalar(select(PublicationSlot).where(
+                    PublicationSlot.record_id == variant.metadata_json.get("record_id"),
+                    PublicationSlot.target_id == variant.target_id).with_for_update())
+                if slot is None:
+                    raise AgentError("ARTICLE_RESERVE_ASSIGNMENT_LOST", 409)
+                ArticleReserveStore(self).update(slot.id, "delivered", token=slot.token,
+                    dispatch_id=dispatch.id, delivered_at=attempt.created_at, session=session)
+        except (AgentError, SQLAlchemyError) as exc:
+            self.db.audit(session, "article_reserve", "reserve_delivery_persistence_failed", dispatch.id,
+                error=exc.code if isinstance(exc, AgentError) else "ARTICLE_RESERVE_STATE_UNAVAILABLE",
+                published_at=attempt.created_at, variant_id=variant.id)
 
     def stage_remote(self, variant_id, due_at=None):
         if due_at is not None and (

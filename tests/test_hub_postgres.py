@@ -90,7 +90,7 @@ def test_real_postgres_migration_and_no_double_send(pg_hub):
         results = list(pool.map(lambda s: s.publish_due(), [hub, other]))
     assert sum(results) == 1 and len(calls) == 1
     with hub.db.engine.connect() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0007"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008"
         assert conn.execute(text("SELECT COUNT(*) FROM editorial_control")).scalar_one() == 0
         assert conn.execute(text("SELECT COUNT(*) FROM hub_dispatch_attempts")).scalar_one() == 1
     other.postiz.close()

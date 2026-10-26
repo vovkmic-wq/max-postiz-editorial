@@ -378,6 +378,156 @@ def test_catalog_cannot_turn_untrusted_links_into_get_targets(source, bad):
     assert len(source.requests) == 1
 
 
+def test_actual_unsupported_catalog_card_is_saved_and_never_requested_while_valid_card_remains(source):
+    invalid = ("/public/images/iotw2341/" if source.source_id == "noirlab_iotw"
+               else "/images/comparisons/potw2137a/")
+    source.pages[source.adapter["catalog"]] = source.catalog(cards=[
+        (source.path, TITLE, "21 October 2026"),
+        (invalid, "A catalog card outside the authorized article route", "20 October 2026")])
+    article = source.run()
+    assert article["url"] == source.url
+    assert len(source.requests) == 3
+    assert "https://" + source.spec["host"] + invalid not in source.requests
+    paths = list((source.root / "data/server-sources").glob("catalog-rejections-*.local.json"))
+    assert len(paths) == 1
+    proof = json.loads(paths[0].read_text(encoding="utf-8"))
+    raw = source.pages[source.adapter["catalog"]].encode()
+    assert proof["contract"] == "science-catalog-rejections-v1"
+    assert proof["catalog_html"].encode() == raw
+    assert proof["catalog_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert proof["rejected"] == [{"literal_href": invalid, "url": "https://" + source.spec["host"] + invalid,
+        "reason": "ARTICLE_SOURCE_URL_INVALID", "classification": "unsupported_image_card"}]
+    with pytest.raises(AgentError, match="ARTICLE_SOURCE_URL_INVALID"):
+        article_sources.validate_source_url(source.source_id, "https://" + source.spec["host"] + invalid)
+
+
+def test_bad_science_catalog_allows_independent_authorized_source_selection(source, monkeypatch):
+    from max_postiz_agent.server_cycle import ServerCycle
+    invalid = "/copyright/"
+    source.pages[source.adapter["catalog"]] = source.catalog(cards=[(invalid, TITLE, "21 October 2026")])
+    primary = {"source_id": "nasa_svs"}
+    expected = {"url": "https://svs.gsfc.nasa.gov/9999/", "title": "An independent NASA article",
+                "original": TEXT, "published_at": STAMP - 86400}
+    selections, phases = [], []
+
+    def science(*args, **kwargs):
+        selections.append(source.source_id)
+        return source.run()
+
+    def nasa(*args, **kwargs):
+        selections.append("nasa_svs")
+        return expected
+
+    monkeypatch.setattr("max_postiz_agent.server_science.select_science_article", science)
+    monkeypatch.setattr("max_postiz_agent.server_nasa.select_nasa_article", nasa)
+    cycle = SimpleNamespace(_policies=lambda: [source.policy, primary],
+                            _policy_for_article=lambda _: primary)
+    state = SimpleNamespace(assert_running=lambda: None,
+                            phase=lambda phase, **details: phases.append((phase, details)))
+    controller = ServerCycle(source.core, state=state, cycle=cycle, clock=lambda: 0)
+    selected = controller._select({"source": "open_science", "nasa": source.options},
+                                  {"records": []}, primary)
+    assert selected == expected and selections == [source.source_id, "nasa_svs"]
+    assert phases[-1][1]["source_errors"] == [
+        {"source_id": source.source_id, "code": "SCIENCE_SOURCE_CATALOG_INVALID"}]
+    assert source.requests == ["https://" + source.spec["host"] + source.adapter["catalog"]]
+
+
+def test_all_unsupported_cards_advance_only_three_catalog_pages_with_no_detail_or_rights_get(source, cycle):
+    source.core.db = cycle[1].db
+    invalid = ("/public/images/iotw2341/" if source.source_id == "noirlab_iotw"
+               else "/images/comparisons/potw2137a/")
+    for page in range(1, 4):
+        path = source.adapter["catalog"] if page == 1 else source.adapter["catalog"] + f"page/{page}/"
+        source.pages[path] = source.catalog(cards=[(invalid, TITLE, "20 October 2026")],
+            following=source.adapter["catalog"] + f"page/{page + 1}/")
+    assert source.run(checkpoint=True) is None
+    assert len(source.requests) == 3
+    assert all(url.startswith("https://" + source.spec["host"] + source.adapter["catalog"])
+               for url in source.requests)
+    with source.core.db.session() as session:
+        checkpoint = session.get(Cursor, "server_science_" + source.source_id)
+        assert checkpoint.data["page"] == 4
+        assert checkpoint.data["head_seen"] == checkpoint.data["page_seen"] == []
+    assert len(list((source.root / "data/server-sources").glob("catalog-rejections-*.local.json"))) == 3
+
+
+def test_unsupported_first_page_can_reach_independently_valid_next_card(source):
+    invalid = ("/public/images/iotw2341/" if source.source_id == "noirlab_iotw"
+               else "/images/comparisons/potw2137a/")
+    source.pages[source.adapter["catalog"]] = source.catalog(cards=[(invalid, TITLE, "20 October 2026")],
+        following=source.adapter["catalog"] + "page/2/")
+    source.pages[source.adapter["catalog"] + "page/2/"] = source.catalog()
+    assert source.run()["url"] == source.url
+    assert len(source.requests) == 4
+    assert "https://" + source.spec["host"] + invalid not in source.requests
+
+
+@pytest.mark.parametrize("damage", ["title", "date", "duplicate", "backslash", "dot_segment"])
+def test_malformed_unsupported_card_still_rejects_whole_catalog(source, damage):
+    invalid = ("/public/images/iotw2341/" if source.source_id == "noirlab_iotw"
+               else "/images/comparisons/potw2137a/")
+    page = source.catalog(cards=[(invalid, TITLE, "20 October 2026")])
+    if damage == "title":
+        page = page.replace(f'<div class="news-title">{TITLE}</div>', "")
+    elif damage == "date":
+        page = page.replace("20 October 2026", "not a date")
+    elif damage == "duplicate":
+        page = source.catalog(cards=[(invalid, TITLE, "20 October 2026")] * 2)
+    elif damage == "backslash":
+        page = page.replace(invalid, invalid.replace("/", "\\", 1))
+    else:
+        prefix = "/public/images/" if source.source_id == "noirlab_iotw" else "/images/"
+        page = page.replace(invalid, prefix + "other/../" + invalid.removeprefix(prefix))
+    source.pages[source.adapter["catalog"]] = page
+    with pytest.raises(AgentError):
+        source.run()
+    assert len(source.requests) == 1
+
+
+def test_rejected_catalog_evidence_is_immutable_and_conflict_stops_before_more_gets(source):
+    invalid = ("/public/images/iotw2341/" if source.source_id == "noirlab_iotw"
+               else "/images/comparisons/potw2137a/")
+    source.pages[source.adapter["catalog"]] = source.catalog(cards=[(invalid, TITLE, "20 October 2026")])
+    assert source.run() is None
+    path = next((source.root / "data/server-sources").glob("catalog-rejections-*.local.json"))
+    original = path.read_bytes()
+    assert source.run() is None and path.read_bytes() == original
+    changed = json.loads(original)
+    changed["rejected"] = []
+    path.write_text(json.dumps(changed), encoding="utf-8")
+    source.requests.clear()
+    with pytest.raises(AgentError, match="SCIENCE_CATALOG_REJECTION_PROOF_CONFLICT"):
+        source.run()
+    assert source.requests == ["https://" + source.spec["host"] + source.adapter["catalog"]]
+
+
+def test_unsupported_cards_still_count_toward_catalog_size_limit(source):
+    prefix = "/public/images/" if source.source_id == "noirlab_iotw" else "/images/"
+    source.pages[source.adapter["catalog"]] = source.catalog(cards=[
+        (prefix + f"unlisted{number}/", TITLE, "20 October 2026") for number in range(101)])
+    with pytest.raises(AgentError, match="SCIENCE_SOURCE_CATALOG_INVALID"):
+        source.run()
+    assert len(source.requests) == 1
+
+
+def test_invalid_saved_checkpoint_url_remains_integrity_error_without_network_or_reset(source, cycle):
+    source.core.db = cycle[1].db
+    invalid = ("/public/images/iotw2341/" if source.source_id == "noirlab_iotw"
+               else "/images/comparisons/potw2137a/")
+    saved = {"page": 12, "head_seen": ["https://" + source.spec["host"] + invalid], "page_seen": [],
+             "selection_hash": fingerprint({"options": source.options, "policy": source.policy})}
+    ident = "server_science_" + source.source_id
+    with source.core.db.session.begin() as session:
+        session.add(Cursor(id=ident, data=copy.deepcopy(saved), status="source_metadata_checkpoint"))
+    with pytest.raises(AgentError, match="ARTICLE_SOURCE_URL_INVALID"):
+        source.run(checkpoint=True)
+    with source.core.db.session() as session:
+        assert session.get(Cursor, ident).data == saved
+        assert session.get(Cursor, ident).status == "source_metadata_checkpoint"
+    assert source.requests == []
+
+
 @pytest.mark.parametrize("where", ["catalog", "detail"])
 def test_future_release_is_deferred_without_losing_the_source_or_weakening_age(
     source, cycle, where

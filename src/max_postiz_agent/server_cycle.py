@@ -207,6 +207,11 @@ class ServerCycle:
             if times and due < max(times) + max(settings["interval_seconds"], policy["min_gap_seconds"]) + 1:
                 raise AgentError("ARTICLE_HOURLY_GAP", 409)
             self.core._quality(session, variant, target)
+            if record.get("reserve_contract") == "article-reserve-v1":
+                from .article_reserve import ArticleReserveStore
+                # После доказанной сверки только прежнего QUEUE возвращаем его
+                # fence текущему владельцу; дата/token/approval не меняются.
+                ArticleReserveStore(self.core).rebind_pending(session, record["id"], dispatch_id)
             target.paused = False
             self.core.db.audit(session, "editorial_server", "editorial_resume_pending", dispatch.id,
                                snapshot_hash=dispatch.snapshot_hash, due_at=due, variant_id=variant.id)

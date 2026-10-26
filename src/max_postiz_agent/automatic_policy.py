@@ -168,8 +168,23 @@ def _reference_binding(session, variant, record):
         raise AgentError("ARTICLE_AUTOMATIC_RECHECK_REQUIRED", 409)
 
 
-def _eligible_record(cycle, session, variant, policy, record):
+def _eligible_record(cycle, session, variant, policy, record, *, reserve_unassigned=False):
     core = cycle.core
+    if not isinstance(record, dict):
+        raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
+    reserve_binding = session.get(Audit, str(uuid5(NAMESPACE_URL, "max-postiz:reserve-binding:" + record["id"])))
+    if (record.get("reserve_contract") is not None or variant.metadata_json.get("reserve_contract") is not None
+            or reserve_binding is not None):
+        cycle._reserve_record(record, session=session)
+        if (variant.metadata_json.get("reserve_contract") != record.get("reserve_contract")
+                or variant.metadata_json.get("reserve_binding_hash") != record.get("reserve_binding_hash")):
+            raise AgentError("ARTICLE_RESERVE_BINDING_INVALID", 409)
+        if not reserve_unassigned:
+            from .article_reserve import ArticleReserveStore
+            assigned = ArticleReserveStore(core).require_assignment(record["id"], session=session)
+            if (assigned["text_hash"] != record.get("reserve_prepared_hash")
+                    or assigned["evidence_hash"] != variant.metadata_json.get("machine_review_evidence_hash")):
+                raise AgentError("ARTICLE_RESERVE_ASSIGNMENT_CHANGED", 409)
     if (policy.get("approval_mode") != "automatic"
             or variant.metadata_json.get("approval_mode") != "automatic"
             or variant.metadata_json.get("origin") != "hourly_article_test"
@@ -237,21 +252,30 @@ def publish(cycle, record, ledger, reviewed_hash, due_at):
     if record["state"] not in {"prepared", "automatic_ready"}:
         raise AgentError("ARTICLE_AUTOMATIC_NOT_READY", 409)
     slot = int(now() // 3600)
+    reserved = record.get("reserve_contract") == "article-reserve-v1"
+    assigned = None
+    if reserved:
+        from .article_reserve import ArticleReserveStore
+        cycle._reserve_record(record)
+        assigned = ArticleReserveStore(core).require_assignment(record["id"])
     # A completed, unpublished draft may cross an hour boundary while models
     # or Postiz finish. Reserve this hour for that one draft, instead of trying
     # to catch up missed source slots or replay a late dispatch.
     if record["slot"] > slot:
         raise AgentError("ARTICLE_SLOT_EXPIRED", 409)
-    if any(item is not record and (item["slot"] == slot or item.get("automatic_slot") == slot)
+    if not reserved and any(item is not record and (item["slot"] == slot or item.get("automatic_slot") == slot)
            for item in ledger["records"]):
         raise AgentError("ARTICLE_SLOT_ALREADY_CLAIMED", 409)
     cycle._clear_outstanding(record["target_id"])
     earliest = cycle._cadence(policy, now(), check_gap=False)
     due = float(max(now() + 120, earliest) if due_at is None else due_at)
+    if assigned is not None and due != assigned["due_at"]:
+        raise AgentError("ARTICLE_RESERVE_ASSIGNMENT_CHANGED", 409)
     if not now() + 30 <= due <= now() + 3700:
         raise AgentError("ARTICLE_AUTOMATIC_DATE_INVALID", 409)
     cycle._cadence(policy, due)
     with core.db.session() as session:
+        require_running(core, session, lock=True)
         variant = core._variant(session, record["variant_id"], True)
         target = session.scalar(select(Target).where(Target.id == variant.target_id).with_for_update())
         eligible(core, session, variant)

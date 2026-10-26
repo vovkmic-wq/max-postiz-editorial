@@ -12,6 +12,8 @@ type State = {
   revision: number; paused: boolean; phase?: string; updated_at?: string | number; next_run_at?: string | number;
   last_error?: { code: string; message?: string } | null; recent?: Recent[];
   capabilities?: { reddit?: { available?: boolean; reason?: string } };
+  reserve?: { enabled?: boolean; ready?: number; target?: number; next_delivery_at?: number };
+  preparation?: { phase?: string; last_error?: { code: string } | null };
 };
 const errors: Record<string, string> = {
   EDITORIAL_SERVICE_UNAVAILABLE: 'Редакционный сервис недоступен. Проверьте его состояние на сервере и обновите страницу.',
@@ -38,6 +40,11 @@ const errors: Record<string, string> = {
   EDITORIAL_FORM_INVALID: 'Проверьте поля: интервал от 60 минут, целые неотрицательные рейтинги и допустимые списки.',
   REDDIT_ACCESS_REQUIRED: 'Для Reddit требуется разрешённый доступ к API.',
   REDDIT_RIGHTS_REQUIRED: 'Для Reddit требуется подтверждение прав на внешнюю публикацию.',
+  ARTICLE_RESERVE_EMPTY: 'Запас проверенных статей пуст. Подготовка пополняет его; проверки качества сохраняются.',
+  ARTICLE_RESERVE_PREPARATION_ACTIVE: 'Есть незавершённая подготовка. Её исход нужно сверить до нового обращения к модели.',
+  SCIENCE_SOURCES_UNAVAILABLE: 'Научные источники сейчас недоступны. История и запас статей сохранены.',
+  ARTICLE_RESERVE_CLAIM_LOST: 'Не удалось подтвердить владельца подготовки. Работа остановлена до сверки.',
+  ARTICLE_RESERVE_ASSIGNMENT_LOST: 'Назначение статьи требует сверки. Повторная отправка заблокирована.',
 };
 export function errorText(code: string) { return errors[code] || `Действие остановлено. Код: ${code}`; }
 export function readableTime(value?: string | number) {
@@ -59,6 +66,10 @@ const phases: Record<string, string> = {
   reconciling: 'Сверка состояний Postiz и MAX', rejected: 'Материал отклонён проверками',
   hour_used: 'В этом часу новая статья уже обрабатывалась', no_source: 'Подходящий материал не найден',
   selection_slot_expired: 'Час отбора завершился — ожидаем следующий', waiting_interval: 'Ожидание допустимого интервала между доставками',
+  quality_ready: 'Проверен и сохранён в запасе', staging_reserve_draft: 'Передача проверенной статьи в Postiz',
+  reserve_satisfied: 'Запас пополнен', reserve_refilled: 'Пополнение запаса', reserve_empty: 'Ожидаем проверенную статью',
+  waiting_source: 'Ожидание следующего подбора', reserve_disabled: 'Резерв выключен',
+  preparation_deferred: 'Подготовка ждёт завершения текущей отправки',
 };
 export function phaseText(phase?: string) { return phases[phase || ''] || phase || '—'; }
 export function sourceText(source?: string) {
@@ -138,6 +149,11 @@ export function EditorialPanel() {
     <section className={styles.card} aria-labelledby="cycle-heading"><h2 id="cycle-heading">Управление циклом</h2>
       <p aria-live="polite">{state ? phaseText(state.phase) : 'Загрузка состояния…'}</p>
       <p className={styles.muted}>Последнее обновление: {readableTime(state?.updated_at)} · Следующий цикл: {readableTime(state?.next_run_at)}</p>
+      {state?.reserve?.enabled && <div aria-live="polite">
+        <p>Проверенных статей в запасе: <strong>{state.reserve.ready ?? 0}</strong> / {state.reserve.target ?? 6} · Ближайшая отправка: {readableTime(state.reserve.next_delivery_at)}</p>
+        <p className={styles.muted}>Подготовка: {phaseText(state.preparation?.phase)}</p>
+        {state.preparation?.last_error && <div className={styles.notice}>{errorText(state.preparation.last_error.code)}</div>}
+      </div>}
       {state?.last_error && <div className={styles.notice}>{errorText(state.last_error.code)}</div>}
       <div className={styles.actions}>
         <button className={`${styles.button} ${styles.primary}`} disabled={pending || !state || !state.paused || dirty} onClick={() => control('start')}>Запустить цикл</button>
@@ -151,6 +167,11 @@ export function EditorialPanel() {
         <div className={styles.grid}>
           <label className={styles.field}>Источник<select value={form.source} onChange={event => change('source', event.target.value)} disabled={pending}><option value="open_science">Открытая наука: NASA, NOIRLab, ESA/Hubble</option><option value="nasa_svs">NASA SVS</option><option value="reddit">Reddit</option></select></label>
           {field('Интервал между статьями, минут', 'interval', 'number', 'Не менее 60 минут. Догоняющих пачек после простоя нет.')}
+          <label className={styles.field}>Резерв проверенных статей<select value={form.reserveEnabled} onChange={event => change('reserveEnabled', event.target.value)} disabled={pending}><option value="false">Выключен</option><option value="true">Включён</option></select></label>
+          {field('Целевой запас статей', 'reserveTarget', 'number')}
+          {field('Пополнять при остатке', 'reserveLow', 'number')}
+          {field('Предельный запас', 'reserveMaximum', 'number')}
+          {field('Новых источников за проход', 'reserveBatch', 'number', 'От 1 до 3. На каждую статью сохраняется предел двух исправлений.')}
         </div>
         {['nasa_svs', 'open_science'].includes(form.source) ? <div className={styles.grid}>
           {field(form.source === 'open_science' ? 'Авторы' : 'Авторы NASA', 'nasaAuthors', 'textarea', 'По одному имени на строку или через запятую. Пусто — любой автор.')}

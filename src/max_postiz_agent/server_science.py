@@ -152,7 +152,18 @@ def _release_day(value):
     return _day(f"{match[2]} {month} {match[3]}")
 
 
-def _catalog(raw, source_id, page):
+def _unsupported_image_card(spec, literal, url):
+    """Отсеять чистую ссылку другого image-раздела, не разрешая её загрузку."""
+    parsed = urlsplit(url)
+    prefix = "/public/images/" if spec["id"] == "noirlab_iotw" else "/images/"
+    return (parsed.scheme == "https" and parsed.netloc == spec["host"]
+        and not parsed.query and not parsed.fragment
+        and url == "https://" + spec["host"] + parsed.path
+        and not any(part in {".", ".."} for part in urlsplit(literal).path.split("/"))
+        and re.fullmatch(re.escape(prefix) + r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*/", parsed.path) is not None)
+
+
+def _catalog(raw, source_id, page, rejected=None):
     spec, adapter = source_spec(source_id), ADAPTERS[source_id]
     soup = _html(raw)
     if soup.html is None or soup.html.get("lang", "").split("-", 1)[0] != "en":
@@ -169,7 +180,7 @@ def _catalog(raw, source_id, page):
             literal = card["href"]
             if re.search(r"[\x00-\x20\x7f\\]", literal):
                 raise AgentError("SCIENCE_SOURCE_CATALOG_INVALID", 503)
-            url = validate_source_url(source_id, urljoin("https://" + spec["host"], literal))
+            url = urljoin("https://" + spec["host"], literal)
             title, date = card.select_one(".news-title"), card.select_one(".news-teaser strong")
             if (
                 title is None
@@ -179,14 +190,28 @@ def _catalog(raw, source_id, page):
             ):
                 raise AgentError("SCIENCE_SOURCE_CATALOG_INVALID", 503)
             unique.add(url)
+            day = _day(date.get_text(" ", strip=True))
+            try:
+                validate_source_url(source_id, url)
+            except AgentError as exc:
+                if exc.code != "ARTICLE_SOURCE_URL_INVALID":
+                    raise
+                if not _unsupported_image_card(spec, literal, url):
+                    raise AgentError("SCIENCE_SOURCE_CATALOG_INVALID", 503) from exc
+                # Это только отказ карточки. Точный whitelist статьи/прав не
+                # меняется, detail/медиа по этой ссылке никогда не запрашиваются.
+                if rejected is not None:
+                    rejected.append({"literal_href": literal, "url": url,
+                        "reason": "ARTICLE_SOURCE_URL_INVALID", "classification": "unsupported_image_card"})
+                continue
             items.append(
                 {
                     "url": url,
                     "title": title.get_text(" ", strip=True),
-                    "day": _day(date.get_text(" ", strip=True)),
+                    "day": day,
                 }
             )
-    if len(items) > 100:
+    if len(unique) > 100:
         raise AgentError("SCIENCE_SOURCE_CATALOG_INVALID", 503)
     following = []
     for link in soup.select("ul.pagination a[href], .prev-next a[href]"):
@@ -209,6 +234,43 @@ def _catalog(raw, source_id, page):
     if len(following) > 1:
         raise AgentError("SCIENCE_SOURCE_CATALOG_INVALID", 503)
     return items, following[0] if following else None
+
+
+def _catalog_rejection_proof(core, source_id, page, raw, rejected):
+    """Сохранить исходный HTML и причины отказа карточек до следующего GET."""
+    if not rejected:
+        return
+    hashed = hashlib.sha256(raw).hexdigest()
+    spec, adapter = source_spec(source_id), ADAPTERS[source_id]
+    catalog_path = adapter["catalog"] if page == 1 else adapter["catalog"] + f"page/{page}/"
+    proof = {"contract": "science-catalog-rejections-v1", "source_id": source_id,
+        "page": page, "catalog_url": "https://" + spec["host"] + catalog_path,
+        "catalog_sha256": hashed, "rejected": rejected, "catalog_html": raw.decode("utf-8")}
+    directory = inside(core.settings.root, "data/server-sources")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / ("catalog-rejections-" + source_id + "-" + hashed + ".local.json")
+    if path.exists() or path.is_symlink():
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate catalog evidence key")
+                result[key] = value
+            return result
+        try:
+            if path.is_symlink() or path.stat().st_size > 20 * MAX_BYTES:
+                raise ValueError("invalid catalog evidence file")
+            old = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+            if old != proof:
+                raise ValueError("changed catalog evidence")
+        except (OSError, ValueError, TypeError, UnicodeError) as exc:
+            raise AgentError("SCIENCE_CATALOG_REJECTION_PROOF_CONFLICT", 409) from exc
+        return
+    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(proof, stream, ensure_ascii=False)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _table_value(soup, label):
@@ -609,7 +671,9 @@ def select_science_article(
             page = next_page
             path = adapter["catalog"] if page == 1 else adapter["catalog"] + f"page/{page}/"
             catalog_raw = get("https://" + spec["host"] + path)
-            items, following = _catalog(catalog_raw, source_id, page)
+            rejected_cards = []
+            items, following = _catalog(catalog_raw, source_id, page, rejected=rejected_cards)
+            _catalog_rejection_proof(core, source_id, page, catalog_raw, rejected_cards)
             seen_key = "head_seen" if page == 1 else "page_seen"
             if page > 1 and progress["page"] != page:
                 progress.update(page=page, page_seen=[])

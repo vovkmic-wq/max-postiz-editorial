@@ -20,6 +20,7 @@ WORKER_LOCK = 599916633322113
 
 def default_settings():
     return {"source": "nasa_svs", "interval_seconds": 3600,
+        "reserve": {"enabled": False, "target": 6, "low": 3, "maximum": 12, "batch": 3},
         "nasa": {"authors": [], "keywords": [], "min_rating": 0,
                  "max_candidates": 30, "max_words": 300},
         "reddit": {"subreddits": [], "authors": [], "keywords": [], "min_score": 0,
@@ -28,12 +29,22 @@ def default_settings():
 
 
 def validate_settings(value):
+    # Старые настройки читаются без включения новой политики задним числом.
+    if isinstance(value, dict) and set(value) == set(default_settings()) - {"reserve"}:
+        value = {**value, "reserve": default_settings()["reserve"]}
     if (not isinstance(value, dict) or set(value) != set(default_settings())
             or value["source"] not in {"nasa_svs", "open_science", "reddit"}
             or type(value["interval_seconds"]) is not int
             or not 3600 <= value["interval_seconds"] <= 86400):
         raise AgentError("EDITORIAL_SETTINGS_INVALID", 422)
     nasa = value["nasa"]
+    reserve = value["reserve"]
+    if (not isinstance(reserve, dict) or set(reserve) != set(default_settings()["reserve"])
+            or type(reserve["enabled"]) is not bool
+            or any(type(reserve[k]) is not int for k in ("target", "low", "maximum", "batch"))
+            or not 1 <= reserve["low"] < reserve["target"] <= reserve["maximum"] <= 24
+            or not 1 <= reserve["batch"] <= 3):
+        raise AgentError("EDITORIAL_SETTINGS_INVALID", 422)
     if (not isinstance(nasa, dict) or set(nasa) != set(default_settings()["nasa"])
             or any(not isinstance(nasa[k], list) or len(nasa[k]) > 50
                    or any(not isinstance(x, str) or not x.strip() or len(x) > 120 for x in nasa[k])
@@ -97,6 +108,18 @@ class ServerState:
 
     def assert_running(self):
         require_running(self.core)
+
+    def progress(self, channel, phase, **details):
+        """Подготовка обновляет свою строку статуса, не затирая состояние отправки."""
+        if channel != "preparation":
+            raise AgentError("EDITORIAL_PROGRESS_INVALID", 422)
+        with self.core.db.session.begin() as session:
+            row = session.scalar(select(EditorialControl).where(
+                EditorialControl.id == CONTROL_ID).with_for_update())
+            if row is None:
+                raise AgentError("EDITORIAL_NOT_INITIALIZED", 409)
+            previous = row.runtime.get(channel, {})
+            row.runtime = {**row.runtime, channel: {**previous, **details, "phase": phase, "heartbeat_at": now()}}
 
     def control(self, action, revision, actor):
         if action not in {"start", "pause"}:
@@ -186,9 +209,20 @@ class DatabaseArticleLedger:
                     raise AgentError("ARTICLE_LEDGER_DATABASE_MISSING", 409)
                 return None
             self.cycle._ledger_revision = row.revision
-            return copy.deepcopy(row.payload)
+            value = copy.deepcopy(row.payload)
+            if getattr(self.cycle, "reserve_mode", False):
+                # Каждому снимку своя база: вложенный _load не подменяет revision
+                # внешнего вызова, который ещё ждёт долгий ответ модели.
+                bases = getattr(self.cycle, "_reserve_ledger_bases", {})
+                bases[id(value)] = (value, row.revision, copy.deepcopy(value))
+                self.cycle._reserve_ledger_bases = bases
+                while len(bases) > 64:
+                    del bases[next(iter(bases))]
+            return value
 
     def save(self, payload):
+        if getattr(self.cycle, "reserve_mode", False):
+            return self._save_reserve(payload)
         with self.cycle.core.db.session.begin() as session:
             row = session.get(EditorialLedger, LEDGER_ID)
             if row is None:
@@ -203,6 +237,64 @@ class DatabaseArticleLedger:
                 raise AgentError("ARTICLE_LEDGER_REVISION_CONFLICT", 409)
             self.cycle._ledger_revision = revision + 1
         return True
+
+    def _save_reserve(self, payload):
+        """Сливать только независимые записи; изменение чужой версии запрещено."""
+        bases = getattr(self.cycle, "_reserve_ledger_bases", {})
+        loaded = bases.get(id(payload))
+        with self.cycle.core.db.session.begin() as session:
+            row = session.scalar(select(EditorialLedger).where(
+                EditorialLedger.id == LEDGER_ID).with_for_update())
+            if row is None:
+                if self.marker.exists():
+                    raise AgentError("ARTICLE_LEDGER_DATABASE_MISSING", 409)
+                return False
+            if loaded is None or loaded[0] is not payload:
+                raise AgentError("ARTICLE_LEDGER_REVISION_CONFLICT", 409)
+            _, _, base = loaded
+            merged = self._merge_records(base, payload, row.payload)
+            saved_revision = row.revision + 1
+            result = session.execute(update(EditorialLedger).where(
+                EditorialLedger.id == LEDGER_ID, EditorialLedger.revision == row.revision).values(
+                    payload=copy.deepcopy(merged), revision=saved_revision, updated_at=now()))
+            if result.rowcount != 1:
+                raise AgentError("ARTICLE_LEDGER_REVISION_CONFLICT", 409)
+        # Сохраняем ссылки на локально изменённые records, которыми ещё пользуется
+        # вызывающий код. Чужие новые/изменённые records добавляются свежими копиями.
+        payload["records"][:] = merged["records"]
+        self.cycle._ledger_revision = saved_revision
+        bases[id(payload)] = (payload, saved_revision, copy.deepcopy(payload))
+        return True
+
+    @staticmethod
+    def _merge_records(base, proposed, current):
+        def records(value):
+            if (not isinstance(value, dict) or set(value) != {"records"}
+                    or not isinstance(value["records"], list)
+                    or any(not isinstance(r, dict) or not isinstance(r.get("id"), str)
+                           for r in value["records"])):
+                raise AgentError("ARTICLE_LEDGER_INVALID", 409)
+            result = {r["id"]: r for r in value["records"]}
+            if len(result) != len(value["records"]):
+                raise AgentError("ARTICLE_LEDGER_INVALID", 409)
+            return result
+        before, after, latest = records(base), records(proposed), records(current)
+        if not set(before) <= set(after) or not set(before) <= set(latest):
+            raise AgentError("ARTICLE_LEDGER_REVISION_CONFLICT", 409)
+        changed = {key for key in after if key not in before or after[key] != before[key]}
+        for key in changed:
+            if (key in before and latest.get(key) != before[key]
+                    or key not in before and key in latest):
+                raise AgentError("ARTICLE_LEDGER_REVISION_CONFLICT", 409)
+        merged = []
+        for item in current["records"]:
+            key = item["id"]
+            if key in changed or key in after and after[key] == item:
+                merged.append(after[key])
+            else:
+                merged.append(copy.deepcopy(item))
+        merged.extend(after[key] for key in after if key not in latest)
+        return {"records": merged}
 
     def migrate(self):
         with profile_lock(self.cycle.directory / "cycle.lock"):
