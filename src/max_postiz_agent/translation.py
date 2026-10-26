@@ -1,6 +1,7 @@
 """Dedicated EN->RU translation; independent editorial gates remain mandatory."""
 
 import copy
+import hashlib
 import json
 import re
 from collections import Counter, defaultdict
@@ -14,6 +15,7 @@ from .config import AgentError
 
 MADLAD_MODEL = "madlad400-3b-q4k-causal-v2"
 MADLAD_BACKEND_CONTRACT = "madlad400-candle-causal-v2"
+MADLAD_SEGMENTATION_CONTRACT = "madlad-segment-budget-v1"
 MADLAD_ARTIFACT_SHA256 = {
     "worker": "7b3fd9c77e130992a9b233c30b26a0245b9bb4386a5ecc7250f244d90d4e97cd",
     "model": "ea6e5531a3e95213c7f0635988d119e078a655c09306e47851e15d4c0c3f9c37",
@@ -177,6 +179,7 @@ class DedicatedTranslator:
         if not isinstance(config, dict):
             raise AgentError("TRANSLATION_CONFIG_INVALID")
         self.model = config.get("model")
+        self.segment_chars = config.get("segment_chars", 1400)
         url = config.get("base_url", "")
         if not isinstance(self.model, str) or not isinstance(url, str):
             raise AgentError("TRANSLATION_CONFIG_INVALID")
@@ -189,6 +192,9 @@ class DedicatedTranslator:
                 or not parsed.hostname or parsed.username or parsed.password
                 or parsed.query or parsed.fragment or port == 0):
             raise AgentError("TRANSLATION_CONFIG_INVALID")
+        if (type(self.segment_chars) is not int or not 400 <= self.segment_chars <= 1400
+                or self.segment_chars != 1400 and self.model != MADLAD_MODEL):
+            raise AgentError("TRANSLATION_CONFIG_INVALID")
         self.url = url.rstrip("/")
         self.client = httpx.Client(timeout=600, trust_env=False, transport=transport,
                                    follow_redirects=False)
@@ -196,7 +202,7 @@ class DedicatedTranslator:
 
     def translate(self, text):
         output, metrics = [], []
-        for part, translate in segments(text):
+        for part, translate in segments(text, limit=self.segment_chars):
             if not translate:
                 output.append(part)
                 continue
@@ -221,8 +227,17 @@ class DedicatedTranslator:
                 raise AgentError("TRANSLATION_RESPONSE_INVALID", 503)
             restored, count = restore_numeric_spelling(part, value["text"].strip())
             output.append(restored)
-            metrics.append({**(segment_metrics if isinstance(segment_metrics, dict) else {}),
-                            "numeric_spelling_restored": count})
+            metadata = {**(segment_metrics if isinstance(segment_metrics, dict) else {}),
+                        "numeric_spelling_restored": count}
+            if self.segment_chars != 1400:
+                metadata.update(segmentation_contract=MADLAD_SEGMENTATION_CONTRACT,
+                    segment_chars=self.segment_chars, segment_index=len(metrics),
+                    segment_input_sha256=hashlib.sha256(part.encode("utf-8")).hexdigest(),
+                    segment_output_sha256=hashlib.sha256(restored.encode("utf-8")).hexdigest(),
+                    segment_input_chars=len(part), segment_output_chars=len(restored),
+                    segment_raw_output_sha256=hashlib.sha256(value["text"].encode("utf-8")).hexdigest(),
+                    segment_raw_output_chars=len(value["text"]))
+            metrics.append(metadata)
         return "".join(output), metrics
 
     def generate_text(self, prompt):
@@ -242,8 +257,16 @@ class DedicatedTranslator:
         self._cached_source = self._cached_result = None
         translated_title, title_metrics = self.translate(title)
         translated_body, body_metrics = self.translate(body)
-        result = (json.dumps({"title": translated_title, "body": translated_body}, ensure_ascii=False), {
-            "model": self.model, "segments": title_metrics + body_metrics, "cache_reused": False})
+        info = {"model": self.model, "segments": title_metrics + body_metrics, "cache_reused": False}
+        if self.segment_chars != 1400:
+            bound = []
+            for field, values in (("title", title_metrics), ("body", body_metrics)):
+                for field_index, metadata in enumerate(values):
+                    bound.append({**metadata, "segment_field": field, "field_segment_index": field_index,
+                                  "segment_index": len(bound)})
+            info.update(segmentation_contract=MADLAD_SEGMENTATION_CONTRACT,
+                        segment_chars=self.segment_chars, segments=bound)
+        result = (json.dumps({"title": translated_title, "body": translated_body}, ensure_ascii=False), info)
         self._cached_source, self._cached_result = cache_key, copy.deepcopy(result)
         return result
 

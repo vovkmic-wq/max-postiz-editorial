@@ -75,8 +75,16 @@ class ServerCycle:
             from .server_nasa import select_nasa_article
             from .server_science import select_science_article
             policies = self.cycle._policies()
-            # Приоритет вращается по общему часу; после перезапуска часа нет второй подготовки.
+            # Старый режим сохраняет вращение по часу. Резерв делает несколько
+            # кандидатов в час и после любого известного результата меняет источник.
             offset = int(self.clock() // 3600) % len(policies)
+            if getattr(self.cycle, "reserve_mode", False):
+                source_ids = [current["source_id"] for current in policies]
+                previous = next((record.get("source_id") for record in reversed(ledger["records"])
+                    if record.get("reserve_contract") == "article-reserve-v1"
+                    and record.get("source_id") in source_ids), None)
+                if previous is not None:
+                    offset = (source_ids.index(previous) + 1) % len(policies)
             policies = policies[offset:] + policies[:offset]
             failures = []
             for current in policies:

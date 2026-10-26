@@ -514,9 +514,16 @@ class ArticleQuality:
             self._emit("translation_started", attempt, context=context)
             raw_translation = None
             try:
-                raw_translation = self.translator.generate_text(
-                    json.dumps(context, ensure_ascii=False))[0]
-                self._emit("translation_returned", attempt, raw=raw_translation)
+                returned = self.translator.generate_text(json.dumps(context, ensure_ascii=False))
+                raw_translation = returned[0]
+                # Новая явная сегментация сохраняет request/response bindings и
+                # raw worker evidence в прежнем событии, не меняя порядок trace.
+                # Старые модели/trace не получают выдуманное доказательство.
+                metadata = (returned[1] if isinstance(returned, tuple) and len(returned) == 2
+                            and isinstance(returned[1], dict) else {})
+                evidence = ({"translation_metadata": metadata}
+                            if metadata.get("segmentation_contract") else {})
+                self._emit("translation_returned", attempt, raw=raw_translation, **evidence)
                 translated = extract_object(raw_translation)
             except AgentError as exc:
                 if exc.code != "INVALID_EDITOR_RESULT":
