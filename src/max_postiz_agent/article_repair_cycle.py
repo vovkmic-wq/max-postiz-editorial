@@ -26,7 +26,7 @@ QUARANTINE_ERRORS = {"ARTICLE_REPAIR_RESPONSE_INVALID", "ARTICLE_REPAIR_PATCH_IN
                      "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"}
 _BINDING = ("id", "number", "contract", "model", "input_hash", "policy_hash", "slot",
             "parent_trace_hash", "parent_trace_bytes", "snapshot_hash", "snapshot_path", "prompts", "target_binding_hash",
-            "source_config_hash", "reference_contract")
+            "source_config_hash", "reference_contract", "review_rubric")
 
 
 def _now():
@@ -152,13 +152,14 @@ class AutomaticArticleRepair:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         return expected
 
-    def _prompts(self, contract=None):
+    def _prompts(self, contract=None, rubric="meaning-first-v1"):
         # Claim привязан к своей версии промпта: новая редакция не переоценивает
         # сохранённые v3/v4 и не меняет их имена полей или hashes в истории.
         repair_prompt = repair_prompt_name(REPAIR_CONTRACT if contract is None else contract)
+        from .article_quality import review_prompt_name
         root = self.core.settings.root / "prompts"
         return {name: _sha((root / name).read_bytes()) for name in (
-            "ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt", repair_prompt)}
+            "ARTICLE_TRANSLATE.txt", review_prompt_name(rubric), repair_prompt)}
 
     def _quiet(self, record, policy):
         require_running(self.core)
@@ -214,9 +215,11 @@ class AutomaticArticleRepair:
             return {key: normalize_article_links(value[key].strip()) for key in ("title", "body")}
 
         try:
-            from .article_cycle import scientific_contract_binding
+            from .article_cycle import automatic_review_rubric, review_rubric_binding, scientific_contract_binding
+            rubric = automatic_review_rubric(record)
             with self.core.db.session() as session:
                 scientific_contract = scientific_contract_binding(self.core, session, record)
+                review_rubric_binding(self.core, session, record)
             expected = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
             require(record.get("quality_trace") == expected and type(record.get("slot")) is int)
             raw = inside(self.core.settings.root, expected).read_bytes()
@@ -287,7 +290,8 @@ class AutomaticArticleRepair:
             require(starts and starts[0] == 0 and len(starts) == terminal["attempt"]
                     and (initial or len(starts) == 1))
             translation_prompt = (self.core.settings.root / "prompts/ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8")
-            review_prompt = (self.core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt").read_text(encoding="utf-8")
+            from .article_quality import review_prompt_name
+            review_prompt = (self.core.settings.root / "prompts" / review_prompt_name(rubric)).read_text(encoding="utf-8")
             review_hash = _sha(review_prompt.encode("utf-8"))
             original = source["title"] + "\n\n" + source["body"]
             prior_feedback = {}
@@ -328,7 +332,7 @@ class AutomaticArticleRepair:
                 full = translated + "\n\n" + article_footer(article["url"])
                 gate_error = None
                 try:
-                    rubric_translation_gate(original, translated, "meaning-first-v1",
+                    rubric_translation_gate(original, translated, rubric,
                                             reference_contract=reference_contract)
                     if len(full) > 3500:
                         raise AgentError("ARTICLE_POST_TOO_LONG")
@@ -353,11 +357,11 @@ class AutomaticArticleRepair:
                         require(phases == expected_phases)
                         context = tail[1].get("context")
                         require(isinstance(context, dict) and context == article_review_context(
-                            review_prompt, original, translated, "meaning-first-v1", review_hash,
+                            review_prompt, original, translated, rubric, review_hash,
                             reference_contract=reference_contract))
                         require(isinstance(tail[2].get("raw"), str))
                         raw_review = extract_object(tail[2]["raw"])
-                        reviewed = normalize_rubric_review(raw_review, "meaning-first-v1")
+                        reviewed = normalize_rubric_review(raw_review, rubric)
                         normalized = [e for e in tail if e["phase"] == "review_normalized"]
                         require(bool(normalized) == (reviewed != raw_review))
                         if normalized:
@@ -366,7 +370,7 @@ class AutomaticArticleRepair:
                         require(parsed.get("review") == reviewed)
                         matches = next(e for e in tail if e["phase"] == "spelling_returned").get("matches")
                         require(isinstance(matches, list) and all(isinstance(m, dict) for m in matches))
-                        adjudicated, unresolved = rubric_spelling(original, translated, matches, "meaning-first-v1",
+                        adjudicated, unresolved = rubric_spelling(original, translated, matches, rubric,
                             allow_spacetime=True, allow_registered_terms=scientific_contract is not None)
                         spelling = tail[-1]
                         require(spelling.get("scientific_spelling_contract") == scientific_contract
@@ -393,6 +397,8 @@ class AutomaticArticleRepair:
                 payload["reference_contract"] = reference_contract
             if scientific_contract is not None:
                 payload["scientific_spelling_contract"] = scientific_contract
+            if "review_rubric" in record:
+                payload["review_rubric"] = rubric
             return payload
         except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError, StopIteration, AgentError, OverflowError) as exc:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409) from exc
@@ -419,7 +425,7 @@ class AutomaticArticleRepair:
         self._files(record, claim, snapshot["article"])
         policy = self.cycle._policy_for_record(record)
         source, target = self.cycle._source_target(policy)
-        if (self._prompts(claim["contract"]) != claim["prompts"] or fingerprint(policy) != claim["policy_hash"]
+        if (self._prompts(claim["contract"], claim.get("review_rubric", "meaning-first-v1")) != claim["prompts"] or fingerprint(policy) != claim["policy_hash"]
                 or fingerprint(source) != claim["source_config_hash"] or target.binding_hash != claim["target_binding_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         with self.core.db.session() as session:
@@ -602,7 +608,7 @@ class AutomaticArticleRepair:
             if not audit or any(claim.get(key) != audit.details.get(key) for key in _BINDING):
                 raise AgentError("ARTICLE_AUTOMATIC_REPAIR_CLAIM_LOST", 409)
         if (fingerprint(article) != claim["input_hash"] or fingerprint(candidate) != claim.get("candidate_hash")
-                or self._prompts(claim["contract"]) != claim["prompts"]
+                or self._prompts(claim["contract"], claim.get("review_rubric", "meaning-first-v1")) != claim["prompts"]
                 or _sha(inside(self.core.settings.root, record["quality_trace"]).read_bytes()) != claim["parent_trace_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         self._files(record, claim, article, candidate)
@@ -614,6 +620,8 @@ class AutomaticArticleRepair:
         snapshot = parse_json(snapshot_raw.decode("utf-8"))
         references = self._claim_reference(claim)
         if (_sha(snapshot_raw) != claim["snapshot_hash"] or snapshot["article"] != article
+                or snapshot.get("review_rubric") != record.get("review_rubric")
+                or claim.get("review_rubric") != record.get("review_rubric")
                 or snapshot.get("scientific_spelling_contract") != record.get("scientific_spelling_contract")
                 or snapshot.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != references
                 or record.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != references):
@@ -657,7 +665,7 @@ class AutomaticArticleRepair:
 
     def after_quality(self, record, claim, article):
         source, target = self._quiet(record, self.cycle._policy_for_record(record))
-        if (self._prompts(claim["contract"]) != claim["prompts"] or fingerprint(article) != claim["input_hash"]
+        if (self._prompts(claim["contract"], claim.get("review_rubric", "meaning-first-v1")) != claim["prompts"] or fingerprint(article) != claim["input_hash"]
                 or target.binding_hash != claim["target_binding_hash"] or fingerprint(source) != claim["source_config_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         self._files(record, claim, article)
@@ -699,12 +707,14 @@ class AutomaticArticleRepair:
                 "parent_trace_hash": payload["parent_trace_hash"], "snapshot_path": path,
                 "parent_trace_bytes": len(inside(self.core.settings.root, record["quality_trace"]).read_bytes()),
                 "snapshot_hash": _write_json(inside(self.core.settings.root, path), payload),
-                "prompts": self._prompts(REPAIR_CONTRACT), "target_binding_hash": target.binding_hash,
+                "prompts": self._prompts(REPAIR_CONTRACT, record.get("review_rubric", "meaning-first-v1")), "target_binding_hash": target.binding_hash,
                 "source_config_hash": fingerprint(source),
                 "repair_trace": f"data/hourly-articles/repair-{claim_id}.local.jsonl",
                 "owner_authorization": "2026-10-22 bounded automatic translation corrections"}
             if REPAIR_CONTRACT in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}:
                 claim["reference_contract"] = payload["reference_contract"]
+            if "review_rubric" in record:
+                claim["review_rubric"] = record["review_rubric"]
             try:
                 with self.core.db.session.begin() as session:
                     require_running(self.core, session, lock=True)

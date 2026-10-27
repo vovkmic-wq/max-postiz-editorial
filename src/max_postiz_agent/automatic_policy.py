@@ -95,7 +95,8 @@ def scientific_trace_binding(trace_path, contract, *, expected_hash=None, expect
 
 
 def _validate(evidence, title, body, source):
-    from .article_quality import (FRESH_SPACETIME_SPELLING_CONTRACT, MAX_REVIEW_ISSUES, MEANING_FIRST_REVIEW_RUBRIC, TOPICS,
+    from .article_quality import (FRESH_SPACETIME_SPELLING_CONTRACT, HOURLY_PRACTICAL_REVIEW_RUBRIC,
+                                  MAX_REVIEW_ISSUES, MEANING_FIRST_REVIEW_RUBRIC, TOPICS,
                                   normalize_rubric_review, protocol_recovery_provenance,
                                   review_parser_contract, rubric_spelling, rubric_translation_gate)
     required = {"review_raw", "review", "spelling_matches", "spelling_adjudicated", "spelling_unresolved",
@@ -103,7 +104,8 @@ def _validate(evidence, title, body, source):
     optional = {"parser_contract", "protocol_recovery", "fresh_spelling_contract", "reference_check",
                 "scientific_spelling_contract"}
     if (not isinstance(evidence, dict) or not required <= set(evidence) <= required | optional
-            or evidence["review_rubric"] != MEANING_FIRST_REVIEW_RUBRIC
+            or not isinstance(evidence["review_rubric"], str)
+            or evidence["review_rubric"] not in {MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC}
             or evidence["hard_gates_passed"] is not True
             or evidence["text_hash"] != text_hash(title, body)
             or evidence["source_hash"] != fingerprint({**source, "title": source["title"].strip(),
@@ -166,6 +168,7 @@ def _validate(evidence, title, body, source):
 
 
 def machine_metadata(prepared, source, trace_path):
+    from .article_quality import review_prompt_name
     evidence = copy.deepcopy(prepared.get("machine_review_evidence"))
     if not isinstance(evidence, dict) or prepared.get("machine_review_status") != "passed":
         raise AgentError("ARTICLE_AUTOMATIC_RECHECK_REQUIRED", 409)
@@ -181,8 +184,8 @@ def machine_metadata(prepared, source, trace_path):
     review = _validate(evidence, prepared["title"], prepared["body"], source)
     if (prepared.get("review_rubric") != evidence["review_rubric"]
             or prepared.get("review_prompt_hash") != evidence["review_prompt_hash"]
-            or evidence["review_prompt_hash"] != hashlib.sha256((trace_path.parents[2] /
-                "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt").read_text(encoding="utf-8").encode("utf-8")).hexdigest()):
+            or evidence["review_prompt_hash"] != hashlib.sha256((trace_path.parents[2] / "prompts" /
+                review_prompt_name(evidence["review_rubric"])).read_text(encoding="utf-8").encode("utf-8")).hexdigest()):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     reference_contract = evidence.get("reference_check", {}).get("contract", LEGACY_REFERENCE_CONTRACT)
     if prepared.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract:
@@ -303,15 +306,18 @@ def _eligible_record(cycle, session, variant, policy, record, *, reserve_unassig
     if automatic_evidence(session, variant) is None:
         raise AgentError("ARTICLE_AUTOMATIC_RECHECK_REQUIRED", 409)
     _reference_binding(session, variant, record)
-    from .article_cycle import scientific_contract_binding
+    from .article_cycle import review_rubric_binding, scientific_contract_binding
+    rubric = review_rubric_binding(core, session, record, variant)
+    if rubric != policy["review_rubric"]:
+        raise AgentError("ARTICLE_AUTOMATIC_RECHECK_REQUIRED", 409)
     scientific_contract_binding(core, session, record, variant)
-    from .article_quality import rubric_translation_gate
+    from .article_quality import review_prompt_name, rubric_translation_gate
     source = source_data(session, variant)
     # Даже старый прошедший DRAFT не может отправить повреждённый literal URL.
     rubric_translation_gate(source["title"] + "\n\n" + source["body"],
-        variant.title + "\n\n" + candidate_body(variant, source), "meaning-first-v1",
+        variant.title + "\n\n" + candidate_body(variant, source), rubric,
         reference_contract=REFERENCE_CONTRACT)
-    prompt_hash = hashlib.sha256((core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt")
+    prompt_hash = hashlib.sha256((core.settings.root / "prompts" / review_prompt_name(rubric))
                                 .read_text(encoding="utf-8").encode("utf-8")).hexdigest()
     if variant.metadata_json.get("review_prompt_hash") != prompt_hash:
         raise AgentError("ARTICLE_AUTOMATIC_RECHECK_REQUIRED", 409)

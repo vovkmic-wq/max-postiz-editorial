@@ -25,6 +25,53 @@ from .hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Targ
 from .reddit import text_hash
 
 
+def automatic_review_rubric(record):
+    """Старый журнал без marker сохраняет прежние критерии при смене настройки."""
+    from .article_quality import HOURLY_PRACTICAL_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC
+    rubric = record.get("review_rubric", MEANING_FIRST_REVIEW_RUBRIC)
+    if not isinstance(rubric, str) or rubric not in {MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC}:
+        raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID", 409)
+    return rubric
+
+
+def automatic_review_prompt_name(record):
+    from .article_quality import review_prompt_name
+    return review_prompt_name(automatic_review_rubric(record))
+
+
+def review_rubric_binding(core, session, record, variant=None):
+    """Практические критерии требуют marker в записи, attempts и durable Audit."""
+    from .article_quality import HOURLY_PRACTICAL_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC
+    rubric = automatic_review_rubric(record)
+    attempts = record.get("preparation_attempts", [])
+    audits = list(session.scalars(select(Audit).where(
+        Audit.entity == record["id"], Audit.action == "hourly_article_prepare_attempt")))
+    if not isinstance(attempts, list) or any(not isinstance(a, dict) for a in attempts):
+        raise AgentError("ARTICLE_REVIEW_RUBRIC_BINDING_INVALID", 409)
+    markers = [record.get("review_rubric"), *(a.get("review_rubric") for a in attempts)]
+    if any(not isinstance(a.details, dict) for a in audits):
+        raise AgentError("ARTICLE_REVIEW_RUBRIC_BINDING_INVALID", 409)
+    markers.extend(a.details.get("review_rubric") for a in audits)
+    if variant is not None:
+        markers.append(variant.metadata_json.get("review_rubric"))
+    if HOURLY_PRACTICAL_REVIEW_RUBRIC not in markers:
+        if rubric != MEANING_FIRST_REVIEW_RUBRIC or any(
+                marker is not None and marker != MEANING_FIRST_REVIEW_RUBRIC for marker in markers):
+            raise AgentError("ARTICLE_REVIEW_RUBRIC_BINDING_INVALID", 409)
+        return rubric
+    if (rubric != HOURLY_PRACTICAL_REVIEW_RUBRIC or not attempts
+            or any(marker != rubric for marker in markers)):
+        raise AgentError("ARTICLE_REVIEW_RUBRIC_BINDING_INVALID", 409)
+    for number, attempt in enumerate(attempts, 1):
+        matched = [a for a in audits if type(a.details.get("attempt")) is int and a.details["attempt"] == number]
+        if (type(attempt.get("number")) is not int or attempt["number"] != number
+                or len(matched) != 1 or matched[0].details.get("policy_hash") != record.get("policy_hash")
+                or matched[0].details.get("input_hash") != record.get("input_hash")
+                or matched[0].details.get("source_hash") != record.get("original_hash")):
+            raise AgentError("ARTICLE_REVIEW_RUBRIC_BINDING_INVALID", 409)
+    return rubric
+
+
 def scientific_contract_binding(core, session, record, variant=None):
     """Новую словарную семантику закрепляем до модели, без переоценки истории."""
     from .scientific_terms import SCIENTIFIC_SPELLING_CONTRACT
@@ -127,8 +174,10 @@ class HourlyArticleCycle:
             required = {"enabled", "target_id", "source_id", "allowed_hosts", "rights_evidence",
                         "owner_instruction", "min_gap_seconds", "max_per_day", "max_source_age_hours"}
             mode = policy.get("approval_mode", "legacy")
+            from .article_quality import HOURLY_PRACTICAL_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC
             valid_keys = (set(policy) == required | {"approval_mode", "review_rubric"}
-                          and policy.get("review_rubric") == "meaning-first-v1") if mode == "automatic" else (
+                          and policy.get("review_rubric") in {MEANING_FIRST_REVIEW_RUBRIC,
+                                                             HOURLY_PRACTICAL_REVIEW_RUBRIC}) if mode == "automatic" else (
                               set(policy) in (required, required | {"approval_mode"}))
             if (not valid_keys
                     or policy.get("approval_mode", "legacy") not in {"legacy", "human", "automatic"}
@@ -332,6 +381,7 @@ class HourlyArticleCycle:
         if records:
             with self.core.db.session() as session:
                 scientific_contract = scientific_contract_binding(self.core, session, records[0])
+                review_rubric_binding(self.core, session, records[0])
         with ExitStack() as cleanup:
             if review_only:
                 from .human_review import CandidateOnlyTranslator
@@ -361,7 +411,8 @@ class HourlyArticleCycle:
             quality = ArticleQuality(translator, reviewer, prompt_dir=self.core.settings.root / "prompts",
                                      trace=self._trace_writer(record_id) if record_id else None,
                                      allow_human_rejection=human_mode,
-                                     review_rubric="meaning-first-v1" if mode == "automatic" else "legacy",
+                                     review_rubric=(automatic_review_rubric(records[0]) if records else
+                                         self._policy(enabled=False)["review_rubric"]) if mode == "automatic" else "legacy",
                                      reference_contract=reference_contract,
                                      allow_registered_terms=scientific_contract is not None)
             cleanup.pop_all()
@@ -654,10 +705,10 @@ class HourlyArticleCycle:
                             or review.get("translation_untrusted") != translated["title"] + "\n\n" + translated["body"]):
                         raise ValueError
                     if reference_contract == REFERENCE_CONTRACT:
-                        review_prompt = (self.core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt").read_text(encoding="utf-8")
+                        review_prompt = (self.core.settings.root / "prompts" / automatic_review_prompt_name(record)).read_text(encoding="utf-8")
                         if review != article_review_context(review_prompt,
                                 source["title"] + "\n\n" + source["body"],
-                                translated["title"] + "\n\n" + translated["body"], "meaning-first-v1",
+                                translated["title"] + "\n\n" + translated["body"], automatic_review_rubric(record),
                                 hashlib.sha256(review_prompt.encode("utf-8")).hexdigest(),
                                 reference_contract=reference_contract):
                             raise ValueError
@@ -809,6 +860,9 @@ class HourlyArticleCycle:
                           "url": article["url"], "original_hash": original_hash, "policy_hash": fingerprint(policy),
                           "target_id": target.id, "source_id": source["id"], "source_published_at": article["published_at"],
                           "input_hash": fingerprint(article), "preparation_attempts": []}
+                if policy.get("review_rubric") == "hourly-practical-v1":
+                    # Новая рубрика выбирается только явной политикой до первой модели.
+                    record["review_rubric"] = policy["review_rubric"]
                 if self.reserve_mode:
                     from .article_reserve import ArticleReserveStore
                     ArticleReserveStore(self.core).bind_preparation(reserve_claim, record["id"])
@@ -843,6 +897,8 @@ class HourlyArticleCycle:
                 self._guard_candidate_replay(ledger, record, candidate, "prepare_candidate", article)
             attempt = {"number": len(record["preparation_attempts"]) + 1,
                        "started_at": now(), "state": "preparing", "operator_retry": bool(retry_record) and not repair_claim}
+            if "review_rubric" in record:
+                attempt["review_rubric"] = automatic_review_rubric(record)
             if "reference_contract" in record:
                 if (not isinstance(record["reference_contract"], str)
                         or record["reference_contract"] not in REFERENCE_CONTRACTS):
@@ -874,6 +930,7 @@ class HourlyArticleCycle:
                         input_hash=record["input_hash"], policy_hash=record["policy_hash"],
                         candidate_hash=attempt.get("candidate_hash"), operator_correction=attempt.get("operator_correction", False),
                         automatic_repair_claim=automatic_repair_claim,
+                        **({"review_rubric": attempt["review_rubric"]} if "review_rubric" in attempt else {}),
                         **({"reference_contract": attempt["reference_contract"]}
                            if "reference_contract" in attempt else {}),
                         **({"scientific_spelling_contract": attempt["scientific_spelling_contract"]}
@@ -921,6 +978,9 @@ class HourlyArticleCycle:
         material_hash = fingerprint(" ".join(article["original"].casefold().split()))
         if prepared["url"] != article["url"]:
             raise AgentError("ARTICLE_SOURCE_CHANGED", 409)
+        if (policy.get("approval_mode") == "automatic"
+                and prepared.get("review_rubric") != automatic_review_rubric(record)):
+            raise AgentError("ARTICLE_REVIEW_RUBRIC_BINDING_INVALID", 409)
         if (record.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
                 != prepared.get("reference_contract", LEGACY_REFERENCE_CONTRACT)):
             raise AgentError("ARTICLE_REFERENCE_CONTRACT_INVALID", 409)
@@ -975,6 +1035,8 @@ class HourlyArticleCycle:
                     "translation_hash": translation_hash})
             session.add(variant)
             session.flush()
+            if policy.get("approval_mode") == "automatic":
+                review_rubric_binding(self.core, session, record, variant)
             scientific_contract_binding(self.core, session, record, variant)
             self.core._history(session, variant, target, "article_quality")
             # Generation and database work may cross the reserved hour.
@@ -1115,7 +1177,7 @@ class HourlyArticleCycle:
                     or fingerprint(snapshot) != record.get("prepared_hash")
                     or fingerprint(snapshot) != record.get("reserve_prepared_hash")
                     or variant.metadata_json.get("review_prompt_hash") != hashlib.sha256(
-                        (self.core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt")
+                        (self.core.settings.root / "prompts" / automatic_review_prompt_name(record))
                         .read_text(encoding="utf-8").encode("utf-8")).hexdigest()
                     or evidence is None or material.published_at is None
                     or material.published_at != record.get("source_published_at")
@@ -1493,7 +1555,7 @@ class HourlyArticleCycle:
             first, gate, review_start, returned, invalid, rejected = segment
             original = source["title"] + "\n\n" + source["body"]
             translation = canonical["title"] + "\n\n" + canonical["body"]
-            prompt = (self.core.settings.root / "prompts/ARTICLE_REVIEW_MEANING_FIRST_V1.txt").read_text(encoding="utf-8")
+            prompt = (self.core.settings.root / "prompts" / automatic_review_prompt_name(record)).read_text(encoding="utf-8")
             prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
             context = review_start.get("context", {})
             if not isinstance(context, dict):
@@ -1504,14 +1566,14 @@ class HourlyArticleCycle:
                     or first.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract
                     or gate.get("characters") != len(translation + "\n\n" + article_footer(article["url"]))
                     or context.get("instruction") != prompt or context.get("review_prompt_hash") != prompt_hash
-                    or context.get("review_rubric") != "meaning-first-v1"
+                    or context.get("review_rubric") != automatic_review_rubric(record)
                     or context.get("source_untrusted") != original or context.get("translation_untrusted") != translation
                     or invalid.get("error") != "ARTICLE_REVIEW_SCHEMA_INVALID"
                     or rejected.get("mode") != "candidate" or rejected.get("error") != "ARTICLE_QUALITY_REJECTED"
                     or rejected.get("feedback")):
                 raise ValueError
             if reference_contract == REFERENCE_CONTRACT and context != article_review_context(
-                    prompt, original, translation, "meaning-first-v1", prompt_hash,
+                    prompt, original, translation, automatic_review_rubric(record), prompt_hash,
                     reference_contract=reference_contract):
                 raise ValueError
             # Another verdict for this exact EN/RU pair is never upgraded by a
@@ -1582,6 +1644,9 @@ class HourlyArticleCycle:
         with profile_lock(self.directory / "cycle.lock"):
             policy, ledger = self._policy(), self._load()
             record = self._record(ledger, ident)
+            if automatic_review_rubric(record) != "meaning-first-v1":
+                # Историческое исключение протокола не переносим на новую рубрику.
+                raise AgentError("ARTICLE_REVIEW_PROTOCOL_NOT_RECOVERABLE", 409)
             from .article_sources import require_legacy_source
             require_legacy_source(record)
             if (policy.get("approval_mode") != "automatic" or record.get("state") != "needs_attention"

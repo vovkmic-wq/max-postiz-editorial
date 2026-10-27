@@ -46,7 +46,14 @@ REVIEW_PROTOCOL_CONTRACT = "meaning-first-advisory-v2"
 MAX_PROTOCOL_REVIEW_BYTES = 65536
 LEGACY_REVIEW_RUBRIC = "legacy"
 MEANING_FIRST_REVIEW_RUBRIC = "meaning-first-v1"
-REVIEW_RUBRICS = {LEGACY_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC}
+HOURLY_PRACTICAL_REVIEW_RUBRIC = "hourly-practical-v1"
+REVIEW_RUBRICS = {LEGACY_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC,
+                  HOURLY_PRACTICAL_REVIEW_RUBRIC}
+# Новое поручение владельца: редкие языковые замечания допустимы, массовые — нет.
+PRACTICAL_LT_MIN_FINDINGS = 8
+PRACTICAL_LT_WORDS_PER_FINDING = 10
+_PRACTICAL_LT_ISSUES = frozenset({"misspelling", "grammar", "typographical", "style",
+                                  "register", "duplication", "locale-violation"})
 _INLINE_ARTICLE_LINK = re.compile(r"(?<![!\\])\[([^\[\]\r\n]+)\]\((https?://)")
 
 
@@ -104,13 +111,18 @@ def _normalize_review(value):
 
 def normalize_rubric_review(value, rubric):
     """Separate advisory wording from substantive issues without changing a verdict."""
+    if not isinstance(rubric, str) or rubric not in REVIEW_RUBRICS:
+        raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
     if rubric == LEGACY_REVIEW_RUBRIC:
         return _normalize_review(value)
-    if rubric != MEANING_FIRST_REVIEW_RUBRIC:
+    if rubric not in {MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC}:
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
     if not isinstance(value, dict) or set(value) != {"approved", "topic", "issues", "warnings"}:
         raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
     normalized = _normalize_review({key: value[key] for key in ("approved", "topic", "issues")})
+    if rubric == HOURLY_PRACTICAL_REVIEW_RUBRIC and normalized["approved"] and normalized["issues"]:
+        # Противоречивый verdict не превращаем в passed или содержательное одобрение.
+        raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
     warnings = value["warnings"]
     if (not isinstance(warnings, list) or len(warnings) > MAX_REVIEW_WARNINGS
             or any(not isinstance(item, str) or not item.strip()
@@ -176,8 +188,7 @@ def rubric_translation_gate(original, translated, rubric, *, reference_contract=
     source_urls = reference_urls(original, contract=reference_contract)
     candidate_urls = reference_urls(translated, contract=reference_contract)
     translation_gate(original, translated)
-    if (rubric == MEANING_FIRST_REVIEW_RUBRIC
-            and source_urls != candidate_urls):
+    if rubric != LEGACY_REVIEW_RUBRIC and source_urls != candidate_urls:
         raise AgentError("TRANSLATION_REFERENCE_CHANGED")
 
 
@@ -353,13 +364,75 @@ def adjudicate_scientific_spelling(original, translated, matches, *, allow_space
     return adjudicated, unresolved
 
 
+def review_prompt_name(rubric):
+    """Сохранённые рубрики всегда читают свой неизменённый review prompt."""
+    names = {LEGACY_REVIEW_RUBRIC: "ARTICLE_REVIEW.txt",
+             MEANING_FIRST_REVIEW_RUBRIC: "ARTICLE_REVIEW_MEANING_FIRST_V1.txt",
+             HOURLY_PRACTICAL_REVIEW_RUBRIC: "ARTICLE_REVIEW_HOURLY_PRACTICAL.txt"}
+    if not isinstance(rubric, str) or rubric not in names:
+        raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
+    return names[rubric]
+
+
+def practical_language_budget(translated):
+    """Ровно 1 LT finding на 10 русских слов, минимум 8; URL бюджет не увеличивают."""
+    narrative = re.sub(r"https?://[^\s<>]+", " ", translated)
+    word_count = len(re.findall(r"[А-Яа-яЁё]+(?:[-’'][А-Яа-яЁё]+)*", narrative))
+    maximum = max(PRACTICAL_LT_MIN_FINDINGS,
+                  (word_count + PRACTICAL_LT_WORDS_PER_FINDING - 1)
+                  // PRACTICAL_LT_WORDS_PER_FINDING)
+    return {"russian_words": word_count, "max_findings": maximum}
+
+
+def _ordinary_language_finding(match, translated):
+    """Повреждённый LT payload или неизвестный тип не становится советом."""
+    rule, kind = match.get("rule"), match.get("type")
+    offset, length = match.get("offset"), match.get("length")
+    if (not isinstance(rule, dict) or not isinstance(rule.get("id"), str) or not rule["id"]
+            or rule.get("issueType") not in _PRACTICAL_LT_ISSUES
+            or not isinstance(rule.get("category"), dict)
+            or not isinstance(rule["category"].get("id"), str) or not rule["category"]["id"]
+            or not isinstance(kind, dict) or kind.get("typeName") not in
+            {"Other", "UnknownWord", "Grammar", "Style", "Register"}
+            or type(offset) is not int or type(length) is not int or offset < 0 or length <= 0):
+        return False
+    try:
+        encoded = translated.encode("utf-16-le")
+        if offset + length > len(encoded) // 2:
+            return False
+        encoded[:offset * 2].decode("utf-16-le")
+        encoded[offset * 2:(offset + length) * 2].decode("utf-16-le")
+        return True
+    except UnicodeError:
+        return False
+
+
 def rubric_spelling(original, translated, matches, rubric, *, allow_spacetime=False,
                     allow_registered_terms=False):
-    """Retain style suggestions as audited advice; grammar and unknown rules block."""
+    """Версионная языковая проверка: старые gates либо ограниченный практический совет."""
     if not isinstance(rubric, str) or rubric not in REVIEW_RUBRICS:
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
     adjudicated, unresolved = adjudicate_scientific_spelling(original, translated, matches,
         allow_spacetime=allow_spacetime, allow_registered_terms=allow_registered_terms)
+    if rubric == HOURLY_PRACTICAL_REVIEW_RUBRIC:
+        budget = practical_language_budget(translated)
+        # Стиль и необязательная пунктуация не создают новый барьер по сравнению
+        # с meaning-first-v1; ранее доказанные термины тоже не являются ошибками.
+        optional = {"style", "register", "typographical"}
+        language_findings = sum(_ordinary_language_finding(match, translated)
+            and match["rule"]["issueType"] not in optional for match in unresolved)
+        budget["nonstyle_readability_findings"] = language_findings
+        over_budget = language_findings > budget["max_findings"]
+        blocking = []
+        for match in unresolved:
+            if (_ordinary_language_finding(match, translated)
+                    and (not over_budget or match["rule"]["issueType"] in optional)):
+                adjudicated.append({"match": copy.deepcopy(match),
+                    "reason": "NON_BLOCKING_PRACTICAL_LANGUAGE_ADVICE",
+                    "review_rubric": rubric, "readability_budget": budget.copy()})
+            else:
+                blocking.append(match)
+        return adjudicated, blocking
     if rubric == LEGACY_REVIEW_RUBRIC:
         return adjudicated, unresolved
     blocking = []
@@ -442,7 +515,7 @@ class ArticleQuality:
             raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
         self.review_rubric = review_rubric
         if (type(allow_registered_terms) is not bool
-                or allow_registered_terms and review_rubric != MEANING_FIRST_REVIEW_RUBRIC):
+                or allow_registered_terms and review_rubric == LEGACY_REVIEW_RUBRIC):
             raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_CONTRACT_INVALID", 409)
         self.allow_registered_terms = allow_registered_terms
         self.scientific_spelling_contract = None
@@ -450,15 +523,14 @@ class ArticleQuality:
             from .scientific_terms import SCIENTIFIC_SPELLING_CONTRACT
             self.scientific_spelling_contract = SCIENTIFIC_SPELLING_CONTRACT
         if reference_contract is None:
-            reference_contract = (REFERENCE_CONTRACT if review_rubric == MEANING_FIRST_REVIEW_RUBRIC
+            reference_contract = (REFERENCE_CONTRACT if review_rubric != LEGACY_REVIEW_RUBRIC
                                   else LEGACY_REFERENCE_CONTRACT)
         # Исторический cycle передаёт V1 явно: обновление кода не меняет replay.
         reference_urls("", contract=reference_contract)
         self.reference_contract = reference_contract
         prompts = Path(prompt_dir) if prompt_dir else Path(__file__).resolve().parents[2] / "prompts"
         self.translation_prompt = (prompts / "ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8")
-        review_file = ("ARTICLE_REVIEW_MEANING_FIRST_V1.txt"
-                       if review_rubric == MEANING_FIRST_REVIEW_RUBRIC else "ARTICLE_REVIEW.txt")
+        review_file = review_prompt_name(review_rubric)
         self.review_prompt = (prompts / review_file).read_text(encoding="utf-8")
         self.review_prompt_hash = hashlib.sha256(self.review_prompt.encode()).hexdigest()
         self.spelling_url = spelling_url
@@ -489,7 +561,7 @@ class ArticleQuality:
 
     def _human_evidence(self, prepared, title, original, reviewed, raw, matches,
                         adjudicated, unresolved, *, fresh_spelling=False):
-        if self.allow_human_rejection or self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC:
+        if self.allow_human_rejection or self.review_rubric != LEGACY_REVIEW_RUBRIC:
             prepared["machine_review_status"] = "passed" if reviewed["approved"] else "rejected"
             prepared["machine_review_evidence"] = {
                 "review_raw": raw, "review": copy.deepcopy(reviewed),
@@ -498,7 +570,7 @@ class ArticleQuality:
                 "spelling_unresolved": copy.deepcopy(unresolved), "hard_gates_passed": True,
                 "text_hash": fingerprint({"title": prepared["title"], "body": prepared["body"]}),
                 "source_hash": fingerprint({"title": title, "body": original, "url": prepared["url"]})}
-            if self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC:
+            if self.review_rubric != LEGACY_REVIEW_RUBRIC:
                 prepared.update(review_rubric=self.review_rubric,
                                 review_prompt_hash=self.review_prompt_hash,
                                 warnings=copy.deepcopy(reviewed["warnings"]))
@@ -637,7 +709,7 @@ class ArticleQuality:
                 raise
             self._emit("spelling_returned", attempt, matches=matches)
             adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric,
-                allow_spacetime=self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC,
+                allow_spacetime=self.review_rubric in {MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC},
                 allow_registered_terms=self.allow_registered_terms)
             self._emit("spelling_adjudicated", attempt, adjudicated=adjudicated, unresolved=unresolved,
                        **self._scientific_marker())
@@ -722,7 +794,7 @@ class ArticleQuality:
             raise
         self._emit("spelling_returned", 1, matches=matches)
         adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric,
-            allow_spacetime=self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC,
+            allow_spacetime=self.review_rubric in {MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC},
             allow_registered_terms=self.allow_registered_terms)
         self._emit("spelling_adjudicated", 1, adjudicated=adjudicated, unresolved=unresolved,
                    **self._scientific_marker())
