@@ -311,7 +311,8 @@ def spacetime_spelling_evidence(original, translated, match):
     return None
 
 
-def adjudicate_scientific_spelling(original, translated, matches, *, allow_spacetime=False):
+def adjudicate_scientific_spelling(original, translated, matches, *, allow_spacetime=False,
+                                  allow_registered_terms=False):
     """Resolve documented exact scientific terms; retain every other LT finding."""
     adjudicated, unresolved = [], []
     for match in matches:
@@ -321,6 +322,9 @@ def adjudicate_scientific_spelling(original, translated, matches, *, allow_space
                     or roni_spelling_evidence(original, translated, match)
                     or (spacetime_spelling_evidence(original, translated, match)
                         if allow_spacetime is True else None))
+        if evidence is None and allow_registered_terms is True:
+            from .scientific_terms import scoped_spelling_evidence
+            evidence = scoped_spelling_evidence(original, translated, match)
         if (isinstance(rule, dict) and rule.get("id") == "MORFOLOGIK_RULE_RU_RU"
                 and rule.get("issueType") == "misspelling"
                 and isinstance(kind, dict) and kind.get("typeName") == "UnknownWord"
@@ -349,12 +353,13 @@ def adjudicate_scientific_spelling(original, translated, matches, *, allow_space
     return adjudicated, unresolved
 
 
-def rubric_spelling(original, translated, matches, rubric, *, allow_spacetime=False):
+def rubric_spelling(original, translated, matches, rubric, *, allow_spacetime=False,
+                    allow_registered_terms=False):
     """Retain style suggestions as audited advice; grammar and unknown rules block."""
     if not isinstance(rubric, str) or rubric not in REVIEW_RUBRICS:
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
     adjudicated, unresolved = adjudicate_scientific_spelling(original, translated, matches,
-                                                           allow_spacetime=allow_spacetime)
+        allow_spacetime=allow_spacetime, allow_registered_terms=allow_registered_terms)
     if rubric == LEGACY_REVIEW_RUBRIC:
         return adjudicated, unresolved
     blocking = []
@@ -418,7 +423,8 @@ def _validated_source(title, original):
 class ArticleQuality:
     def __init__(self, translator, reviewer, spelling_url=SPELLING_URL, transport=None,
                  prompt_dir=None, trace=None, allow_human_rejection=False,
-                 review_rubric=LEGACY_REVIEW_RUBRIC, reference_contract=None):
+                 review_rubric=LEGACY_REVIEW_RUBRIC, reference_contract=None,
+                 allow_registered_terms=False):
         if (translator is reviewer or (
                 getattr(translator, "model", None) and getattr(reviewer, "model", None)
                 and translator.model == reviewer.model)):
@@ -435,6 +441,14 @@ class ArticleQuality:
         if not isinstance(review_rubric, str) or review_rubric not in REVIEW_RUBRICS:
             raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
         self.review_rubric = review_rubric
+        if (type(allow_registered_terms) is not bool
+                or allow_registered_terms and review_rubric != MEANING_FIRST_REVIEW_RUBRIC):
+            raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_CONTRACT_INVALID", 409)
+        self.allow_registered_terms = allow_registered_terms
+        self.scientific_spelling_contract = None
+        if allow_registered_terms:
+            from .scientific_terms import SCIENTIFIC_SPELLING_CONTRACT
+            self.scientific_spelling_contract = SCIENTIFIC_SPELLING_CONTRACT
         if reference_contract is None:
             reference_contract = (REFERENCE_CONTRACT if review_rubric == MEANING_FIRST_REVIEW_RUBRIC
                                   else LEGACY_REFERENCE_CONTRACT)
@@ -469,6 +483,10 @@ class ArticleQuality:
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
             raise AgentError("ARTICLE_SPELLING_UNAVAILABLE", 503) from exc
 
+    def _scientific_marker(self):
+        return ({"scientific_spelling_contract": self.scientific_spelling_contract}
+                if self.allow_registered_terms else {})
+
     def _human_evidence(self, prepared, title, original, reviewed, raw, matches,
                         adjudicated, unresolved, *, fresh_spelling=False):
         if self.allow_human_rejection or self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC:
@@ -489,6 +507,9 @@ class ArticleQuality:
                     parser_contract=review_parser_contract(raw))
                 if fresh_spelling is True:
                     prepared["machine_review_evidence"]["fresh_spelling_contract"] = FRESH_SPACETIME_SPELLING_CONTRACT
+                    if self.allow_registered_terms:
+                        prepared.update(self._scientific_marker())
+                        prepared["machine_review_evidence"].update(self._scientific_marker())
             if self.reference_contract == REFERENCE_CONTRACT:
                 prepared["reference_contract"] = self.reference_contract
                 prepared["machine_review_evidence"]["reference_check"] = article_review_context(
@@ -502,7 +523,8 @@ class ArticleQuality:
         title, original, source = _validated_source(title, original)
         context = {"instruction": self.translation_prompt,
                    "source_untrusted": {"title": title, "body": original, "url": url},
-                   "numeric_tokens_must_match_exactly": sorted(numbers(source))}
+                   "numeric_tokens_must_match_exactly": sorted(numbers(source)),
+                   **self._scientific_marker()}
         if self.reference_contract == REFERENCE_CONTRACT:
             context["reference_contract"] = self.reference_contract
         immutable_candidates = getattr(self.translator, "immutable_candidates", False) is True
@@ -615,8 +637,10 @@ class ArticleQuality:
                 raise
             self._emit("spelling_returned", attempt, matches=matches)
             adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric,
-                allow_spacetime=self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC)
-            self._emit("spelling_adjudicated", attempt, adjudicated=adjudicated, unresolved=unresolved)
+                allow_spacetime=self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC,
+                allow_registered_terms=self.allow_registered_terms)
+            self._emit("spelling_adjudicated", attempt, adjudicated=adjudicated, unresolved=unresolved,
+                       **self._scientific_marker())
             passed = reviewed["approved"] and not reviewed["issues"]
             human_rejection = (self.allow_human_rejection and reviewed["approved"] is False
                                and bool(reviewed["issues"]))
@@ -633,7 +657,7 @@ class ArticleQuality:
             rejected_candidates[text] = copy.deepcopy(context["repair_feedback"])
             self._emit("retry", attempt, feedback=context["repair_feedback"])
         self._emit("rejected", attempt, error="ARTICLE_QUALITY_REJECTED",
-                   feedback=context.get("repair_feedback"))
+                   feedback=context.get("repair_feedback"), **self._scientific_marker())
         raise AgentError("ARTICLE_QUALITY_REJECTED")
 
     def check_candidate(self, title, body, original_title, original, url):
@@ -649,6 +673,7 @@ class ArticleQuality:
         full = text + "\n\n" + article_footer(url)
         self._emit("candidate_started", 1, mode="candidate", candidate={"title": title, "body": body},
                    source_untrusted={"title": original_title, "body": original, "url": url},
+                   **self._scientific_marker(),
                    **({"reference_contract": self.reference_contract}
                       if self.reference_contract == REFERENCE_CONTRACT else {}),
                    **({"candidate_raw": candidate_raw}
@@ -660,7 +685,7 @@ class ArticleQuality:
                 raise AgentError("ARTICLE_POST_TOO_LONG")
         except AgentError as exc:
             self._emit("gate_rejected", 1, error=exc.code, characters=len(full))
-            self._emit("rejected", 1, mode="candidate", error=exc.code)
+            self._emit("rejected", 1, mode="candidate", error=exc.code, **self._scientific_marker())
             raise
         self._emit("gate_passed", 1, characters=len(full))
         review_context = article_review_context(self.review_prompt, source, text,
@@ -677,13 +702,13 @@ class ArticleQuality:
                     self._emit("review_failed", 1, error=exc.code)
                 raise
             self._emit("review_invalid", 1, error=exc.code, raw=raw_review)
-            self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED")
+            self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED", **self._scientific_marker())
             raise AgentError("ARTICLE_QUALITY_REJECTED") from exc
         try:
             normalized = normalize_rubric_review(reviewed, self.review_rubric)
         except AgentError as exc:
             self._emit("review_invalid", 1, error="ARTICLE_REVIEW_SCHEMA_INVALID", review=reviewed)
-            self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED")
+            self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED", **self._scientific_marker())
             raise AgentError("ARTICLE_QUALITY_REJECTED") from exc
         if normalized != reviewed:
             self._emit("review_normalized", 1, raw_review=reviewed, review=normalized)
@@ -697,15 +722,18 @@ class ArticleQuality:
             raise
         self._emit("spelling_returned", 1, matches=matches)
         adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric,
-            allow_spacetime=self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC)
-        self._emit("spelling_adjudicated", 1, adjudicated=adjudicated, unresolved=unresolved)
+            allow_spacetime=self.review_rubric == MEANING_FIRST_REVIEW_RUBRIC,
+            allow_registered_terms=self.allow_registered_terms)
+        self._emit("spelling_adjudicated", 1, adjudicated=adjudicated, unresolved=unresolved,
+                   **self._scientific_marker())
         passed = reviewed["approved"] and not reviewed["issues"]
         human_rejection = (self.allow_human_rejection and reviewed["approved"] is False
                            and bool(reviewed["issues"]))
         if not ((passed or human_rejection) and reviewed["topic"] in TOPICS and not unresolved):
             feedback = {"review_approved": reviewed["approved"], "topic": reviewed["topic"],
                         "review_issues": reviewed["issues"], "spelling_matches": unresolved[:20]}
-            self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED", feedback=feedback)
+            self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED", feedback=feedback,
+                       **self._scientific_marker())
             raise AgentError("ARTICLE_QUALITY_REJECTED")
         prepared = {"title": title, "body": full, "translation": text,
                     "original": source, "url": url, "topic": reviewed["topic"]}

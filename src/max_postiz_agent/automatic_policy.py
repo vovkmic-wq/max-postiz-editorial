@@ -12,12 +12,86 @@ from sqlalchemy.exc import IntegrityError
 
 from .adapters import extract_object
 from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT, reference_urls
-from .config import AgentError, fingerprint, inside
+from .config import AgentError, fingerprint, inside, parse_json
 from .db import Audit, Material, now
 from .hub_models import BridgePost, Dispatch, RemoteDraft, Target, TargetApproval
 from .human_review import candidate_body, machine_current, source_data, text_hash
 
 POLICY_ACTOR = "hourly_article_policy"
+
+
+def scientific_trace_binding(trace_path, contract, *, expected_hash=None, expected_evidence=None,
+                             expected_record_id=None):
+    """Новый словарь действует только в явно помеченном полном fresh trace."""
+    from .scientific_terms import SCIENTIFIC_SPELLING_CONTRACT
+    try:
+        raw = trace_path.read_bytes()
+        if (contract != SCIENTIFIC_SPELLING_CONTRACT or not 0 < len(raw) <= 2 * 1024 * 1024
+                or expected_hash is not None and hashlib.sha256(raw).hexdigest() != expected_hash):
+            raise ValueError
+        lines = raw.decode("utf-8").splitlines()
+        if not 0 < len(lines) <= 10000 or not all(line.strip() for line in lines):
+            raise ValueError
+        events = [parse_json(line) for line in lines]
+        if any(not isinstance(event, dict) for event in events):
+            raise ValueError
+        record_id = expected_record_id if expected_record_id is not None else events[0].get("record_id")
+        if (not isinstance(record_id, str) or not record_id
+                or any(event.get("record_id") != record_id for event in events)):
+            raise ValueError
+        for event in events:
+            phase = event.get("phase")
+            if phase == "translation_started":
+                context = event.get("context")
+                if not isinstance(context, dict) or context.get("scientific_spelling_contract") != contract:
+                    raise ValueError
+            elif phase in {"candidate_started", "spelling_adjudicated", "rejected"}:
+                if event.get("scientific_spelling_contract") != contract:
+                    raise ValueError
+            elif phase == "accepted":
+                result = event.get("result", {})
+                evidence = result.get("machine_review_evidence", {})
+                if (result.get("scientific_spelling_contract") != contract
+                        or evidence.get("scientific_spelling_contract") != contract):
+                    raise ValueError
+            elif phase in {"saved_review_recovery_started", "saved_review_recovery_validated"}:
+                raise ValueError
+        starts = [i for i, event in enumerate(events)
+                  if event.get("phase") in {"translation_started", "candidate_started"}]
+        if not starts:
+            raise ValueError
+        segment = events[starts[-1]:]
+        phases = [event.get("phase") for event in segment]
+        prefix = (["translation_started", "translation_returned", "translation_parsed"]
+                  if phases[0] == "translation_started" else ["candidate_started"])
+        expected = prefix + ["gate_passed", "review_started", "review_returned", "review_parsed",
+                             "spelling_started", "spelling_returned", "spelling_adjudicated", "accepted"]
+        if "review_normalized" in phases:
+            expected.insert(len(prefix) + 3, "review_normalized")
+        if phases != expected:
+            raise ValueError
+        result = segment[-1]["result"]
+        evidence = result["machine_review_evidence"]
+        context = segment[0].get("context") if phases[0] == "translation_started" else segment[0]
+        source = context.get("source_untrusted")
+        review_context = next(event["context"] for event in segment if event["phase"] == "review_started")
+        if (not isinstance(source, dict) or set(source) != {"title", "body", "url"}
+                or result.get("original") != source["title"] + "\n\n" + source["body"]
+                or result.get("url") != source["url"] or evidence.get("source_hash") != fingerprint(source)
+                or review_context.get("source_untrusted") != result["original"]
+                or review_context.get("translation_untrusted") != result.get("translation")
+                or next(event["raw"] for event in segment if event["phase"] == "review_returned") != evidence["review_raw"]
+                or next(event["review"] for event in segment if event["phase"] == "review_parsed") != evidence["review"]
+                or next(event["matches"] for event in segment if event["phase"] == "spelling_returned") != evidence["spelling_matches"]
+                or segment[-2].get("adjudicated") != evidence["spelling_adjudicated"]
+                or segment[-2].get("unresolved") != evidence["spelling_unresolved"]):
+            raise ValueError
+        if expected_evidence is not None:
+            actual = events[-1]["result"]["machine_review_evidence"]
+            if actual != {key: value for key, value in expected_evidence.items() if key != "trace_hash"}:
+                raise ValueError
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError, AttributeError, StopIteration) as exc:
+        raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_BINDING_INVALID", 409) from exc
 
 
 def _validate(evidence, title, body, source):
@@ -26,7 +100,8 @@ def _validate(evidence, title, body, source):
                                   review_parser_contract, rubric_spelling, rubric_translation_gate)
     required = {"review_raw", "review", "spelling_matches", "spelling_adjudicated", "spelling_unresolved",
                 "hard_gates_passed", "text_hash", "source_hash", "review_rubric", "review_prompt_hash", "trace_hash"}
-    optional = {"parser_contract", "protocol_recovery", "fresh_spelling_contract", "reference_check"}
+    optional = {"parser_contract", "protocol_recovery", "fresh_spelling_contract", "reference_check",
+                "scientific_spelling_contract"}
     if (not isinstance(evidence, dict) or not required <= set(evidence) <= required | optional
             or evidence["review_rubric"] != MEANING_FIRST_REVIEW_RUBRIC
             or evidence["hard_gates_passed"] is not True
@@ -38,6 +113,12 @@ def _validate(evidence, title, body, source):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     if "fresh_spelling_contract" in evidence and (
             evidence["fresh_spelling_contract"] != FRESH_SPACETIME_SPELLING_CONTRACT
+            or "protocol_recovery" in evidence):
+        raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
+    from .scientific_terms import SCIENTIFIC_SPELLING_CONTRACT
+    if "scientific_spelling_contract" in evidence and (
+            evidence["scientific_spelling_contract"] != SCIENTIFIC_SPELLING_CONTRACT
+            or evidence.get("fresh_spelling_contract") != FRESH_SPACETIME_SPELLING_CONTRACT
             or "protocol_recovery" in evidence):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     rubric = evidence["review_rubric"]
@@ -76,7 +157,8 @@ def _validate(evidence, title, body, source):
     if not isinstance(matches, list) or any(not isinstance(value, dict) for value in matches):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     adjudicated, unresolved = rubric_spelling(original, candidate, matches, rubric,
-        allow_spacetime=evidence.get("fresh_spelling_contract") == FRESH_SPACETIME_SPELLING_CONTRACT)
+        allow_spacetime=evidence.get("fresh_spelling_contract") == FRESH_SPACETIME_SPELLING_CONTRACT,
+        allow_registered_terms=evidence.get("scientific_spelling_contract") == SCIENTIFIC_SPELLING_CONTRACT)
     if (unresolved or evidence["spelling_adjudicated"] != adjudicated
             or evidence["spelling_unresolved"] != unresolved):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
@@ -91,6 +173,11 @@ def machine_metadata(prepared, source, trace_path):
     if evidence.get("trace_hash", hashed) != hashed:
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     evidence["trace_hash"] = hashed
+    if prepared.get("scientific_spelling_contract") != evidence.get("scientific_spelling_contract"):
+        raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_BINDING_INVALID", 409)
+    if "scientific_spelling_contract" in evidence:
+        scientific_trace_binding(trace_path, evidence["scientific_spelling_contract"], expected_hash=hashed,
+                                 expected_evidence=evidence)
     review = _validate(evidence, prepared["title"], prepared["body"], source)
     if (prepared.get("review_rubric") != evidence["review_rubric"]
             or prepared.get("review_prompt_hash") != evidence["review_prompt_hash"]
@@ -104,6 +191,8 @@ def machine_metadata(prepared, source, trace_path):
             "machine_review_warnings": review["warnings"], "machine_review_evidence": evidence,
             "machine_review_evidence_hash": fingerprint(evidence), "review_rubric": evidence["review_rubric"],
             "review_prompt_hash": evidence["review_prompt_hash"],
+            **({"scientific_spelling_contract": evidence["scientific_spelling_contract"]}
+               if "scientific_spelling_contract" in evidence else {}),
             **({"reference_contract": reference_contract}
                if reference_contract != LEGACY_REFERENCE_CONTRACT else {})}
 
@@ -120,6 +209,7 @@ def automatic_evidence(session, variant):
         if (hashed != variant.metadata_json.get("machine_review_evidence_hash")
                 or variant.metadata_json.get("review_rubric") != evidence["review_rubric"]
                 or variant.metadata_json.get("review_prompt_hash") != evidence["review_prompt_hash"]
+                or variant.metadata_json.get("scientific_spelling_contract") != evidence.get("scientific_spelling_contract")
                 or variant.metadata_json.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
                 != evidence.get("reference_check", {}).get("contract", LEGACY_REFERENCE_CONTRACT)):
             return None
@@ -213,6 +303,8 @@ def _eligible_record(cycle, session, variant, policy, record, *, reserve_unassig
     if automatic_evidence(session, variant) is None:
         raise AgentError("ARTICLE_AUTOMATIC_RECHECK_REQUIRED", 409)
     _reference_binding(session, variant, record)
+    from .article_cycle import scientific_contract_binding
+    scientific_contract_binding(core, session, record, variant)
     from .article_quality import rubric_translation_gate
     source = source_data(session, variant)
     # Даже старый прошедший DRAFT не может отправить повреждённый literal URL.

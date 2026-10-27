@@ -214,6 +214,9 @@ class AutomaticArticleRepair:
             return {key: normalize_article_links(value[key].strip()) for key in ("title", "body")}
 
         try:
+            from .article_cycle import scientific_contract_binding
+            with self.core.db.session() as session:
+                scientific_contract = scientific_contract_binding(self.core, session, record)
             expected = f"data/hourly-articles/quality-{record['id']}.local.jsonl"
             require(record.get("quality_trace") == expected and type(record.get("slot")) is int)
             raw = inside(self.core.settings.root, expected).read_bytes()
@@ -271,12 +274,14 @@ class AutomaticArticleRepair:
             initial = segment[0]["phase"] == "translation_started"
             require(initial == (not bool(attempt.get("candidate_hash"))))
             start_context = segment[0].get("context") if initial else segment[0]
-            require(isinstance(start_context, dict))
+            require(isinstance(start_context, dict)
+                    and start_context.get("scientific_spelling_contract") == scientific_contract)
             reference_contract = start_context.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
             require(reference_contract in REFERENCE_CONTRACTS
                     and attempt.get("reference_contract", LEGACY_REFERENCE_CONTRACT) == reference_contract
                     and record.get("reference_contract", LEGACY_REFERENCE_CONTRACT) == reference_contract)
             require(terminal["phase"] == "rejected" and terminal.get("error") == "ARTICLE_QUALITY_REJECTED"
+                    and terminal.get("scientific_spelling_contract") == scientific_contract
                     and terminal.get("mode") == (None if initial else "candidate"))
             starts = [i for i, e in enumerate(segment[:-1]) if e["phase"] in {"translation_started", "candidate_started"}]
             require(starts and starts[0] == 0 and len(starts) == terminal["attempt"]
@@ -298,6 +303,7 @@ class AutomaticArticleRepair:
                     require(isinstance(context, dict) and context.get("source_untrusted") == source
                             and context.get("instruction") == translation_prompt
                             and context.get("reference_contract", LEGACY_REFERENCE_CONTRACT) == reference_contract
+                            and context.get("scientific_spelling_contract") == scientific_contract
                             and context.get("numeric_tokens_must_match_exactly") == sorted(numbers(original))
                             and isinstance(block[1].get("raw"), str))
                     candidate = fields(extract_object(block[1]["raw"]))
@@ -307,6 +313,7 @@ class AutomaticArticleRepair:
                     retry = tail.pop()
                 else:
                     require(phases[0] == "candidate_started" and block[0].get("mode") == "candidate"
+                            and block[0].get("scientific_spelling_contract") == scientific_contract
                             and block[0].get("reference_contract", LEGACY_REFERENCE_CONTRACT) == reference_contract
                             and block[0].get("source_untrusted") == source)
                     candidate = fields(block[0].get("candidate"))
@@ -359,9 +366,11 @@ class AutomaticArticleRepair:
                         require(parsed.get("review") == reviewed)
                         matches = next(e for e in tail if e["phase"] == "spelling_returned").get("matches")
                         require(isinstance(matches, list) and all(isinstance(m, dict) for m in matches))
-                        adjudicated, unresolved = rubric_spelling(original, translated, matches, "meaning-first-v1", allow_spacetime=True)
+                        adjudicated, unresolved = rubric_spelling(original, translated, matches, "meaning-first-v1",
+                            allow_spacetime=True, allow_registered_terms=scientific_contract is not None)
                         spelling = tail[-1]
-                        require(spelling.get("adjudicated") == adjudicated and spelling.get("unresolved") == unresolved
+                        require(spelling.get("scientific_spelling_contract") == scientific_contract
+                                and spelling.get("adjudicated") == adjudicated and spelling.get("unresolved") == unresolved
                                 and not (reviewed["approved"] is True and not reviewed["issues"]
                                          and reviewed["topic"] in TOPICS and not unresolved))
                         feedback = {"review_approved": reviewed["approved"], "topic": reviewed["topic"],
@@ -382,6 +391,8 @@ class AutomaticArticleRepair:
                        "parent_trace_hash": _sha(raw), "rejected_replay_hashes": sorted(rejected)}
             if reference_contract != LEGACY_REFERENCE_CONTRACT:
                 payload["reference_contract"] = reference_contract
+            if scientific_contract is not None:
+                payload["scientific_spelling_contract"] = scientific_contract
             return payload
         except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError, StopIteration, AgentError, OverflowError) as exc:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409) from exc
@@ -603,6 +614,7 @@ class AutomaticArticleRepair:
         snapshot = parse_json(snapshot_raw.decode("utf-8"))
         references = self._claim_reference(claim)
         if (_sha(snapshot_raw) != claim["snapshot_hash"] or snapshot["article"] != article
+                or snapshot.get("scientific_spelling_contract") != record.get("scientific_spelling_contract")
                 or snapshot.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != references
                 or record.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != references):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)

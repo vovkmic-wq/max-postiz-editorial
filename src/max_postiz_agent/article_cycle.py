@@ -25,12 +25,62 @@ from .hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Targ
 from .reddit import text_hash
 
 
+def scientific_contract_binding(core, session, record, variant=None):
+    """Новую словарную семантику закрепляем до модели, без переоценки истории."""
+    from .scientific_terms import SCIENTIFIC_SPELLING_CONTRACT
+    attempts = record.get("preparation_attempts", [])
+    audits = list(session.scalars(select(Audit).where(
+        Audit.entity == record["id"], Audit.action == "hourly_article_prepare_attempt")))
+    if (not isinstance(attempts, list) or any(not isinstance(a, dict) for a in attempts)
+            or any(not isinstance(a.details, dict) for a in audits)):
+        raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_BINDING_INVALID", 409)
+    marker = record.get("scientific_spelling_contract")
+    markers = [marker, *(a.get("scientific_spelling_contract") for a in attempts),
+               *(a.details.get("scientific_spelling_contract") for a in audits)]
+    evidence = variant.metadata_json.get("machine_review_evidence", {}) if variant else {}
+    if variant:
+        markers.extend((variant.metadata_json.get("scientific_spelling_contract"),
+                        evidence.get("scientific_spelling_contract") if isinstance(evidence, dict) else None))
+    if not any(value is not None for value in markers):
+        return None
+    if (marker != SCIENTIFIC_SPELLING_CONTRACT or not attempts or any(value != marker for value in markers)
+            or any(a.get("number") != number or type(a.get("number")) is not int
+                   or a.get("scientific_spelling_contract") != marker
+                   for number, a in enumerate(attempts, 1))):
+        raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_BINDING_INVALID", 409)
+    for attempt in attempts:
+        matching = [a for a in audits if type(a.details.get("attempt")) is int
+                    and a.details["attempt"] == attempt["number"]]
+        expected = {"scientific_spelling_contract": marker, "source_hash": record.get("original_hash"),
+                    "input_hash": record.get("input_hash"), "policy_hash": record.get("policy_hash"),
+                    "candidate_hash": attempt.get("candidate_hash"), "operator_retry": attempt.get("operator_retry")}
+        if (len(matching) != 1
+                or any(matching[0].details.get(key) != value for key, value in expected.items())):
+            raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_BINDING_INVALID", 409)
+    if variant:
+        if (not isinstance(evidence, dict)
+                or variant.metadata_json.get("scientific_spelling_contract") != marker
+                or evidence.get("scientific_spelling_contract") != marker):
+            raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_BINDING_INVALID", 409)
+        from .automatic_policy import scientific_trace_binding
+        trace = inside(core.settings.root, record.get("quality_trace", ""))
+        scientific_trace_binding(trace, marker, expected_hash=evidence.get("trace_hash"), expected_evidence=evidence,
+                                 expected_record_id=record["id"])
+    return marker
+
+
 class HourlyArticleCycle:
     """A private durable ledger stops interrupted operations instead of replaying them."""
 
-    def __init__(self, core, quality_factory=None, repair_factory=None, *, reserve_mode=False):
+    def __init__(self, core, quality_factory=None, repair_factory=None, *, reserve_mode=False,
+                 scientific_spelling_contract=None):
         self.core, self.quality_factory, self.repair_factory = core, quality_factory, repair_factory
         self.reserve_mode = reserve_mode
+        if scientific_spelling_contract is not None:
+            from .scientific_terms import SCIENTIFIC_SPELLING_CONTRACT
+            if scientific_spelling_contract != SCIENTIFIC_SPELLING_CONTRACT:
+                raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_CONTRACT_INVALID", 409)
+        self.scientific_spelling_contract = scientific_spelling_contract
         self.directory = inside(core.settings.root, "data/hourly-articles")
         self.directory.mkdir(parents=True, exist_ok=True)
         self.ledger_path = self.directory / "ledger.local.json"
@@ -275,6 +325,13 @@ class HourlyArticleCycle:
         from .article_quality import ArticleQuality
         from .translation import AUTOMATIC_TRANSLATION_MODELS, DedicatedTranslator, configured_translator
         reference_contract = self._quality_reference_contract(record_id)
+        records = [r for r in self._load()["records"] if r.get("id") == record_id]
+        if len(records) > 1:
+            raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_BINDING_INVALID", 409)
+        scientific_contract = None
+        if records:
+            with self.core.db.session() as session:
+                scientific_contract = scientific_contract_binding(self.core, session, records[0])
         with ExitStack() as cleanup:
             if review_only:
                 from .human_review import CandidateOnlyTranslator
@@ -305,7 +362,8 @@ class HourlyArticleCycle:
                                      trace=self._trace_writer(record_id) if record_id else None,
                                      allow_human_rejection=human_mode,
                                      review_rubric="meaning-first-v1" if mode == "automatic" else "legacy",
-                                     reference_contract=reference_contract)
+                                     reference_contract=reference_contract,
+                                     allow_registered_terms=scientific_contract is not None)
             cleanup.pop_all()
             return quality
 
@@ -536,6 +594,7 @@ class HourlyArticleCycle:
             segment = segments[0]
             terminal = segment[-1]
             if (terminal.get("error") != "ARTICLE_QUALITY_REJECTED" or terminal.get("mode") is not None
+                    or terminal.get("scientific_spelling_contract") != record.get("scientific_spelling_contract")
                     or terminal["attempt"] > 3):
                 raise ValueError
             prompt = (self.core.settings.root / "prompts/ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8")
@@ -565,6 +624,7 @@ class HourlyArticleCycle:
                                       "body": bound_article["original"].strip()}
                         or context.get("instruction") != prompt
                         or context.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract
+                        or context.get("scientific_spelling_contract") != record.get("scientific_spelling_contract")
                         or context.get("numeric_tokens_must_match_exactly") != sorted(numbers(source["title"] + "\n\n" + source["body"]))):
                     raise ValueError
                 if not isinstance(block[1].get("raw"), str):
@@ -764,6 +824,11 @@ class HourlyArticleCycle:
                 # последующей коррекции; старые записи без поля остаются V1.
                 if policy.get("approval_mode") == "automatic" and REFERENCE_CONTRACT != LEGACY_REFERENCE_CONTRACT:
                     record["reference_contract"] = REFERENCE_CONTRACT
+                if policy.get("approval_mode") == "automatic" and (
+                        self.scientific_spelling_contract is not None
+                        or not self.quality_factory and getattr(self._quality, "__func__", None) is HourlyArticleCycle._quality):
+                    from .scientific_terms import SCIENTIFIC_SPELLING_CONTRACT
+                    record["scientific_spelling_contract"] = SCIENTIFIC_SPELLING_CONTRACT
                 ledger["records"].append(record)
                 from .article_repair_cycle import capture_input
                 capture_input(self, record, article)
@@ -783,6 +848,11 @@ class HourlyArticleCycle:
                         or record["reference_contract"] not in REFERENCE_CONTRACTS):
                     raise AgentError("ARTICLE_REFERENCE_CONTRACT_INVALID", 409)
                 attempt["reference_contract"] = record["reference_contract"]
+            if "scientific_spelling_contract" in record:
+                from .scientific_terms import SCIENTIFIC_SPELLING_CONTRACT
+                if record["scientific_spelling_contract"] != SCIENTIFIC_SPELLING_CONTRACT:
+                    raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_CONTRACT_INVALID", 409)
+                attempt["scientific_spelling_contract"] = record["scientific_spelling_contract"]
             if candidate is not None:
                 attempt.update(candidate_hash=self._candidate_hash(candidate), operator_correction=not bool(repair_claim),
                                candidate_normalization="article-links-v1",
@@ -805,8 +875,12 @@ class HourlyArticleCycle:
                         candidate_hash=attempt.get("candidate_hash"), operator_correction=attempt.get("operator_correction", False),
                         automatic_repair_claim=automatic_repair_claim,
                         **({"reference_contract": attempt["reference_contract"]}
-                           if "reference_contract" in attempt else {}))
+                           if "reference_contract" in attempt else {}),
+                        **({"scientific_spelling_contract": attempt["scientific_spelling_contract"]}
+                           if "scientific_spelling_contract" in attempt else {}))
                 quality = self._quality(record["id"])
+                if getattr(quality, "scientific_spelling_contract", None) != record.get("scientific_spelling_contract"):
+                    raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_BINDING_INVALID", 409)
                 prepared = (quality.check_candidate(candidate["title"], candidate["body"], article["title"],
                     article["original"], article["url"]) if candidate is not None else
                     quality.prepare(article["title"], article["original"], article["url"]))
@@ -901,6 +975,7 @@ class HourlyArticleCycle:
                     "translation_hash": translation_hash})
             session.add(variant)
             session.flush()
+            scientific_contract_binding(self.core, session, record, variant)
             self.core._history(session, variant, target, "article_quality")
             # Generation and database work may cross the reserved hour.
             # Raising inside the transaction rolls back every generated entity.
