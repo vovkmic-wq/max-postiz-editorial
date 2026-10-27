@@ -147,7 +147,7 @@ class AutomaticArticleRepair:
     def _claim_reference(claim):
         """V6/V7 хранят marker; прежние claims остаются без нового поля."""
         expected = repair_reference_contract(claim["contract"])
-        if ((claim["contract"] in {"article-repair-v6", "article-repair-v7"}) != ("reference_contract" in claim)
+        if ((claim["contract"] in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}) != ("reference_contract" in claim)
                 or claim.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != expected):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         return expected
@@ -433,7 +433,7 @@ class AutomaticArticleRepair:
             "old_candidate_hash": fingerprint(snapshot["candidate"]),
             "old_replay_hash": repair_replay_hash(snapshot["candidate"]),
             "feedback_hash": fingerprint(snapshot["feedback"])}
-        if claim["contract"] in {"article-repair-v6", "article-repair-v7"}:
+        if claim["contract"] in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}:
             expected["reference_contract"] = self._claim_reference(claim)
         article = snapshot["article"]
         expected_context = repair_context(article, snapshot["candidate"], snapshot["feedback"],
@@ -703,7 +703,7 @@ class AutomaticArticleRepair:
                 "source_config_hash": fingerprint(source),
                 "repair_trace": f"data/hourly-articles/repair-{claim_id}.local.jsonl",
                 "owner_authorization": "2026-10-22 bounded automatic translation corrections"}
-            if REPAIR_CONTRACT in {"article-repair-v6", "article-repair-v7"}:
+            if REPAIR_CONTRACT in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}:
                 claim["reference_contract"] = payload["reference_contract"]
             try:
                 with self.core.db.session.begin() as session:
@@ -744,7 +744,7 @@ class AutomaticArticleRepair:
                     "old_candidate_hash": fingerprint(payload["candidate"]),
                     "old_replay_hash": repair_replay_hash(payload["candidate"]),
                     "feedback_hash": fingerprint(payload["feedback"])}
-                if claim["contract"] in {"article-repair-v6", "article-repair-v7"}:
+                if claim["contract"] in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}:
                     expected_binding["reference_contract"] = self._claim_reference(claim)
                 times = [e.get("at") for e in repair_events]
                 if (not 0 < len(repair_raw) <= 512 * 1024

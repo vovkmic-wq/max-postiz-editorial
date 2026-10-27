@@ -507,7 +507,7 @@ def markdown_repair_case():
     return article, output, url
 
 
-@pytest.mark.parametrize("contract", ["article-repair-v4", "article-repair-v5", "article-repair-v6", "article-repair-v7"])
+@pytest.mark.parametrize("contract", ["article-repair-v4", "article-repair-v5", "article-repair-v6", "article-repair-v7", "article-repair-v8"])
 def test_modern_contract_normalizes_safe_markdown_before_diff_hashes_and_gates_and_retains_the_full_raw(contract):
     article, output, url = markdown_repair_case()
     untouched = copy.deepcopy((article, output, CANDIDATE, FEEDBACK))
@@ -546,7 +546,7 @@ def test_legacy_v3_keeps_the_same_markdown_response_rejected_without_new_evidenc
     assert events[1]["raw"] == json.dumps(output, ensure_ascii=False)
 
 
-@pytest.mark.parametrize("contract", ["article-repair-v4", "article-repair-v5", "article-repair-v6", "article-repair-v7"])
+@pytest.mark.parametrize("contract", ["article-repair-v4", "article-repair-v5", "article-repair-v6", "article-repair-v7", "article-repair-v8"])
 @pytest.mark.parametrize("link", [
     "[подпись](javascript:alert(1))", "[подпись](data:text/html,unsafe)",
     "[подпись](ftp://science.example.org/)", "[подпись](//science.example.org/)",
@@ -570,7 +570,7 @@ def test_modern_contract_never_discards_unsafe_malformed_nested_or_image_wrapper
     assert events[-1]["phase"] == "repair_failed"
 
 
-@pytest.mark.parametrize("contract", ["article-repair-v4", "article-repair-v5", "article-repair-v6", "article-repair-v7"])
+@pytest.mark.parametrize("contract", ["article-repair-v4", "article-repair-v5", "article-repair-v6", "article-repair-v7", "article-repair-v8"])
 @pytest.mark.parametrize("change,error", [
     ("href", "TRANSLATION_REFERENCE_CHANGED"), ("lost_href", "TRANSLATION_REFERENCE_CHANGED"),
     ("number", "TRANSLATION_NUMBER_CHANGED"), ("language", "TRANSLATION_NOT_RUSSIAN"),
@@ -594,7 +594,7 @@ def test_modern_canonicalization_preserves_the_existing_source_number_language_a
     assert not any(event["phase"] == "repair_candidate" for event in events)
 
 
-@pytest.mark.parametrize("contract", ["article-repair-v4", "article-repair-v5", "article-repair-v6", "article-repair-v7"])
+@pytest.mark.parametrize("contract", ["article-repair-v4", "article-repair-v5", "article-repair-v6", "article-repair-v7", "article-repair-v8"])
 @pytest.mark.parametrize("blocked", [False, True])
 def test_modern_markdown_and_whitespace_alone_do_not_renew_an_unchanged_or_rejected_candidate(blocked, contract):
     article, output, _ = markdown_repair_case()
@@ -609,7 +609,7 @@ def test_modern_markdown_and_whitespace_alone_do_not_renew_an_unchanged_or_rejec
     assert len(editor.calls) == 1 and events[-1]["phase"] == "repair_failed"
 
 
-@pytest.mark.parametrize("contract", ["article-repair-v4", "article-repair-v5", "article-repair-v6", "article-repair-v7"])
+@pytest.mark.parametrize("contract", ["article-repair-v4", "article-repair-v5", "article-repair-v6", "article-repair-v7", "article-repair-v8"])
 def test_modern_length_bounds_apply_to_canonical_text_while_raw_remains_bounded(contract):
     url = "https://science.example.org/"
     article = {**ARTICLE, "original": ARTICLE["original"] + " Details: " + url}
@@ -628,7 +628,7 @@ def test_modern_length_bounds_apply_to_canonical_text_while_raw_remains_bounded(
     assert len(result["raw"].encode("utf-8")) <= MAX_RESPONSE_BYTES
 
 
-@pytest.mark.parametrize("contract", [None, False, [], "article-repair-v2", "article-repair-v8"])
+@pytest.mark.parametrize("contract", [None, False, [], "article-repair-v2", "article-repair-v9"])
 def test_unknown_repair_contract_is_blocked_before_any_editor_request(contract):
     editor = Editor(changed())
     with pytest.raises(AgentError, match="ARTICLE_REPAIR_CONTRACT_INVALID"):
@@ -638,14 +638,14 @@ def test_unknown_repair_contract_is_blocked_before_any_editor_request(contract):
 
 @pytest.mark.parametrize("contract", sorted(REPAIR_CONTRACTS))
 def test_contract_selects_exact_prompt_and_legacy_prompt_stays_unchanged(contract):
-    assert REPAIR_CONTRACT == "article-repair-v7"
+    assert REPAIR_CONTRACT == "article-repair-v8"
     prompts = Path(__file__).resolve().parents[1] / "prompts"
     old_prompt = (prompts / "ARTICLE_REPAIR.txt").read_text(encoding="utf-8")
     assert hashlib.sha256(old_prompt.encode()).hexdigest() == "9a8a3543e63173d6a51d81153561cebea0ba726b0e9e22f347f8a0c8c8fc5040"
     assert hashlib.sha256((prompts / "ARTICLE_REPAIR_V5.txt").read_bytes()).hexdigest() == "80102f3d47a88e3e6589284ea45b755b64dbb7586a3885ee7d4c48413fd52ad0"
     expected_name = {"article-repair-v5": "ARTICLE_REPAIR_V5.txt",
                      "article-repair-v6": "ARTICLE_REPAIR_V6.txt",
-                     "article-repair-v7": "ARTICLE_REPAIR_V7.txt"}.get(contract, "ARTICLE_REPAIR.txt")
+                     "article-repair-v7": "ARTICLE_REPAIR_V7.txt", "article-repair-v8": "ARTICLE_REPAIR_V8.txt"}.get(contract, "ARTICLE_REPAIR.txt")
     assert repair_prompt_name(contract) == expected_name
     result, editor, events = propose(changed()["candidate"], contract=contract)
     instruction = editor.calls[0].split("\n\nUNTRUSTED_JSON_DATA:\n", 1)[0]
@@ -653,8 +653,8 @@ def test_contract_selects_exact_prompt_and_legacy_prompt_stays_unchanged(contrac
     assert result["evidence"]["prompt_hash"] == hashlib.sha256(instruction.encode()).hexdigest()
     assert events[0]["binding"]["prompt_hash"] == result["evidence"]["prompt_hash"]
     assert ("reference_url_manifest" in instruction) == (contract in {
-        "article-repair-v5", "article-repair-v6", "article-repair-v7"})
-    if contract in {"article-repair-v5", "article-repair-v6", "article-repair-v7"}:
+        "article-repair-v5", "article-repair-v6", "article-repair-v7", "article-repair-v8"})
+    if contract in {"article-repair-v5", "article-repair-v6", "article-repair-v7", "article-repair-v8"}:
         assert "Числовой токен может находиться внутри URL" in instruction
         assert "ЦЕЛЫЙ исходный" in instruction and "не добавляй отдельное число" in instruction
 
@@ -759,7 +759,7 @@ def balanced_reference_case():
     return article, previous, corrected, url, malformed
 
 
-@pytest.mark.parametrize("contract", ["article-repair-v6", "article-repair-v7"])
+@pytest.mark.parametrize("contract", ["article-repair-v6", "article-repair-v7", "article-repair-v8"])
 def test_modern_repairs_a_malformed_reference_using_the_full_exact_source_and_keeps_raw(contract):
     article, previous, output, url, malformed = balanced_reference_case()
     before = copy.deepcopy((article, previous, output))
@@ -778,7 +778,7 @@ def test_modern_repairs_a_malformed_reference_using_the_full_exact_source_and_ke
     assert (article, previous, output) == before and len(editor.calls) == 1
 
 
-@pytest.mark.parametrize("contract", ["article-repair-v6", "article-repair-v7"])
+@pytest.mark.parametrize("contract", ["article-repair-v6", "article-repair-v7", "article-repair-v8"])
 @pytest.mark.parametrize("changed_url", [
     "https://science.example.org/Asterism_(astronomy",
     "https://science.example.org/Asterism_(astronomy)?mode=wrong#definition",
@@ -815,5 +815,5 @@ def test_historical_v5_prefix_only_gate_replays_exactly_but_v6_blocks_the_same_r
 
 @pytest.mark.parametrize("contract", sorted(REPAIR_CONTRACTS))
 def test_reference_extractor_contract_is_explicit_for_each_repair_protocol(contract):
-    expected = REFERENCE_CONTRACT if contract in {"article-repair-v6", "article-repair-v7"} else LEGACY_REFERENCE_CONTRACT
+    expected = REFERENCE_CONTRACT if contract in {"article-repair-v6", "article-repair-v7", "article-repair-v8"} else LEGACY_REFERENCE_CONTRACT
     assert repair_reference_contract(contract) == expected

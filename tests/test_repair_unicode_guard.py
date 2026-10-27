@@ -1,4 +1,4 @@
-"""V7 запрещает латинскую маску до новой QA; V3–V6 читаются прежним кодом."""
+"""V7/V8 запрещают латинскую маску до QA; V3–V6 читаются прежним кодом."""
 import copy
 import hashlib
 import json
@@ -25,18 +25,19 @@ def named_case(before="Хоралек", after="Хорáлек"):
     return article, previous, candidate
 
 
+@pytest.mark.parametrize("contract", ["article-repair-v7", "article-repair-v8"])
 @pytest.mark.parametrize("after", ["Хорáлек", "Хорaлек", "Horalek", "Horálek", "Hóralek"])
-def test_v7_blocks_full_and_mixed_latin_in_actual_diff_before_fresh_quality(after):
+def test_strict_contracts_block_full_and_mixed_latin_in_actual_diff_before_fresh_quality(after, contract):
     article, previous, candidate = named_case(after=after)
     editor, events = Editor(candidate), []
     with pytest.raises(AgentError, match="ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"):
-        ArticleRepair(editor, trace=events.append).propose(article, previous, FEEDBACK)
-    assert REPAIR_CONTRACT == "article-repair-v7"
+        ArticleRepair(editor, trace=events.append, contract=contract).propose(article, previous, FEEDBACK)
+    assert REPAIR_CONTRACT == "article-repair-v8"
     assert len(editor.calls) == 1
     assert [event["phase"] for event in events] == ["repair_started", "repair_returned", "repair_failed"]
     assert events[1]["raw"] == json.dumps(candidate, ensure_ascii=False)
     assert events[-1]["error"] == "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"
-    assert events[0]["binding"]["contract"] == "article-repair-v7"
+    assert events[0]["binding"]["contract"] == contract
     assert events[0]["binding"]["reference_contract"] == REFERENCE_CONTRACT
 
 
@@ -57,14 +58,15 @@ def test_historical_contracts_replay_the_same_mixed_candidate_and_exact_old_evid
     assert _latin_mask("Хоралек", "Хорáлек", guard_mixed=True) is True
 
 
-def test_v7_rejects_mixed_latin_in_model_report_even_when_actual_candidate_is_cyrillic():
+@pytest.mark.parametrize("contract", ["article-repair-v7", "article-repair-v8"])
+def test_strict_contracts_reject_mixed_latin_in_model_report_even_when_actual_candidate_is_cyrillic(contract):
     article, previous, _ = named_case()
     candidate = {**previous, "body": previous["body"].replace("изучила", "изучили")}
     output = {"candidate": candidate, "changes": [{"field": "body", "before": "Хоралек", "after": "Хорáлек",
         "source_quote": "Petr Horalek", "reason": "Восстановлено написание имени по английскому оригиналу."}]}
     editor, events = Editor(output), []
     with pytest.raises(AgentError, match="ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"):
-        ArticleRepair(editor, trace=events.append).propose(article, previous, FEEDBACK)
+        ArticleRepair(editor, trace=events.append, contract=contract).propose(article, previous, FEEDBACK)
     assert events[-1]["error"] == "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN" and len(editor.calls) == 1
 
 
@@ -76,12 +78,13 @@ def test_v7_allows_cyrillic_typos_and_existing_unicode_latin_names(before, after
     assert _latin_mask(before, after, guard_mixed=True) is False
 
 
-def test_v7_candidate_keeps_unchanged_latin_name_and_acronym_while_correcting_cyrillic_typo():
+@pytest.mark.parametrize("contract", ["article-repair-v7", "article-repair-v8"])
+def test_strict_contracts_keep_unchanged_latin_name_and_acronym_while_correcting_cyrillic_typo(contract):
     article, previous, _ = named_case()
     previous["body"] += " NASA и Horálek сохранены."
     candidate = {**previous, "body": previous["body"].replace("изучила", "изучили")}
     editor = Editor(candidate)
-    result = ArticleRepair(editor).propose(article, previous, FEEDBACK)
+    result = ArticleRepair(editor, contract=contract).propose(article, previous, FEEDBACK)
     assert result["candidate"] == candidate and len(editor.calls) == 1
 
 
@@ -114,14 +117,24 @@ def mixed_repair_cycle(automatic_cycle, monkeypatch):
     return value
 
 
-def test_new_v7_complete_mixed_response_is_quarantined_without_min_lt_or_retry(mixed_repair_cycle):
+@pytest.mark.parametrize("contract", ["article-repair-v7", "article-repair-v8"])
+def test_strict_complete_mixed_response_is_quarantined_without_min_lt_or_retry(mixed_repair_cycle, monkeypatch, contract):
     value = mixed_repair_cycle
+    import max_postiz_agent.article_repair_cycle as protocol
+    original_factory = value.cycle.repair_factory
+
+    def factory(trace):
+        editor = original_factory(trace).editor
+        return ArticleRepair(editor, trace=trace, prompt_dir=value.core.settings.root / "prompts", contract=contract)
+
+    monkeypatch.setattr(protocol, "REPAIR_CONTRACT", contract)
+    monkeypatch.setattr(value.cycle, "repair_factory", factory)
     original_record = copy.deepcopy(current(value))
     with pytest.raises(AgentError, match="ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"):
         value.cycle.repair_rejected(value.initial["id"])
     saved = current(value)
     claim = saved["automatic_repair_attempts"][-1]
-    assert claim["contract"] == "article-repair-v7" and claim["reference_contract"] == REFERENCE_CONTRACT
+    assert claim["contract"] == contract and claim["reference_contract"] == REFERENCE_CONTRACT
     assert claim["state"] == "not_repairable" and claim["outcome_origin"] == "protocol_guard"
     assert claim["error"] == "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"
     assert saved["error"] == "ARTICLE_QUALITY_REJECTED" and MAX_AUTOMATIC_REPAIRS == 2
@@ -131,7 +144,8 @@ def test_new_v7_complete_mixed_response_is_quarantined_without_min_lt_or_retry(m
     events = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
     assert [event["phase"] for event in events] == ["repair_started", "repair_returned", "repair_failed"]
     assert json.loads(events[1]["raw"]) == value.controls.output
-    assert "ARTICLE_REPAIR_V7.txt" in claim["prompts"] and "ARTICLE_REPAIR_V6.txt" not in claim["prompts"]
+    assert set(claim["prompts"]) == {"ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt",
+                                     repair_prompt_name(contract)}
     assert value.trace.read_bytes() == value.initial_trace
     assert saved["preparation_attempts"] == original_record["preparation_attempts"]
     with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_NOT_REPAIRABLE"):

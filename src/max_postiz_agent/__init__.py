@@ -1,3 +1,3 @@
 """MAX channel agent: deterministic service with an OpenCode editorial adapter."""
 
-__version__ = "0.10.4"
+__version__ = "0.10.5"

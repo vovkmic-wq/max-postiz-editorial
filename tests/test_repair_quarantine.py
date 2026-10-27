@@ -618,19 +618,19 @@ def test_legacy_failed_claim_uses_its_old_prompt_and_context_after_v5_upgrade(
     no_delivery(value)
 
 
-def test_new_claim_binds_v7_prompt_and_exact_reference_manifest(linked_repair_cycle):
+def test_new_claim_binds_v8_prompt_and_exact_reference_manifest(linked_repair_cycle):
     value = linked_repair_cycle
     with pytest.raises(AgentError, match="TRANSLATION_REFERENCE_CHANGED"):
         value.cycle.repair_rejected(value.initial["id"])
     saved = current(value)
     claim = saved["automatic_repair_attempts"][-1]
-    assert claim["contract"] == "article-repair-v7" and claim["reference_contract"] == REFERENCE_CONTRACT
+    assert claim["contract"] == "article-repair-v8" and claim["reference_contract"] == REFERENCE_CONTRACT
     assert set(claim["prompts"]) == {"ARTICLE_TRANSLATE.txt", "ARTICLE_REVIEW_MEANING_FIRST_V1.txt",
-                                     "ARTICLE_REPAIR_V7.txt"}
+                                     "ARTICLE_REPAIR_V8.txt"}
     assert claim["prompts"] == AutomaticArticleRepair(value.cycle)._prompts()
     events = [json.loads(line) for line in
               (value.core.settings.root / claim["repair_trace"]).read_text(encoding="utf-8").splitlines()]
-    assert events[0]["binding"]["prompt_hash"] == claim["prompts"]["ARTICLE_REPAIR_V7.txt"]
+    assert events[0]["binding"]["prompt_hash"] == claim["prompts"]["ARTICLE_REPAIR_V8.txt"]
     assert events[0]["binding"]["reference_contract"] == REFERENCE_CONTRACT
     assert events[0]["context"]["reference_url_manifest"] == {"contract": REFERENCE_CONTRACT,
         "required_urls": [REFERENCE], "current_urls": [REFERENCE], "missing_urls": [], "unexpected_urls": []}
@@ -638,8 +638,8 @@ def test_new_claim_binds_v7_prompt_and_exact_reference_manifest(linked_repair_cy
     old_prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR.txt"
     old_prompt.write_bytes(old_prompt.read_bytes() + b"\nUnrelated legacy prompt revision.\n")
     assert value.cycle.automatic_repair_status(saved)["reason"] == "NOT_REPAIRABLE"
-    prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V7.txt"
-    prompt.write_bytes(prompt.read_bytes() + b"\nChanged after saved v7 claim.\n")
+    prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V8.txt"
+    prompt.write_bytes(prompt.read_bytes() + b"\nChanged after saved v8 claim.\n")
     assert value.cycle.automatic_repair_status(saved)["reason"] == "TRACE_INVALID"
     assert current(value) == saved
     assert value.counts == {"hy": 1, "min": 1, "lt": 1, "qwen": 1}
@@ -647,7 +647,8 @@ def test_new_claim_binds_v7_prompt_and_exact_reference_manifest(linked_repair_cy
 
 
 @pytest.mark.parametrize("contract", ["article-repair-v3", "article-repair-v4", "article-repair-v5"])
-def test_old_no_change_is_not_resampled_with_v7_prompt(legacy_repair_cycle, monkeypatch, contract):
+@pytest.mark.parametrize("future_prompt", ["ARTICLE_REPAIR_V7.txt", "ARTICLE_REPAIR_V8.txt"])
+def test_old_no_change_is_not_resampled_with_future_prompt(legacy_repair_cycle, monkeypatch, contract, future_prompt):
     value = legacy_repair_cycle
     value.controls.output = lambda context: context["candidate_untrusted"]
     with monkeypatch.context() as previous:
@@ -662,7 +663,7 @@ def test_old_no_change_is_not_resampled_with_v7_prompt(legacy_repair_cycle, monk
                                      repair_prompt_name(contract)}
     trace = value.core.settings.root / claim["repair_trace"]
     raw = trace.read_bytes()
-    prompt = value.core.settings.root / "prompts/ARTICLE_REPAIR_V7.txt"
+    prompt = value.core.settings.root / "prompts" / future_prompt
     prompt.write_bytes(prompt.read_bytes() + b"\nFuture-only prompt revision.\n")
     assert value.cycle.automatic_repair_status(before)["reason"] == "NO_CHANGE"
     with pytest.raises(AgentError, match="ARTICLE_AUTOMATIC_REPAIR_NO_CHANGE"):
