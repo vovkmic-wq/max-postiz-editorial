@@ -22,9 +22,9 @@ from .article_quality import (
 from .config import AgentError, fingerprint, parse_json
 from .editorial import numbers
 
-REPAIR_CONTRACT = "article-repair-v6"
+REPAIR_CONTRACT = "article-repair-v7"
 LEGACY_REPAIR_CONTRACT = "article-repair-v3"
-_LINK_CANONICAL_CONTRACTS = frozenset({"article-repair-v4", "article-repair-v5", "article-repair-v6"})
+_LINK_CANONICAL_CONTRACTS = frozenset({"article-repair-v4", "article-repair-v5", "article-repair-v6", "article-repair-v7"})
 REPAIR_CONTRACTS = frozenset({LEGACY_REPAIR_CONTRACT, *_LINK_CANONICAL_CONTRACTS})
 REPAIR_MODEL = "proxmox/qwen35-9b"
 MAX_FEEDBACK_BYTES = 128 * 1024
@@ -48,13 +48,14 @@ def repair_prompt_name(contract):
     _require(isinstance(contract, str) and contract in REPAIR_CONTRACTS,
              "ARTICLE_REPAIR_CONTRACT_INVALID")
     return {"article-repair-v5": "ARTICLE_REPAIR_V5.txt",
-            "article-repair-v6": "ARTICLE_REPAIR_V6.txt"}.get(contract, "ARTICLE_REPAIR.txt")
+            "article-repair-v6": "ARTICLE_REPAIR_V6.txt",
+            "article-repair-v7": "ARTICLE_REPAIR_V7.txt"}.get(contract, "ARTICLE_REPAIR.txt")
 
 
 def repair_reference_contract(contract):
     """Новый extractor не меняет воспроизведение прежних трёх протоколов."""
     repair_prompt_name(contract)
-    return "article-links-v2" if contract == "article-repair-v6" else LEGACY_REFERENCE_CONTRACT
+    return "article-links-v2" if contract in {"article-repair-v6", "article-repair-v7"} else LEGACY_REFERENCE_CONTRACT
 
 
 def repair_context(article, candidate, feedback, *, contract=REPAIR_CONTRACT):
@@ -66,7 +67,7 @@ def repair_context(article, candidate, feedback, *, contract=REPAIR_CONTRACT):
                "candidate_untrusted": copy.deepcopy(candidate),
                "feedback_untrusted": copy.deepcopy(feedback),
                "numeric_tokens_must_match_exactly": sorted(numbers(source))}
-    if contract in {"article-repair-v5", "article-repair-v6"}:
+    if contract in {"article-repair-v5", "article-repair-v6", "article-repair-v7"}:
         # Диагностика использует тот же literal parser, что и hard gate.
         # Список помогает редактору; код не дописывает ссылки в его ответ.
         references = repair_reference_contract(contract)
@@ -95,14 +96,16 @@ def _text_fields(value, *, title_limit, body_limit, code):
              and "Перевод и редактура с помощью нейросетей." not in value["body"], code)
 
 
-def _latin_mask(before, after):
+def _latin_mask(before, after, *, guard_mixed=False):
     """Смена алфавита неизвестного слова не считается исправлением словаря."""
     old, new = (re.findall(r"[^\W\d_]+", value) for value in (before, after))
     for operation, left, right, start, end in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
         if (operation == "replace" and 1 <= right - left <= 4 and 1 <= end - start <= 4
                 and all(re.fullmatch(r"[А-Яа-яЁё]+", token) for token in old[left:right])
-                and all(all(unicodedata.name(char, "").startswith("LATIN ") for char in token)
-                        for token in new[start:end])):
+                and (any(any(unicodedata.name(char, "").startswith("LATIN ") for char in token)
+                         for token in new[start:end]) if guard_mixed else
+                     all(all(unicodedata.name(char, "").startswith("LATIN ") for char in token)
+                         for token in new[start:end]))):
             return True
     return False
 
@@ -131,7 +134,7 @@ def _json_data(value, limit):
         raise AgentError("ARTICLE_REPAIR_INPUT_INVALID", 409) from exc
 
 
-def _actual_diff(previous, candidate):
+def _actual_diff(previous, candidate, *, contract=REPAIR_CONTRACT):
     """Полный diff вычисляется кодом; self-report модели не задаёт его полноту."""
     actual, mappings = [], {}
     for field in ("title", "body"):
@@ -148,7 +151,8 @@ def _actual_diff(previous, candidate):
             cursor = right
         parts.append(old[cursor:])
         _require("".join(parts) == new, "ARTICLE_REPAIR_PATCH_INVALID")
-        _require(not _latin_mask(old, new), "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN")
+        _require(not _latin_mask(old, new, guard_mixed=contract == "article-repair-v7"),
+                 "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN")
     return actual, mappings
 
 
@@ -234,7 +238,7 @@ def _patch_candidate(previous, output, source, *, contract=REPAIR_CONTRACT):
     _text_fields(candidate, title_limit=500, body_limit=3500, code=code)
     _require(all(value == normalize_article_links(value.strip()) for value in candidate.values()), code)
     _require(isinstance(changes, list) and len(changes) <= MAX_CHANGES, code)
-    actual, mappings = _actual_diff(previous, candidate)
+    actual, mappings = _actual_diff(previous, candidate, contract=contract)
     spans = {"title": [], "body": []}
     for change in changes:
         _require(isinstance(change, dict)
@@ -249,7 +253,8 @@ def _patch_candidate(previous, output, source, *, contract=REPAIR_CONTRACT):
                  and 10 <= len(reason.strip()) <= 1000, code)
         # Консервативно отклоняем даже потенциально верный original-name вариант:
         # его нельзя использовать как автоматическое подавление словаря LT.
-        _require(not _latin_mask(before, after), "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN")
+        _require(not _latin_mask(before, after, guard_mixed=contract == "article-repair-v7"),
+                 "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN")
         _require(previous[field].count(before) == 1, code)
         start = previous[field].index(before)
         end = start + len(before)
@@ -311,7 +316,7 @@ class ArticleRepair:
         binding = {"contract": self.contract, "model": REPAIR_MODEL, "prompt_hash": self.prompt_hash,
                    "input_hash": fingerprint(article), "old_candidate_hash": fingerprint(previous),
                    "old_replay_hash": repair_replay_hash(previous), "feedback_hash": fingerprint(diagnostic)}
-        if self.contract == "article-repair-v6":
+        if self.contract in {"article-repair-v6", "article-repair-v7"}:
             binding["reference_contract"] = repair_reference_contract(self.contract)
         context = repair_context(article, previous, diagnostic, contract=self.contract)
         prompt = self.instruction + "\n\nUNTRUSTED_JSON_DATA:\n" + json.dumps(context, ensure_ascii=False)

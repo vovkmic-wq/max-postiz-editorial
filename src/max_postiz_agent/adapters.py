@@ -9,7 +9,8 @@ from dataclasses import dataclass
 
 import httpx
 
-from .config import AgentError, inside, parse_json
+from .config import AgentError, inside, parse_json, unique_keys
+from .opencode_journal import OpenCodeRequestJournal
 
 
 # Извлекаем структурированный ответ и проверяем его формат.
@@ -25,6 +26,17 @@ def extract_object(text):
     if not isinstance(value, dict):
         raise AgentError("INVALID_EDITOR_RESULT")
     return value
+
+
+def _session_json(raw):
+    """Неоднозначный protocol response сохраняем, но не считаем успехом."""
+    def invalid_constant(_):
+        raise ValueError("Invalid JSON number")
+
+    try:
+        return json.loads(raw, object_pairs_hook=unique_keys, parse_constant=invalid_constant)
+    except (AgentError, ValueError, TypeError) as exc:
+        raise AgentError("OPENCODE_GENERATION_FAILED") from exc
 
 
 # Структура OpenCode объединяет связанные данные и операции модуля.
@@ -93,50 +105,9 @@ class OpenCode:
             payload["model"] = {"providerID": provider, "id": model}
         # Выполняем операцию с отдельной обработкой возможных ошибок.
         try:
-            session_id = None
-            # Обрабатываем ветвь при условии: self.options.get('generate_transport') == 'session'.
             if self.options.get("generate_transport") == "session":
-                created = self.client.post(
-                    self.base_url + "/api/session",
-                    auth=self.auth,
-                    json={
-                        "title": "MAX editorial task",
-                        "model": payload.get("model"),
-                        "location": {
-                            "directory": str(inside(self.root, self.options["runtime_dir"]))
-                        },
-                        "permissions": [{"action": "*", "resource": "*", "effect": "deny"}],
-                    },
-                )
-                created.raise_for_status()
-                session_id = created.json().get("data", {}).get("id")
-                # Обрабатываем ветвь при условии: not session_id or not re.fullmatch('ses[a-zA-Z0-9_-]+', session_id).
-                if not session_id or not re.fullmatch(r"ses[a-zA-Z0-9_-]+", session_id):
-                    raise AgentError("OPENCODE_SESSION_INVALID")
-            # Выполняем операцию с отдельной обработкой возможных ошибок.
-            try:
-                path = f"/api/session/{session_id}/generate" if session_id else self.path
-                response = self.client.post(
-                    self.base_url + path,
-                    json={"prompt": prompt} if session_id else payload,
-                    auth=self.auth,
-                )
-            finally:
-                # Обрабатываем ветвь при условии: session_id.
-                if session_id:
-                    # Выполняем операцию с отдельной обработкой возможных ошибок.
-                    try:
-                        self.client.post(
-                            self.base_url + f"/api/session/{session_id}/interrupt",
-                            auth=self.auth,
-                            timeout=5,
-                        )
-                        self.client.delete(
-                            self.base_url + f"/api/session/{session_id}", auth=self.auth, timeout=5
-                        )
-                    # Обрабатываем httpx.HTTPError и выбираем допустимый исход.
-                    except httpx.HTTPError:
-                        pass
+                return self._generate_session(prompt, payload.get("model"))
+            response = self.client.post(self.base_url + self.path, json=payload, auth=self.auth)
             # Обрабатываем ветвь при условии: response.status_code in {401, 403}.
             if response.status_code in {401, 403}:
                 raise AgentError("OPENCODE_ACCESS_DENIED")
@@ -153,6 +124,58 @@ class OpenCode:
         # Обрабатываем (httpx.HTTPError, ValueError, TypeError) и выбираем допустимый исход.
         except (httpx.HTTPError, ValueError, TypeError) as exc:
             raise AgentError("OPENCODE_GENERATION_FAILED") from exc
+
+    def _generate_session(self, prompt, model):
+        """Сбой удерживает точную сессию: interrupt/delete уничтожали доказательства."""
+        journal = OpenCodeRequestJournal(self.root, prompt, model)
+        stage = "create"
+        try:
+            created = self.client.post(
+                self.base_url + "/api/session", auth=self.auth,
+                json={"title": "MAX editorial task", "model": model,
+                      "location": {"directory": str(inside(self.root, self.options["runtime_dir"]))},
+                      "permissions": [{"action": "*", "resource": "*", "effect": "deny"}]},
+            )
+            journal.response("create", created.status_code, created.content)
+            created.raise_for_status()
+            value = _session_json(created.content)
+            data = value.get("data") if isinstance(value, dict) else None
+            session_id = data.get("id") if isinstance(data, dict) else None
+            if not isinstance(session_id, str) or not re.fullmatch(r"ses[a-zA-Z0-9_-]+", session_id):
+                raise AgentError("OPENCODE_SESSION_INVALID")
+            journal.bind_session(session_id)
+            stage = "generate"
+            response = self.client.post(self.base_url + f"/api/session/{session_id}/generate",
+                                        json={"prompt": prompt}, auth=self.auth)
+            journal.response("response", response.status_code, response.content)
+            stage = "validate"
+            if response.status_code in {401, 403}:
+                raise AgentError("OPENCODE_ACCESS_DENIED")
+            if response.status_code == 503:
+                raise AgentError("OPENCODE_PROVIDER_UNAVAILABLE")
+            response.raise_for_status()
+            data = _session_json(response.content)
+            value = data.get("data", data) if isinstance(data, dict) else None
+            if not isinstance(value, dict):
+                raise AgentError("OPENCODE_GENERATION_FAILED")
+            text = value.get("text", "")
+            if not isinstance(text, str) or not text.strip():
+                raise AgentError("OPENCODE_EMPTY_RESPONSE")
+            journal.validated(text)
+        except AgentError as exc:
+            journal.failed(exc.code, stage)
+            raise
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            journal.failed("OPENCODE_GENERATION_FAILED", stage)
+            raise AgentError("OPENCODE_GENERATION_FAILED") from exc
+        # Только проверенный непустой ответ с durable raw допускает прежний cleanup.
+        try:
+            self.client.post(self.base_url + f"/api/session/{session_id}/interrupt",
+                             auth=self.auth, timeout=5)
+            self.client.delete(self.base_url + f"/api/session/{session_id}", auth=self.auth, timeout=5)
+        except httpx.HTTPError:
+            pass
+        return text, data.get("usage", {})
 
     # Операция run: адаптеры внешних сервисов и безопасная обработка результатов отправки.
     def run(self, task_type, context):
