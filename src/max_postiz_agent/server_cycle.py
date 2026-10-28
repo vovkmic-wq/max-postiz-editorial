@@ -162,7 +162,7 @@ class ServerCycle:
             raise AgentError("EDITORIAL_PENDING_RESUME_NOT_SAFE", 409)
         # Это только GET. Ни создание approval, ни повтор HTTP-планирования не нужны.
         remote = self.core.postiz.get_post(record["postiz_id"])
-        body, media, due, remote_hash = self.core.bridge.normalize(remote)
+        body, media, observed_due, remote_hash = self.core.bridge.normalize(remote)
         with self.core.db.session.begin() as session:
             # Порядок согласован с глобальной паузой и отправкой: Control→Variant→Target→Dispatch.
             require_running(self.core, session, lock=True)
@@ -170,11 +170,16 @@ class ServerCycle:
             target = session.scalar(select(Target).where(Target.id == variant.target_id).with_for_update())
             dispatch = session.scalar(select(Dispatch).where(Dispatch.id == dispatch_id).with_for_update())
             approval = session.get(TargetApproval, dispatch.approval_id) if dispatch else None
+            # Подписанная дата остаётся точной: Postiz возвращает её с точностью
+            # до миллисекунд. Допуск относится только к наблюдаемому GET.
+            due = dispatch.due_at if dispatch else None
             snapshot = self.core.snapshot(variant, target)
             bound = fingerprint({"content": snapshot, "due_at": due})
             link = session.get(BridgePost, record["postiz_id"])
             unsafe = (
                 not dispatch or not approval or not target or not link
+                or type(due) not in {int, float} or not math.isfinite(due)
+                or type(observed_due) not in {int, float} or not math.isfinite(observed_due)
                 or dispatch.state != "pending" or dispatch.owner is not None or dispatch.lease_until != 0
                 or dispatch.attempts != 0 or dispatch.verified or dispatch.error
                 or dispatch.external_id is not None or dispatch.permalink is not None
@@ -194,7 +199,8 @@ class ServerCycle:
                 or dispatch.snapshot != snapshot or dispatch.snapshot_hash != bound or approval.snapshot_hash != bound
                 or automatic_evidence(session, variant) is None
                 or remote.get("id") != record["postiz_id"] or remote.get("state") != "QUEUE"
-                or body != snapshot["body"] or media or due != dispatch.due_at or due != approval.scheduled_at
+                or body != snapshot["body"] or media or abs(observed_due - due) >= .001
+                or due != approval.scheduled_at
                 or due != record.get("due_at") or not self.clock() - 3600 <= due <= self.clock() + 3700
                 or link.variant_id != variant.id or not link.active or link.error or link.remote_state != "QUEUE"
                 or link.remote_hash != remote_hash or snapshot["metadata"].get("postiz_hash") != remote_hash
