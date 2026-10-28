@@ -54,7 +54,7 @@ class ReserveServerCycle(ServerCycle):
         delivered = self.reserve.status(policy["target_id"])["last_delivered_at"]
         if delivered is not None:
             earliest = max(earliest, delivered + interval + 1)
-        return max(self.clock() + 120, earliest)
+        return self.reserve.next_available_due(policy["target_id"], max(self.clock() + 120, earliest))
 
     def _observe_slot(self, slot, record):
         # MAX delivery сохраняется до GET Postiz: сбой его API не разрешает замену.
@@ -75,7 +75,25 @@ class ReserveServerCycle(ServerCycle):
             self.reserve.update(slot["id"], "published", token=slot["token"],
                 dispatch_id=result["dispatch_id"])
             return self._observed_phase("published", record, result)
-        if result.get("state") in {"unknown", "failed", "cancelled", "published_unverified"}:
+        if result.get("state") == "cancelled":
+            # ERROR до единственной попытки MAX — известная отмена, а не
+            # неизвестная доставка. Свежий GET и текущий fence позволяют
+            # закрыть только этот слот; отменённый источник остаётся занятым.
+            revision = self.state.read()["revision"]
+            remote = self.core.postiz.get_post(result.get("postiz_id") or record.get("postiz_id"))
+            try:
+                self.reserve.release_cancelled_no_send(slot["id"], token=slot["token"],
+                    remote=remote, expected_revision=revision)
+            except AgentError as exc:
+                if exc.code != "ARTICLE_RESERVE_CANCELLED_NOT_SAFE":
+                    raise
+                return self._phase("blocked", record_id=record["id"],
+                    last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
+            # Следующий проход выберет другой источник; промежуточный статус
+            # использует существующую русскую подпись сверки в Postiz.
+            return self._phase("reconciling", record_id=record["id"], slot_id=slot["id"],
+                slot_state="missed", last_error=None)
+        if result.get("state") in {"unknown", "failed", "published_unverified"}:
             self.reserve.update(slot["id"], "blocked_unknown", token=slot["token"],
                 dispatch_id=result.get("dispatch_id"), error="ARTICLE_RECONCILIATION_REQUIRED")
             return self._phase("blocked", record_id=record["id"],

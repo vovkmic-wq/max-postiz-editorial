@@ -1,0 +1,11 @@
+{
+  "base_image": "max-postiz-linux:0.10.0-editorial",
+  "base_image_id": "sha256:782787e5cf1559d76d3c89e7f0804af68acd2e60e70bac96bec75ed963dc4587",
+  "typescript_version": "5.5.4",
+  "source": "libraries/nestjs-libraries/src/integrations/social/max-browser.provider.ts",
+  "source_sha256": "1e35270fd36d40ab330a36ae0bbb03c2f7b7c87ef156957eaef1dbd6de65fcf3",
+  "compiled": {
+    "apps/backend/dist/libraries/nestjs-libraries/src/integrations/social/max-browser.provider.js": "50f01d05646432832d43920cc60f9c23bb60b2c29c06eb19f7382c1b69e85ce0",
+    "apps/orchestrator/dist/libraries/nestjs-libraries/src/integrations/social/max-browser.provider.js": "50f01d05646432832d43920cc60f9c23bb60b2c29c06eb19f7382c1b69e85ce0"
+  }
+}

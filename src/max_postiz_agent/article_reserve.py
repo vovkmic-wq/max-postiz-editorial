@@ -287,6 +287,135 @@ class ArticleReserveStore:
             dispatch_id=dispatch_id, due_at=row.due_at, snapshot_hash=dispatch.snapshot_hash)
         return _slot_view(row)
 
+    def release_cancelled_no_send(self, slot_id, *, token, remote, expected_revision):
+        """Закрыть только доказанную отмену без отправки, сохранив прежний claim.
+
+        remote — свежий GET Postiz, выполненный вызывающим кодом до транзакции.
+        Старый fence не разрешает повтор отправки: текущий Control позволяет
+        только терминальную классификацию. Запись, approval и dispatch не меняем.
+        """
+        from .max_bridge import MaxBridge
+
+        code = "ARTICLE_RESERVE_CANCELLED_NOT_SAFE"
+        if not isinstance(remote, dict) or remote.get("state") != "ERROR":
+            raise AgentError(code, 409)
+        body, media, observed_due, remote_hash = MaxBridge.normalize(remote)
+        with self.core.db.session.begin() as session:
+            control = self._control(session)
+            if type(expected_revision) is not int or control.revision != expected_revision:
+                raise AgentError("EDITORIAL_REVISION_CONFLICT", 409)
+            # Сначала читаем идентичность, затем берём locks в обычном порядке
+            # Control → Variant → Target → Dispatch → Approval → Bridge → Slot.
+            candidate = session.get(PublicationSlot, slot_id)
+            if candidate is None:
+                raise AgentError(code, 409)
+            identity = (candidate.record_id, candidate.binding.get("variant_id"),
+                        candidate.target_id, candidate.dispatch_id)
+            variant = session.scalar(select(Variant).where(Variant.id == identity[1]).with_for_update())
+            target = session.scalar(select(Target).where(Target.id == identity[2]).with_for_update())
+            dispatch = session.scalar(select(Dispatch).where(Dispatch.id == identity[3]).with_for_update())
+            approval = session.scalar(select(TargetApproval).where(
+                TargetApproval.id == dispatch.approval_id).with_for_update()) if dispatch else None
+            links = list(session.scalars(select(BridgePost).where(
+                BridgePost.variant_id == identity[1]).with_for_update()))
+            link = links[0] if len(links) == 1 else None
+            row = session.scalar(select(PublicationSlot).where(
+                PublicationSlot.id == slot_id).with_for_update().execution_options(populate_existing=True))
+            ledger = session.scalar(select(EditorialLedger).where(
+                EditorialLedger.id == LEDGER_ID).with_for_update())
+            records = [r for r in ledger.payload.get("records", [])
+                       if r.get("id") == identity[0]] if ledger else []
+            record = records[0] if len(records) == 1 else {}
+            snapshot = dispatch.snapshot if dispatch else {}
+            metadata = snapshot.get("metadata", {}) if isinstance(snapshot, dict) else {}
+            if not isinstance(snapshot, dict) or not isinstance(metadata, dict):
+                raise AgentError(code, 409)
+            unsafe = (
+                row is None or variant is None or target is None or dispatch is None
+                or approval is None or link is None or not record
+                or row.token != token or row.state not in {"pending", "blocked_unknown"}
+                or (row.record_id, row.binding.get("variant_id"), row.target_id, row.dispatch_id) != identity
+                or row.active_target != row.target_id or row.delivered_at is not None
+                or not _stamp(row.due_at) or row.due_at > now()
+                or row.binding != {key: record.get(key) for key in _IDENTITY}
+                or record.get("reserve_contract") != RESERVE_CONTRACT or record.get("state") != "cancelled"
+                or record.get("dispatch_id") != dispatch.id or record.get("variant_id") != variant.id
+                or record.get("target_id") != target.id or record.get("postiz_id") != link.post_id
+                or record.get("due_at") != row.due_at or record.get("published_at") is not None
+                or record.get("delivery_verified") is not False
+                or dispatch.variant_id != variant.id or dispatch.state != "cancelled"
+                or dispatch.attempts != 0 or dispatch.owner is not None or dispatch.lease_until != 0
+                or dispatch.verified is not False or dispatch.error is not None
+                or dispatch.external_id is not None or dispatch.permalink is not None
+                or dispatch.due_at != row.due_at or dispatch.snapshot_hash != fingerprint(
+                    {"content": snapshot, "due_at": row.due_at})
+                or approval.variant_id != variant.id or approval.revision != dispatch.revision
+                or approval.revoked is not True or approval.actor != "hourly_article_policy"
+                or approval.scheduled_at != row.due_at or approval.snapshot_hash != dispatch.snapshot_hash
+                or snapshot.get("variant_id") != variant.id or snapshot.get("revision") != dispatch.revision
+                or snapshot.get("target_id") != target.id or snapshot.get("destination") != target.destination
+                or snapshot.get("platform") != "max" or snapshot.get("route") != "max_browser"
+                or metadata.get("origin") != "hourly_article_test" or metadata.get("approval_mode") != "automatic"
+                or metadata.get("record_id") != record["id"] or metadata.get("policy_hash") != record.get("policy_hash")
+                or target.platform != "max" or target.route != "max_browser" or not target.enabled
+                or target.paused is not True
+                or variant.target_id != target.id or variant.body != snapshot.get("body")
+                or variant.media != snapshot.get("media") or snapshot.get("media") != []
+                or row.text_hash != record.get("reserve_prepared_hash")
+                or metadata.get("machine_review_evidence_hash") != row.evidence_hash
+                or variant.metadata_json.get("machine_review_evidence_hash") != row.evidence_hash
+                or link.target_id != target.id or not link.active or link.error is not None
+                or link.remote_state != "ERROR" or link.remote_hash != remote_hash
+                or not _stamp(link.due_at) or abs(link.due_at - row.due_at) >= .001
+                or link.mutation_owner is not None or link.mutation_until != 0
+                or remote.get("id") != link.post_id or body != snapshot.get("body") or media
+                or not _stamp(observed_due) or abs(observed_due - row.due_at) >= .001
+                or remote.get("group") != link.group_id
+                or remote.get("integration", {}).get("id") != link.integration_id
+                or remote.get("releaseId") not in (None, "") or remote.get("releaseURL") not in (None, "")
+                or metadata.get("postiz_state") != "QUEUE"
+            )
+            if unsafe:
+                raise AgentError(code, 409)
+            # Журнал браузера записывается до клика. Любой прежний receipt,
+            # включая sending, требует сверки даже при противоречивой БД.
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", dispatch.id) is None:
+                raise AgentError(code, 409)
+            receipt = self.core.settings.root / "data/browser-publications" / (dispatch.id + ".json")
+            if receipt.exists() or receipt.is_symlink():
+                raise AgentError(code, 409)
+            previous_remote = copy.deepcopy(remote)
+            previous_remote["state"] = "QUEUE"
+            if MaxBridge.normalize(previous_remote)[3] != metadata.get("postiz_hash"):
+                raise AgentError(code, 409)
+            if (session.scalar(select(DispatchAttempt).where(DispatchAttempt.dispatch_id == dispatch.id))
+                    or session.scalar(select(Dispatch).join(Variant).where(
+                        Variant.target_id == target.id, Dispatch.id != dispatch.id,
+                        Dispatch.state.in_(ACTIVE) | Dispatch.owner.is_not(None)
+                        | (Dispatch.lease_until != 0) | Dispatch.lease_until.is_(None)))
+                    or session.scalar(select(Dispatch).where(Dispatch.variant_id == variant.id,
+                        Dispatch.id != dispatch.id))
+                    or session.scalar(select(TargetApproval).where(TargetApproval.variant_id == variant.id,
+                        TargetApproval.id != approval.id))
+                    or session.scalar(select(RemoteDraft).join(Variant).where(
+                        Variant.target_id == target.id, RemoteDraft.state.in_({"creating", "unknown"})))
+                    or session.scalar(select(BridgePost).where(BridgePost.target_id == target.id,
+                        BridgePost.mutation_owner.is_not(None) | (BridgePost.mutation_until != 0)
+                        | BridgePost.mutation_until.is_(None)))
+                    or session.scalar(select(PublicationSlot).where(
+                        PublicationSlot.active_target == target.id, PublicationSlot.id != row.id))):
+                raise AgentError(code, 409)
+            previous_revision = row.control_revision
+            row.state, row.active_target = "missed", None
+            row.error, row.updated_at = "KNOWN_CANCELLED_NO_SEND", now()
+            self.core.db.audit(session, "article_reserve", "reserve_cancelled_no_send_missed", row.id,
+                record_id=record["id"], dispatch_id=dispatch.id, postiz_id=link.post_id,
+                previous_revision=previous_revision, control_revision=control.revision,
+                due_at=row.due_at, snapshot_hash=dispatch.snapshot_hash,
+                remote_hash=remote_hash, remote_proof_hash=fingerprint(remote),
+                dispatch_attempts=0, source_remains_used=True)
+            return _slot_view(row)
+
     def update(self, slot_id, state, *, token, dispatch_id=None, delivered_at=None, error=None, session=None):
         if state not in _TRANSITIONS or delivered_at is not None and not _stamp(delivered_at):
             raise AgentError("ARTICLE_RESERVE_SLOT_STATE_INVALID", 409)
@@ -343,6 +472,24 @@ class ArticleReserveStore:
             return {"slots": dict(Counter(row.state for row in rows)), "active": active,
                 "last_delivered_at": max(delivered) if delivered else None,
                 "next_delivery_at": min(row["due_at"] for row in active) if active else None}
+
+    def next_available_due(self, target_id, due_at):
+        """Не переиспользовать час закрытого missed claim для другого текста.
+
+        Это только чтение: окончательная уникальность и интервал снова
+        проверяются в assign. Прошедшие часы никогда не догоняются.
+        """
+        if not _stamp(due_at):
+            raise AgentError("ARTICLE_RESERVE_ASSIGNMENT_INVALID", 409)
+        with self.core.db.session() as session:
+            occupied = set(session.scalars(select(PublicationSlot.slot_at).where(
+                PublicationSlot.target_id == target_id)))
+        for _ in range(len(occupied) + 1):
+            hour = int(due_at // 3600) * 3600
+            if hour not in occupied:
+                return due_at
+            due_at = hour + 3601
+        raise AgentError("ARTICLE_RESERVE_ASSIGNMENT_INVALID", 409)
 
     def get(self, slot_id):
         """Чтение прежнего claim для сверки, включая паузу и неизвестный исход."""

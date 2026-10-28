@@ -1,0 +1,6 @@
+# build-reliability-image.cjs проверяет точный image ID перед сборкой.
+FROM max-postiz-linux:0.10.0-editorial
+COPY provider-reliability-manifest.json patch-provider-reliability.cjs max-browser.provider.ts test-provider-unavailable.cjs /adapter-reliability/
+RUN node /adapter-reliability/patch-provider-reliability.cjs \
+ && MAX_PROVIDER_COMPILED=/app/apps/backend/dist/libraries/nestjs-libraries/src/integrations/social/max-browser.provider.js node /adapter-reliability/test-provider-unavailable.cjs \
+ && MAX_PROVIDER_COMPILED=/app/apps/orchestrator/dist/libraries/nestjs-libraries/src/integrations/social/max-browser.provider.js node /adapter-reliability/test-provider-unavailable.cjs

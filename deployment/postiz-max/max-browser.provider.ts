@@ -4,6 +4,13 @@ import { makeSecureId } from '@gitroom/nestjs-libraries/services/make.secure.id'
 import { Integration } from '@prisma/client';
 import { ApplicationFailure } from '@temporalio/activity';
 
+class MaxBridgeTransportUnavailable extends Error {
+  constructor() {
+    super('MAX_BROWSER_AGENT_UNAVAILABLE');
+    this.name = 'MaxBridgeTransportUnavailable';
+  }
+}
+
 export async function maxBridgeRequest(path: string, data: any): Promise<any> {
   const base = process.env.MAX_BRIDGE_URL || 'http://host.docker.internal:8090/api/max-bridge';
   const key = process.env.MAX_POSTIZ_BRIDGE_KEY;
@@ -11,13 +18,14 @@ export async function maxBridgeRequest(path: string, data: any): Promise<any> {
   if (!key || !['localhost', '127.0.0.1', 'host.docker.internal'].includes(parsed.hostname) || parsed.protocol !== 'http:') {
     throw new Error('MAX_BROWSER_BRIDGE_NOT_CONFIGURED');
   }
+  const options = { method: 'POST', headers: {
+    'Content-Type': 'application/json', 'X-Max-Bridge-Key': key,
+  }, body: JSON.stringify(data), signal: AbortSignal.timeout(60000) };
   let response: Response;
   try {
-    response = await fetch(base + path, { method: 'POST', headers: {
-      'Content-Type': 'application/json', 'X-Max-Bridge-Key': key,
-    }, body: JSON.stringify(data), signal: AbortSignal.timeout(60000) });
+    response = await fetch(base + path, options);
   } catch {
-    throw new Error('MAX_BROWSER_AGENT_UNAVAILABLE');
+    throw new MaxBridgeTransportUnavailable();
   }
   const result = await response.json();
   if (!response.ok) throw new Error(result.code || 'MAX_BROWSER_BRIDGE_REJECTED');
@@ -55,15 +63,26 @@ export class MaxBrowserProvider extends SocialAbstract implements SocialProvider
   async postPending(id: string, token: string, posts: PostDetails[], integration: Integration): Promise<PostResponse[]> {
     if (posts.length !== 1) throw ApplicationFailure.create({ message: 'MAX threads are unsupported', nonRetryable: true });
     const postId = posts[0].id;
-    await maxBridgeRequest('/submit', { channel_token: token, integration_id: integration.id, post_id: postId });
+    try {
+      await maxBridgeRequest('/submit', { channel_token: token, integration_id: integration.id, post_id: postId });
+    } catch (error) {
+      // Submit регистрирует существующий пост; отправляет агент. Потерянный ответ сохраняет pending.
+      if (!(error instanceof MaxBridgeTransportUnavailable)) throw error;
+    }
     return [{ id: postId, postId, releaseURL: '', status: 'pending', pendingData: { postId } }];
   }
   async post(id: string, token: string, posts: PostDetails[], integration: Integration): Promise<PostResponse[]> {
     return this.postPending(id, token, posts, integration);
   }
   override async checkPostStatus(token: string, pending: any, integration: Integration): Promise<PendingCheckResponse> {
-    const result = await maxBridgeRequest('/status', { channel_token: token,
-      integration_id: integration.id, post_id: pending.postId });
+    let result: any;
+    try {
+      result = await maxBridgeRequest('/status', { channel_token: token,
+        integration_id: integration.id, post_id: pending.postId });
+    } catch (error) {
+      if (!(error instanceof MaxBridgeTransportUnavailable)) throw error;
+      return { status: 'pending', pendingData: pending };
+    }
     if (result.state === 'published') return { status: 'completed', postId: result.external_id,
       releaseURL: result.permalink || '' };
     if (['failed', 'cancelled'].includes(result.state)) {
