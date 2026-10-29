@@ -1,5 +1,27 @@
 # Интеграции и подтверждённые возможности
 
+## Действующая цепочка 0.11.5
+
+Postiz `/editorial` → API server owner → локальные модели и PostgreSQL-резерв
+→ Postiz `max-browser` provider → прежний браузерный транспорт MAX.
+Runtime Linux: `/opt/max-postiz`, сервис `max-postiz-editorial.service`.
+API агента 8092, Postiz 4007, OpenCode 127.0.0.1:4108,
+общий API моделей http://10.20.30.95:8083/v1. MADLAD использует отдельный
+проверенный alias `madlad400-3b-q4k-causal-v2`; Qwen — `proxmox/qwen35-9b`,
+Ministral — совместимый alias `proxmox/qwen25-coder-7b`.
+
+Иллюстрации допускаются только с полными индивидуальными proofs прав/credit,
+проверкой файла и связью с точной статьёй. Независимые Min/LT и exact approval
+обязательны. Postiz image `max-postiz-linux:0.11.2-illustrated-cas` и версия
+Python 0.11.5 относятся к разным компонентам.
+
+Последняя проверенная доставка до обновления Python описана в
+[выпуске](RELEASE_0.11.5.md). Generic Postiz-провайдеры не наследуют MAX approval.
+Пикабу — отдельный ручной маршрут; Reddit и Telegram/VK выключены,
+Vezdepost не участвует. Исторические подключения ниже не включают их.
+
+## Исторические подключения и проверки 0.3–0.4
+
 ## OpenCode и LLM
 
 OpenCode 2.0.17, provider proxmox, общий API http://10.20.30.95:8083/v1.
@@ -50,4 +72,3 @@ deployment/postiz-max/integration-plan.json как исторический ва
 Он не установлен и не участвует в текущей браузерной цепочке.
 Telegram/VK выключены. Нет слепого повторения POST после timeout/5xx;
 unknown требует операторского расследования.
-

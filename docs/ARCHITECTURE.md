@@ -1,34 +1,44 @@
 # Архитектура
+
+Версия 0.11.5, 29 октября 2026, Europe/Moscow.
+
 ```mermaid
-flowchart LR
-  R[RSS / HTML / JSON API / расписание] --> C[Сборщики и checkpoint]
-  C --> P[(PostgreSQL: Material / Story / Jobs)]
-  C --> A[Raw-архив SHA-256]
-  P --> O[OpenCode 2.0.17]
-  O --> L[Локальная Qwen / Ministral]
-  L --> D[Draft / Variant / источники]
-  D --> Z[Postiz: редактор и календарь MAX]
-  Z --> B[MAX browser bridge: зеркало и проверка]
-  B --> H[Наш агент: approval версии и даты]
-  H --> Q[Durable Dispatch]
-  Q --> M[Прежний браузер MAX]
-  Q --> S[Verified ID / ссылка]
-  S --> Z
-  D --> K[Пикабу: ручной пакет и подтверждение]
+flowchart TD
+  S["NOIRLab / ESA Hubble: полный текст и фото"] --> R["Права, credit, raw и SHA"]
+  R --> T["Preflight title/body → MADLAD"]
+  T --> G["Факты, числа, URL и язык"]
+  G --> V["Независимый Ministral и LanguageTool"]
+  V --> K["Qwen: до двух адресных правок"]
+  K --> G
+  V --> Q["PostgreSQL: quality_ready резерв"]
+  Q --> D["Отдельный отправитель: назначение одного слота"]
+  D --> P["Postiz DRAFT / QUEUE и exact policy approval"]
+  P --> B["max-browser provider → агент"]
+  B --> M["MAX: фото, жирный заголовок, полный текст"]
+  M --> E["Verified dispatch / delivered_at / PUBLISHED"]
+  E --> P
+  U["Postiz /editorial: управление и история"] --> D
+  U --> Q
 ```
 
-SQLAlchemy/Alembic управляют PostgreSQL архива редакции. Postiz имеет отдельные
-PostgreSQL/Redis/Temporal и не заменяет эту БД. Повторно использованные модули
-MAX живут в самостоятельном namespace; старый путь согласования закрыт HubService.
+Оба прохода принадлежат одному серверному владельцу. Долгие GET и inference
+выполняются вне транзакции отправителя. PostgreSQL сохраняет durable claims,
+ledger, publication slots, ревизии и fencing. Миграция 0008 дополняет
+прежние таблицы редакции; БД Postiz, Redis и Temporal остаются отдельными.
 
-Для MAX provider Postiz передаёт запрос review и наблюдает pending/status.
-Postiz QUEUE не создаёт approval. Зеркало фиксирует ревизию, точное время,
-hash настроек, текста и медиа; отправку разрешает только агент.
-Mutation guard блокирует изменение во время sending/unknown. Перед внешним
-запросом агент фиксирует sending и повторно читает авторитетный Postiz.
+OpenCode 127.0.0.1:4108 используется для Qwen/Ministral через общий API
+10.20.30.95:8083/v1. MADLAD — отдельный проверяемый адаптер с точным alias
+и hashes worker/весов/tokenizer/config; параметры сегментации не меняют
+требование перевести и проверить полный материал.
 
-Потеря ответа остаётся unknown до сверки; exactly-once не заявляется.
-Completed возвращается Postiz только при verified доставке. Общий guard для
-обычных Postiz-провайдеров остаётся неподтверждённым; TG/VK отключены.
-Подробнее: [адаптер MAX](MAX_BROWSER_ADAPTER.md).
+Postiz не создаёт разрешение отправки сам: агент проверяет точные текст,
+медиа, дату, адресата, policy/evidence и согласование. Изменения требуют
+нового approval; sending/unknown и mutation lease блокируют правки.
+Подтверждённое время MAX сохраняется до последующего GET Postiz.
+Неизвестный эффект удерживает слот до сверки; exactly-once не заявляется.
 
+Hub-классы и legacy-таблицы сохраняют историю, но старый Hub UI/worker,
+Windows worker и desktop heartbeat параллельно не запускаются. Другие
+маршруты не включаются автоматически. [Приёмка](ACCEPTANCE.md),
+[данные](DATA_MODEL.md), [адаптер MAX](MAX_BROWSER_ADAPTER.md),
+[эксплуатация](VM_EDITORIAL.md).
