@@ -1,7 +1,7 @@
 # Applied after postiz/compose.yaml, its image lock, and compose.bridge.yaml.
 services:
   postiz:
-    image: max-postiz-linux:0.10.8-reliability
+    image: max-postiz-linux:0.11.2-illustrated-cas
     environment:
       MAIN_URL: ${POSTIZ_PUBLIC_ORIGIN:?Set the real LAN origin}
       FRONTEND_URL: ${POSTIZ_PUBLIC_ORIGIN}

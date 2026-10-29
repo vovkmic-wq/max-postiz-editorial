@@ -16,6 +16,7 @@ import httpx
 from bs4 import BeautifulSoup, Tag
 from sqlalchemy import select
 
+from .article_attribution import illustrated_presentation
 from .article_sources import source_spec, validate_source_url
 from .config import AgentError, fingerprint, inside
 from .db import Cursor
@@ -425,7 +426,7 @@ def _article(raw, source_id, item, extractor):
         "original": text,
         "published_at": day.timestamp(),
     }
-    return article, {
+    details = {
         "credit": credit,
         "narrative_html": sections,
         "links": links,
@@ -434,6 +435,10 @@ def _article(raw, source_id, item, extractor):
         "rights_box_html": rights_box_html,
         "rights_box_text": rights_boxes[0].get_text(" ", strip=True),
     }
+    extraction_contract = getattr(extractor, "science_extraction_contract", None)
+    if extraction_contract is not None and any(link["url"].startswith("mailto:") for link in links):
+        details["extraction_contract"] = extraction_contract
+    return article, details
 
 
 def _rights(raw, source_id):
@@ -645,7 +650,11 @@ def select_science_article(
     progress = _checkpoint(
         core, source_id, fingerprint({"options": options, "policy": policy}), checkpoint
     )
-    adapter, extractor = ADAPTERS[source_id], _parser()
+    adapter = ADAPTERS[source_id]
+    # Прежние proof/критерии продолжают разбираться links-v1. Новый формат
+    # сохраняет и два mailto официального NOIRLab, не удаляя последний абзац.
+    extractor = (_parser(science_mailto=True)
+                 if illustrated_presentation(policy.get("presentation_contract")) else _parser())
     next_page, full_gets, rights_raw = 1, 0, None
     with httpx.Client(
         # Большой официальный HTML иногда приходит медленно: чтение ограничено

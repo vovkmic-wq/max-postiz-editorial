@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from .adapters import extract_object
+from .article_attribution import illustrated_presentation
 from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT, reference_urls
 from .config import AgentError, fingerprint, inside, parse_json
 from .db import Audit, Material, now
@@ -102,7 +103,7 @@ def _validate(evidence, title, body, source):
     required = {"review_raw", "review", "spelling_matches", "spelling_adjudicated", "spelling_unresolved",
                 "hard_gates_passed", "text_hash", "source_hash", "review_rubric", "review_prompt_hash", "trace_hash"}
     optional = {"parser_contract", "protocol_recovery", "fresh_spelling_contract", "reference_check",
-                "scientific_spelling_contract"}
+                "scientific_spelling_contract", "presentation_contract", "image_credit"}
     if (not isinstance(evidence, dict) or not required <= set(evidence) <= required | optional
             or not isinstance(evidence["review_rubric"], str)
             or evidence["review_rubric"] not in {MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC}
@@ -140,7 +141,9 @@ def _validate(evidence, title, body, source):
             or fingerprint(evidence["protocol_recovery"]) != fingerprint(protocol_recovery_provenance(
                 evidence["review_raw"], evidence["review_prompt_hash"]))):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
-    candidate = title + "\n\n" + candidate_body(SimpleNamespace(title=title, body=body), source)
+    from .article_attribution import presentation_binding
+    presentation = presentation_binding(evidence.get("presentation_contract"), evidence.get("image_credit"))
+    candidate = title + "\n\n" + candidate_body(SimpleNamespace(title=title, body=body), source, **presentation)
     original = source["title"] + "\n\n" + source["body"]
     reference_contract = LEGACY_REFERENCE_CONTRACT
     if "reference_check" in evidence:
@@ -178,6 +181,8 @@ def machine_metadata(prepared, source, trace_path):
     evidence["trace_hash"] = hashed
     if prepared.get("scientific_spelling_contract") != evidence.get("scientific_spelling_contract"):
         raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_BINDING_INVALID", 409)
+    if any(prepared.get(key) != evidence.get(key) for key in ("presentation_contract", "image_credit")):
+        raise AgentError("ARTICLE_PRESENTATION_BINDING_INVALID", 409)
     if "scientific_spelling_contract" in evidence:
         scientific_trace_binding(trace_path, evidence["scientific_spelling_contract"], expected_hash=hashed,
                                  expected_evidence=evidence)
@@ -197,7 +202,9 @@ def machine_metadata(prepared, source, trace_path):
             **({"scientific_spelling_contract": evidence["scientific_spelling_contract"]}
                if "scientific_spelling_contract" in evidence else {}),
             **({"reference_contract": reference_contract}
-               if reference_contract != LEGACY_REFERENCE_CONTRACT else {})}
+               if reference_contract != LEGACY_REFERENCE_CONTRACT else {}),
+            **({key: evidence[key] for key in ("presentation_contract", "image_credit")}
+               if "presentation_contract" in evidence else {})}
 
 
 def automatic_evidence(session, variant):
@@ -214,7 +221,9 @@ def automatic_evidence(session, variant):
                 or variant.metadata_json.get("review_prompt_hash") != evidence["review_prompt_hash"]
                 or variant.metadata_json.get("scientific_spelling_contract") != evidence.get("scientific_spelling_contract")
                 or variant.metadata_json.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
-                != evidence.get("reference_check", {}).get("contract", LEGACY_REFERENCE_CONTRACT)):
+                != evidence.get("reference_check", {}).get("contract", LEGACY_REFERENCE_CONTRACT)
+                or any(variant.metadata_json.get(key) != evidence.get(key)
+                       for key in ("presentation_contract", "image_credit"))):
             return None
         return {"evidence_hash": hashed, "review": copy.deepcopy(review), "warnings": review["warnings"]}
     except (AgentError, ValueError, TypeError, KeyError):
@@ -286,7 +295,23 @@ def _eligible_record(cycle, session, variant, policy, record, *, reserve_unassig
             or variant.metadata_json.get("policy_hash") != fingerprint(policy)):
         raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
     cycle._source_target(policy)
-    if variant.media:
+    if record.get("presentation_contract") is not None:
+        from .article_images import validate_article_image
+        if (not illustrated_presentation(record["presentation_contract"])
+                or policy.get("presentation_contract") != record["presentation_contract"]):
+            raise AgentError("ARTICLE_PRESENTATION_BINDING_INVALID", 409)
+        validate_article_image(core, record, variant)
+        attempts = record.get("preparation_attempts", [])
+        audits = list(session.scalars(select(Audit).where(Audit.entity == record["id"],
+            Audit.action == "hourly_article_prepare_attempt")))
+        expected = {key: record.get(key) for key in
+                    ("presentation_contract", "image_credit", "illustration_proof_hash")}
+        if (not attempts or any(any(a.get(key) != value for key, value in expected.items()) for a in attempts)
+                or any(len([a for a in audits if a.details.get("attempt") == attempt.get("number")
+                    and all(a.details.get(key) == value for key, value in expected.items())]) != 1
+                    for attempt in attempts)):
+            raise AgentError("ARTICLE_PRESENTATION_BINDING_INVALID", 409)
+    elif variant.media or variant.metadata_json.get("presentation_contract") is not None:
         raise AgentError("ARTICLE_MEDIA_NOT_ALLOWED", 409)
     if not record or record["state"] not in {"automatic_ready", "automatic_pending_approval", "pending", "sending", "awaiting_postiz"}:
         raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
@@ -394,7 +419,9 @@ def publish(cycle, record, ledger, reviewed_hash, due_at):
         if post_id:
             # Postiz's MaxBrowserMutationGuard owns the one end-to-end lease.
             # Taking another lease here makes its nested /mutation/start fail.
-            core.postiz.reschedule_existing(post_id, before["body"], due)
+            core.postiz.reschedule_existing(post_id, before["body"], due,
+                **({"expected_media": before["media"], "expected_remote_hash": before["metadata"]["postiz_hash"]}
+                   if illustrated_presentation(record.get("presentation_contract")) else {}))
             # The guard releases asynchronously on HTTP finish. Only observe;
             # never expire or unlock an uncertain mutation to obtain permission.
             deadline = time.monotonic() + 5
@@ -436,7 +463,8 @@ def _reconcile_capture(cycle, session, record, policy, reviewed_hash, due_at):
     core = cycle.core
     variant = core._variant(session, record["variant_id"], True)
     target = session.scalar(select(Target).where(Target.id == variant.target_id).with_for_update())
-    if (not target or not target.paused or variant.state != "review_pending" or variant.media
+    illustrated = illustrated_presentation(record.get("presentation_contract"))
+    if (not target or not target.paused or variant.state != "review_pending" or (variant.media and not illustrated)
             or record.get("policy_hash") != fingerprint(policy)
             or record.get("target_id") != policy["target_id"]
             or record.get("source_id") != policy["source_id"]
@@ -484,7 +512,8 @@ def _reconcile_capture(cycle, session, record, policy, reviewed_hash, due_at):
     core._check_schedule_limits(session, variant, target, due_at, automatic_policy=policy)
     return {"snapshot": snapshot, "postiz_id": link.post_id, "integration_id": link.integration_id,
             "remote_hash": link.remote_hash, "evidence_hash": evidence["evidence_hash"],
-            "source_hash": fingerprint(source), "due_at": due_at}
+            "source_hash": fingerprint(source), "due_at": due_at,
+            **({"presentation_contract": record["presentation_contract"]} if illustrated else {})}
 
 
 def _reconcile_remote(cycle, captured):
@@ -492,6 +521,12 @@ def _reconcile_remote(cycle, captured):
     remote = core.postiz.get_post(captured["postiz_id"])
     body, media, due, hashed = core.bridge.normalize(remote)
     snapshot = captured["snapshot"]
+    if illustrated_presentation(captured.get("presentation_contract")):
+        with core.db.session() as session:
+            target = session.get(Target, snapshot["target_id"])
+        media_matches = core.bridge._media(media, target) == snapshot["media"]
+    else:
+        media_matches = not media
     integrations = [value for value in core.postiz.integrations() if value.get("id") == captured["integration_id"]]
     if (len(integrations) != 1 or integrations[0].get("identifier") != "max-browser"
             or integrations[0].get("accountId") != snapshot["destination"]
@@ -499,7 +534,7 @@ def _reconcile_remote(cycle, captured):
         raise AgentError("BRIDGE_INTEGRATION_UNAVAILABLE", 409)
     if (remote.get("id") != captured["postiz_id"] or remote.get("state") != "QUEUE"
             or remote.get("integration", {}).get("id") != captured["integration_id"]
-            or body != snapshot["body"] or media or hashed != captured["remote_hash"]
+            or body != snapshot["body"] or not media_matches or hashed != captured["remote_hash"]
             or not math.isfinite(due) or abs(due - captured["due_at"]) > 0.001):
         raise AgentError("ARTICLE_REMOTE_CHANGED", 409)
 

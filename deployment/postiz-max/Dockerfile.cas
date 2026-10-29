@@ -1,4 +1,4 @@
-# Verify the local base tag matches cas-manifest.json before building.
-FROM max-postiz-linux:0.5.0
+# build-cas-image.cjs checks this exact local image ID before building.
+FROM max-postiz-linux:0.10.8-reliability
 COPY cas-manifest.json max-browser.guard.ts compile-cas-guard.cjs test-cas-guard.cjs /adapter-cas/
 RUN node /adapter-cas/compile-cas-guard.cjs && node /adapter-cas/test-cas-guard.cjs

@@ -15,7 +15,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
 from .adapters import OpenCode
-from .article_attribution import article_footer
+from .article_attribution import article_footer, illustrated_presentation
 from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT, REFERENCE_CONTRACTS
 from .browser_runtime import profile_lock
 from .config import AgentError, fingerprint, inside, parse_json
@@ -175,11 +175,18 @@ class HourlyArticleCycle:
                         "owner_instruction", "min_gap_seconds", "max_per_day", "max_source_age_hours"}
             mode = policy.get("approval_mode", "legacy")
             from .article_quality import HOURLY_PRACTICAL_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC
-            valid_keys = (set(policy) == required | {"approval_mode", "review_rubric"}
+            keys = set(policy) - {"presentation_contract", "presentation_owner_instruction"}
+            presentation = policy.get("presentation_contract")
+            presentation_keys = set(policy) & {"presentation_contract", "presentation_owner_instruction"}
+            valid_keys = (keys == required | {"approval_mode", "review_rubric"}
                           and policy.get("review_rubric") in {MEANING_FIRST_REVIEW_RUBRIC,
                                                              HOURLY_PRACTICAL_REVIEW_RUBRIC}) if mode == "automatic" else (
-                              set(policy) in (required, required | {"approval_mode"}))
+                              keys in (required, required | {"approval_mode"}))
             if (not valid_keys
+                    or presentation_keys and (presentation_keys != {"presentation_contract", "presentation_owner_instruction"}
+                        or mode != "automatic" or not illustrated_presentation(presentation)
+                        or not isinstance(policy["presentation_owner_instruction"], str)
+                        or len(policy["presentation_owner_instruction"].strip()) < 10)
                     or policy.get("approval_mode", "legacy") not in {"legacy", "human", "automatic"}
                     or type(policy["enabled"]) is not bool
                     or not all(isinstance(policy[k], str) and policy[k].strip()
@@ -190,7 +197,7 @@ class HourlyArticleCycle:
                     or type(policy["min_gap_seconds"]) is not int or policy["min_gap_seconds"] < 3600
                     or type(policy["max_per_day"]) is not int or not 1 <= policy["max_per_day"] <= 24
                     or type(policy["max_source_age_hours"]) is not int
-                    or not 72 <= policy["max_source_age_hours"] <= 8760):
+                    or not 72 <= policy["max_source_age_hours"] <= 43800):
                 raise ValueError
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise AgentError("ARTICLE_POLICY_INVALID", 409) from exc
@@ -414,7 +421,10 @@ class HourlyArticleCycle:
                                      review_rubric=(automatic_review_rubric(records[0]) if records else
                                          self._policy(enabled=False)["review_rubric"]) if mode == "automatic" else "legacy",
                                      reference_contract=reference_contract,
-                                     allow_registered_terms=scientific_contract is not None)
+                                     allow_registered_terms=scientific_contract is not None,
+                                     **({"presentation_contract": records[0]["presentation_contract"],
+                                         "image_credit": records[0]["image_credit"]}
+                                        if records and records[0].get("presentation_contract") else {}))
             cleanup.pop_all()
             return quality
 
@@ -438,13 +448,15 @@ class HourlyArticleCycle:
         from .article_repair_cycle import AutomaticArticleRepair
         return AutomaticArticleRepair(self).run(ident)
 
-    def _repair(self, trace):
+    def _repair(self, trace, *, presentation_contract=None, image_credit=None):
         from .article_repair import ArticleRepair, REPAIR_MODEL
+        from .article_attribution import presentation_binding
+        presentation = presentation_binding(presentation_contract, image_credit)
         if self.repair_factory:
-            return self.repair_factory(trace)
+            return self.repair_factory(trace, **presentation)
         editor = OpenCode(self.core.settings)
         editor.model = REPAIR_MODEL
-        return ArticleRepair(editor, prompt_dir=self.core.settings.root / "prompts", trace=trace)
+        return ArticleRepair(editor, prompt_dir=self.core.settings.root / "prompts", trace=trace, **presentation)
 
     def _assert_pre_draft(self, record):
         if any(record.get(key) for key in ("variant_id", "postiz_id", "dispatch_id", "due_at", "prepared_hash")):
@@ -860,6 +872,9 @@ class HourlyArticleCycle:
                           "url": article["url"], "original_hash": original_hash, "policy_hash": fingerprint(policy),
                           "target_id": target.id, "source_id": source["id"], "source_published_at": article["published_at"],
                           "input_hash": fingerprint(article), "preparation_attempts": []}
+                if illustrated_presentation(policy.get("presentation_contract")):
+                    # Формат закреплён до загрузки изображения и первого вызова модели.
+                    record["presentation_contract"] = policy["presentation_contract"]
                 if policy.get("review_rubric") == "hourly-practical-v1":
                     # Новая рубрика выбирается только явной политикой до первой модели.
                     record["review_rubric"] = policy["review_rubric"]
@@ -909,6 +924,10 @@ class HourlyArticleCycle:
                 if record["scientific_spelling_contract"] != SCIENTIFIC_SPELLING_CONTRACT:
                     raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_CONTRACT_INVALID", 409)
                 attempt["scientific_spelling_contract"] = record["scientific_spelling_contract"]
+            if "presentation_contract" in record:
+                if record["presentation_contract"] != policy.get("presentation_contract"):
+                    raise AgentError("ARTICLE_PRESENTATION_BINDING_INVALID", 409)
+                attempt["presentation_contract"] = record["presentation_contract"]
             if candidate is not None:
                 attempt.update(candidate_hash=self._candidate_hash(candidate), operator_correction=not bool(repair_claim),
                                candidate_normalization="article-links-v1",
@@ -922,6 +941,18 @@ class HourlyArticleCycle:
             self._save(ledger)
             quality = None
             try:
+                if illustrated_presentation(record.get("presentation_contract")):
+                    from .article_images import prepare_article_image, validate_article_image
+                    attempt["image_preparation_state"] = "preparing"
+                    self._save(ledger)
+                    binding = prepare_article_image(self.core, article, record, policy)
+                    record.update(illustration=copy.deepcopy(binding), image_credit=binding["credit"],
+                                  illustration_proof_hash=fingerprint(binding))
+                    validate_article_image(self.core, record)
+                    attempt.update(image_credit=record["image_credit"],
+                                   illustration_proof_hash=record["illustration_proof_hash"],
+                                   image_preparation_state="ready")
+                    self._save(ledger)
                 with self.core.db.session.begin() as session:
                     self.core.db.audit(session, "automatic_article_repair" if repair_claim else
                         ("hourly_article_operator" if retry_record else "article_quality"),
@@ -934,8 +965,13 @@ class HourlyArticleCycle:
                         **({"reference_contract": attempt["reference_contract"]}
                            if "reference_contract" in attempt else {}),
                         **({"scientific_spelling_contract": attempt["scientific_spelling_contract"]}
-                           if "scientific_spelling_contract" in attempt else {}))
+                           if "scientific_spelling_contract" in attempt else {}),
+                        **({key: attempt[key] for key in ("presentation_contract", "image_credit",
+                            "illustration_proof_hash")} if "presentation_contract" in attempt else {}))
                 quality = self._quality(record["id"])
+                if illustrated_presentation(record.get("presentation_contract")):
+                    attempt["model_started_at"] = now()
+                    self._save(ledger)
                 if getattr(quality, "scientific_spelling_contract", None) != record.get("scientific_spelling_contract"):
                     raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_BINDING_INVALID", 409)
                 prepared = (quality.check_candidate(candidate["title"], candidate["body"], article["title"],
@@ -955,6 +991,8 @@ class HourlyArticleCycle:
                     provenance, attempt, check_slot=not self.reserve_mode)
             except Exception as exc:
                 record.update(state="needs_attention", error=exc.code if isinstance(exc, AgentError) else "ARTICLE_PREPARATION_INTERRUPTED")
+                if attempt.get("image_preparation_state") == "preparing" and quality is None:
+                    attempt["image_preparation_state"] = "failed"
                 attempt.update(state="needs_attention", error=record["error"], finished_at=now())
                 self._save(ledger)
                 with self.core.db.session.begin() as session:
@@ -984,6 +1022,17 @@ class HourlyArticleCycle:
         if (record.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
                 != prepared.get("reference_contract", LEGACY_REFERENCE_CONTRACT)):
             raise AgentError("ARTICLE_REFERENCE_CONTRACT_INVALID", 409)
+        presentation = record.get("presentation_contract")
+        media = []
+        if presentation is not None:
+            from .article_images import validate_article_image
+            if (not illustrated_presentation(presentation) or presentation != policy.get("presentation_contract")
+                    or prepared.get("presentation_contract") != presentation
+                    or prepared.get("image_credit") != record.get("image_credit")):
+                raise AgentError("ARTICLE_PRESENTATION_BINDING_INVALID", 409)
+            media = validate_article_image(self.core, record)
+        elif any(prepared.get(key) is not None for key in ("presentation_contract", "image_credit")):
+            raise AgentError("ARTICLE_PRESENTATION_BINDING_INVALID", 409)
         translation_hash = text_hash(prepared["translation"])
         if any(item.get("translation_hash") == translation_hash for item in ledger["records"]):
             raise AgentError("ARTICLE_DUPLICATE_TRANSLATION", 409)
@@ -1014,7 +1063,7 @@ class HourlyArticleCycle:
                 from .automatic_policy import machine_metadata
             variant = Variant(draft_id=draft.id, target_id=target.id, title=prepared["title"],
                 body=prepared["body"], sources=[{"id": material.id, "url": material.url, "source_id": source["id"]}],
-                media=[], source_revision=1, config_hash=self.core.settings.hash,
+                media=media, source_revision=1, config_hash=self.core.settings.hash,
                 binding_hash=target.binding_hash, metadata_json={"origin": "hourly_article_test",
                     "record_id": record["id"], "rights_evidence": policy["rights_evidence"],
                     **({"reserve_contract": record["reserve_contract"],
@@ -1023,6 +1072,9 @@ class HourlyArticleCycle:
                     **provenance,
                     "approval_mode": policy.get("approval_mode", "legacy"),
                     "policy_hash": record["policy_hash"],
+                    **({"presentation_contract": presentation, "image_credit": record["image_credit"],
+                        "illustration": copy.deepcopy(record["illustration"]),
+                        "illustration_proof_hash": record["illustration_proof_hash"]} if presentation else {}),
                     "machine_text_hash": machine_text_hash(prepared["title"], prepared["body"]),
                     "machine_source_hash": fingerprint({"title": article["title"],
                         "body": article["original"], "url": article["url"]}),

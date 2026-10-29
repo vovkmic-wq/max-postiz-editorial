@@ -109,13 +109,25 @@ class PostizClient:
             raise AgentError("POSTIZ_ID_INVALID")
         return self.request("DELETE", "/posts/" + quote(post_id, safe=""))
 
-    def reschedule_existing(self, post_id, expected_body, due_at):
-        """Update one unpublished text post through createOrUpdatePost by its ID."""
+    def reschedule_existing(self, post_id, expected_body, due_at, *, expected_media=None, expected_remote_hash=None):
+        """Update one exact post, preserving the approved image when explicitly bound."""
         from .max_bridge import MaxBridge
         import json
         remote = self.get_post(post_id)
-        body, images, _, _ = MaxBridge.normalize(remote)
-        if remote["state"] not in {"DRAFT", "QUEUE"} or images or body != expected_body:
+        body, images, _, remote_hash = MaxBridge.normalize(remote)
+        illustrated = expected_media is not None or expected_remote_hash is not None
+        if illustrated and (not isinstance(expected_media, list) or len(expected_media) != 1
+                or not isinstance(expected_media[0], dict)
+                or set(expected_media[0]) != {"path", "sha256", "mime"}
+                or expected_media[0]["mime"] not in {"image/jpeg", "image/png"}
+                or not isinstance(expected_media[0]["path"], str) or not expected_media[0]["path"]
+                or not isinstance(expected_media[0]["sha256"], str)
+                or not re.fullmatch(r"[a-f0-9]{64}", expected_media[0]["sha256"])
+                or not isinstance(expected_remote_hash, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", expected_remote_hash)
+                or remote_hash != expected_remote_hash or len(images) != 1):
+            raise AgentError("BRIDGE_REMOTE_CHANGED", 409)
+        if remote["state"] not in {"DRAFT", "QUEUE"} or (images and not illustrated) or body != expected_body:
             raise AgentError("BRIDGE_REMOTE_CHANGED", 409)
         settings = remote.get("settings") or {}
         if isinstance(settings, str):
@@ -126,8 +138,9 @@ class PostizClient:
                    "shortLink": False, "tags": [], "republish": False,
                    "posts": [{"integration": {"id": remote["integration"]["id"]}, "group": remote["group"],
                               "settings": settings, "value": [{"id": post_id,
-                              "content": remote["content"], "image": []}]}]}
-        result = self.request("POST", "/posts", json=payload)
+                              "content": remote["content"], "image": images if illustrated else []}]}]}
+        result = self.request("POST", "/posts", json=payload,
+                              **({"expected_cas_hash": expected_remote_hash} if illustrated else {}))
         if (not isinstance(result, list) or len(result) != 1
                 or not isinstance(result[0], dict) or result[0].get("postId") != post_id):
             raise AgentError("POSTIZ_UNKNOWN", 503)

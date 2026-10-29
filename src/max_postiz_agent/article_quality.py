@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 
-from .article_attribution import article_footer
+from .article_attribution import article_footer, presentation_binding
 from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT, reference_urls
 from .adapters import extract_object
 from .collectors import detect_language
@@ -497,7 +497,7 @@ class ArticleQuality:
     def __init__(self, translator, reviewer, spelling_url=SPELLING_URL, transport=None,
                  prompt_dir=None, trace=None, allow_human_rejection=False,
                  review_rubric=LEGACY_REVIEW_RUBRIC, reference_contract=None,
-                 allow_registered_terms=False):
+                 allow_registered_terms=False, presentation_contract=None, image_credit=None):
         if (translator is reviewer or (
                 getattr(translator, "model", None) and getattr(reviewer, "model", None)
                 and translator.model == reviewer.model)):
@@ -507,6 +507,8 @@ class ArticleQuality:
         if trace is not None and not callable(trace):
             raise AgentError("ARTICLE_TRACE_INVALID")
         self.translator, self.reviewer = translator, reviewer
+        presentation_binding(presentation_contract, image_credit)
+        self.presentation_contract, self.image_credit = presentation_contract, image_credit
         self.trace = trace
         if type(allow_human_rejection) is not bool:
             raise AgentError("ARTICLE_REVIEW_MODE_INVALID")
@@ -540,7 +542,8 @@ class ArticleQuality:
         if self.trace is not None:
             try:
                 # A diagnostic observer cannot mutate the text being checked.
-                self.trace(copy.deepcopy({"phase": phase, "attempt": attempt, **value}))
+                self.trace(copy.deepcopy({"phase": phase, "attempt": attempt,
+                    **self._presentation_marker(), **value}))
             except Exception as exc:
                 raise AgentError("ARTICLE_TRACE_FAILED", 503) from exc
 
@@ -559,8 +562,15 @@ class ArticleQuality:
         return ({"scientific_spelling_contract": self.scientific_spelling_contract}
                 if self.allow_registered_terms else {})
 
+    def _presentation_marker(self):
+        return presentation_binding(self.presentation_contract, self.image_credit)
+
+    def _footer(self, url):
+        return article_footer(url, **self._presentation_marker())
+
     def _human_evidence(self, prepared, title, original, reviewed, raw, matches,
                         adjudicated, unresolved, *, fresh_spelling=False):
+        prepared.update(self._presentation_marker())
         if self.allow_human_rejection or self.review_rubric != LEGACY_REVIEW_RUBRIC:
             prepared["machine_review_status"] = "passed" if reviewed["approved"] else "rejected"
             prepared["machine_review_evidence"] = {
@@ -569,7 +579,8 @@ class ArticleQuality:
                 "spelling_adjudicated": copy.deepcopy(adjudicated),
                 "spelling_unresolved": copy.deepcopy(unresolved), "hard_gates_passed": True,
                 "text_hash": fingerprint({"title": prepared["title"], "body": prepared["body"]}),
-                "source_hash": fingerprint({"title": title, "body": original, "url": prepared["url"]})}
+                "source_hash": fingerprint({"title": title, "body": original, "url": prepared["url"]}),
+                **self._presentation_marker()}
             if self.review_rubric != LEGACY_REVIEW_RUBRIC:
                 prepared.update(review_rubric=self.review_rubric,
                                 review_prompt_hash=self.review_prompt_hash,
@@ -639,7 +650,7 @@ class ArticleQuality:
                           for key, value in translated.items()}
             self._emit("translation_parsed", attempt, translation=translated)
             text = translated["title"] + "\n\n" + translated["body"]
-            full = text + "\n\n" + article_footer(url)
+            full = text + "\n\n" + self._footer(url)
             context["previous_translation"] = translated
             try:
                 rubric_translation_gate(source, text, self.review_rubric,
@@ -742,7 +753,7 @@ class ArticleQuality:
         candidate_raw = {"title": title, "body": body}
         title, body = normalize_article_links(title.strip()), normalize_article_links(body.strip())
         text = title + "\n\n" + body
-        full = text + "\n\n" + article_footer(url)
+        full = text + "\n\n" + self._footer(url)
         self._emit("candidate_started", 1, mode="candidate", candidate={"title": title, "body": body},
                    source_untrusted={"title": original_title, "body": original, "url": url},
                    **self._scientific_marker(),
@@ -843,7 +854,7 @@ class ArticleQuality:
                       if self.reference_contract == REFERENCE_CONTRACT else {}))
         self._emit("protocol_recovery_validated", 1, protocol=protocol, review=reviewed)
         text = title + "\n\n" + body
-        full = text + "\n\n" + article_footer(url)
+        full = text + "\n\n" + self._footer(url)
         try:
             rubric_translation_gate(source, text, self.review_rubric,
                                     reference_contract=self.reference_contract)
@@ -905,7 +916,7 @@ class ArticleQuality:
                       if self.reference_contract == REFERENCE_CONTRACT else {}))
         self._emit("saved_review_recovery_validated", 1, kind="scientific_spelling", review=reviewed)
         text = title + "\n\n" + body
-        full = text + "\n\n" + article_footer(url)
+        full = text + "\n\n" + self._footer(url)
         try:
             rubric_translation_gate(source, text, self.review_rubric,
                                     reference_contract=self.reference_contract)
@@ -963,7 +974,7 @@ class ArticleQuality:
                       if self.reference_contract == REFERENCE_CONTRACT else {}))
         self._emit("saved_review_recovery_validated", 1, kind="roni_spelling", review=reviewed)
         text = title + "\n\n" + body
-        full = text + "\n\n" + article_footer(url)
+        full = text + "\n\n" + self._footer(url)
         try:
             rubric_translation_gate(source, text, self.review_rubric,
                                     reference_contract=self.reference_contract)

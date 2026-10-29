@@ -5,7 +5,7 @@ import re
 
 from sqlalchemy import select
 
-from .article_attribution import article_footer, requires_licensed_footer
+from .article_attribution import article_footer, presentation_binding, requires_licensed_footer
 from .config import AgentError, fingerprint
 from .browser_runtime import profile_lock
 from .db import Audit, Material, now
@@ -58,6 +58,9 @@ def _validate_evidence(evidence, title, body, source, status):
     from .editorial import translation_gate
     required = {"review_raw", "review", "spelling_matches", "spelling_adjudicated",
                 "spelling_unresolved", "hard_gates_passed", "text_hash", "source_hash", "trace_hash"}
+    presentation = (presentation_binding(evidence.get("presentation_contract"), evidence.get("image_credit"))
+                    if isinstance(evidence, dict) else {})
+    required |= set(presentation)
     if (not isinstance(evidence, dict) or set(evidence) not in (required, required | {"segment_hash"})
             or evidence.get("hard_gates_passed") is not True
             or evidence.get("text_hash") != text_hash(title, body)
@@ -80,11 +83,11 @@ def _validate_evidence(evidence, title, body, source, status):
         raise AgentError("ARTICLE_MACHINE_EVIDENCE_INVALID", 409)
     adjudicated, unresolved = adjudicate_scientific_spelling(
         source["title"] + "\n\n" + source["body"], title + "\n\n" + candidate_body(
-            type("Candidate", (), {"title": title, "body": body})(), source), matches)
+            type("Candidate", (), {"title": title, "body": body})(), source, **presentation), matches)
     if (unresolved or evidence["spelling_unresolved"] != unresolved
             or evidence["spelling_adjudicated"] != adjudicated):
         raise AgentError("ARTICLE_MACHINE_EVIDENCE_INVALID", 409)
-    candidate = candidate_body(type("Candidate", (), {"title": title, "body": body})(), source)
+    candidate = candidate_body(type("Candidate", (), {"title": title, "body": body})(), source, **presentation)
     translation_gate(source["title"] + "\n\n" + source["body"], title + "\n\n" + candidate)
     if len(body) > 3500:
         raise AgentError("ARTICLE_POST_TOO_LONG", 409)
@@ -98,6 +101,9 @@ def machine_metadata(prepared, source, trace_path):
             raise AgentError("ARTICLE_MACHINE_EVIDENCE_INVALID", 409)
         return {}  # Historical passed records and explicit offline test doubles.
     evidence = copy.deepcopy(prepared["machine_review_evidence"])
+    presentation = presentation_binding(prepared.get("presentation_contract"), prepared.get("image_credit"))
+    if presentation != presentation_binding(evidence.get("presentation_contract"), evidence.get("image_credit")):
+        raise AgentError("ARTICLE_PRESENTATION_CONTRACT_INVALID", 409)
     trace_hash = hashlib.sha256(trace_path.read_bytes()).hexdigest()
     if evidence.get("trace_hash", trace_hash) != trace_hash:
         raise AgentError("ARTICLE_MACHINE_EVIDENCE_INVALID", 409)
@@ -105,7 +111,8 @@ def machine_metadata(prepared, source, trace_path):
     status = prepared["machine_review_status"]
     reviewed = _validate_evidence(evidence, prepared["title"], prepared["body"], source, status)
     return {"machine_review_status": status, "machine_review_issues": reviewed["issues"],
-            "machine_review_evidence": evidence, "machine_review_evidence_hash": fingerprint(evidence)}
+            "machine_review_evidence": evidence, "machine_review_evidence_hash": fingerprint(evidence),
+            **presentation}
 
 
 def rejected_evidence(session, variant):
@@ -190,7 +197,7 @@ def details(core, ident):
                 "content_hash": fingerprint(core.snapshot(variant, session.get(Target, variant.target_id)))}
 
 
-def candidate_body(variant, source):
+def candidate_body(variant, source, *, presentation_contract=None, image_credit=None):
     body = variant.body
     # Postiz's plain-text extraction may turn a paragraph separator into one LF.
     # Match only the exact staged title and our complete terminal attribution.
@@ -199,12 +206,20 @@ def candidate_body(variant, source):
         if body.startswith(prefix) and body[len(prefix):] and not body[len(prefix):].startswith("\n"):
             body = body[len(prefix):]
             break
-    footer = article_footer(source["url"])
+    metadata = getattr(variant, "metadata_json", {}) or {}
+    if not isinstance(metadata, dict):
+        raise AgentError("ARTICLE_PRESENTATION_CONTRACT_INVALID", 409)
+    supplied = presentation_binding(presentation_contract, image_credit)
+    bound = presentation_binding(metadata.get("presentation_contract"), metadata.get("image_credit"))
+    if supplied and bound and supplied != bound:
+        raise AgentError("ARTICLE_PRESENTATION_CONTRACT_INVALID", 409)
+    presentation = supplied or bound
+    footer = article_footer(source["url"], **presentation)
     for separator in ("\n\n", "\n"):
         suffix = separator + footer
         if body.endswith(suffix) and not body[:-len(suffix)].endswith("\n"):
             return body[:-len(suffix)]
-    if requires_licensed_footer(source["url"]):
+    if presentation or requires_licensed_footer(source["url"]):
         # Потерянная лицензия или attribution не снимаются старым NASA-форматом.
         raise AgentError("ARTICLE_ATTRIBUTION_REQUIRED", 409)
     # Keep the pre-existing two-LF legacy attribution contract. A single-LF

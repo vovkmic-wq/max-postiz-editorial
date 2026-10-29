@@ -8,6 +8,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from .adapters import Delivery
+from .article_attribution import illustrated_presentation
 from .config import AgentError, fingerprint, inside, parse_json, validate_schema
 from .db import Audit, Cursor, Draft, DraftRevision, Job, Material, Story, now, serialize, uid
 from .editorial import validate_draft
@@ -280,7 +281,8 @@ class HubService(Service):
             from .article_attribution import requires_licensed_footer
             from .human_review import candidate_body, source_data
             source = source_data(s, v)
-            if requires_licensed_footer(source["url"]):
+            if (requires_licensed_footer(source["url"])
+                    or illustrated_presentation(v.metadata_json.get("presentation_contract"))):
                 # Проверка обязательной лицензии действует и при отсутствии чисел.
                 licensed_content = {**result, "body": candidate_body(v, source)
                                     + "\n\nИсточник: " + source["url"]}

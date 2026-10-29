@@ -6,7 +6,7 @@ approval/dispatch и не освобождает слот при неизвес�
 from sqlalchemy import select
 
 from .article_cycle import HourlyArticleCycle
-from .article_reserve import ArticleReserveStore, RESERVE_CONTRACT
+from .article_reserve import ArticleReserveStore, KNOWN_IMAGE_REJECTIONS, RESERVE_CONTRACT, ready_for_policy
 from .config import AgentError
 from .hub_models import Dispatch, DispatchAttempt
 from .server_cycle import ServerCycle, TERMINAL
@@ -180,7 +180,7 @@ class ReserveServerCycle(ServerCycle):
                 return self._phase("rejected", record_id=record["id"])
             return self._phase("blocked", record_id=record["id"],
                 last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
-        candidates = [r for r in ledger["records"] if r["state"] == "quality_ready"]
+        candidates = [r for r in ledger["records"] if ready_for_policy(r, policy)]
         if not settings["reserve"]["enabled"]:
             return self._phase("reserve_disabled")
         for record in candidates:
@@ -265,7 +265,7 @@ class ReserveServerCycle(ServerCycle):
                 continue
             return self._phase("blocked", record_id=previous["id"],
                 last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
-        count = sum(r["state"] == "quality_ready" for r in self.cycle._load()["records"])
+        count = sum(ready_for_policy(r, policy) for r in self.cycle._load()["records"])
         runtime = control.get("runtime", {}).get("preparation", {})
         if runtime.get("next_run_at", 0) and runtime["next_run_at"] > self.clock():
             return {"phase": "waiting_source", "next_run_at": runtime["next_run_at"]}
@@ -280,7 +280,7 @@ class ReserveServerCycle(ServerCycle):
             if leased or any(d["state"] in {"sending", "unknown"} for d in active):
                 return self._phase("blocked", refilling=True,
                     last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
-            if sum(r["state"] == "quality_ready" for r in self.cycle._load()["records"]) >= options["target"]:
+            if sum(ready_for_policy(r, policy) for r in self.cycle._load()["records"]) >= options["target"]:
                 break
             claim = self.reserve.begin_preparation(expected_revision=control["revision"])
             try:
@@ -303,6 +303,11 @@ class ReserveServerCycle(ServerCycle):
                         self.reserve.finish_preparation(claim, "no_source", exc.code)
                         return self._phase("preparation_deferred", refilling=True,
                             next_run_at=self.clock() + 30, last_error={"code": exc.code})
+                    if (exc.code in KNOWN_IMAGE_REJECTIONS and bound
+                            and bound["id"] == claim["id"] and bound.get("record_id")):
+                        self.reserve.reject_image_preparation(claim, bound["record_id"], exc.code)
+                        completed.append("image_rejected")
+                        continue
                     if exc.code != "ARTICLE_QUALITY_REJECTED" or not bound or not bound.get("record_id"):
                         raise
                     record = self.cycle._record(self.cycle._load(), bound["record_id"])
@@ -310,6 +315,13 @@ class ReserveServerCycle(ServerCycle):
             except Exception as exc:
                 # Claim остаётся занят: ни рестарт, ни новый источник не повторят неизвестный запрос.
                 code = exc.code if isinstance(exc, AgentError) else "ARTICLE_RESERVE_PREPARATION_INTERRUPTED"
+                if code == "EDITORIAL_PAUSED":
+                    unbound = self.reserve.active_preparation()
+                    if (unbound and unbound["id"] == claim["id"] and unbound["state"] == "selecting"
+                            and unbound["record_id"] is None):
+                        self.reserve.finish_unbound_selection_on_pause(claim,
+                            expected_revision=self.state.read()["revision"])
+                        return {"phase": "paused"}
                 self.reserve.finish_preparation(claim, "blocked_unknown", code)
                 raise
         return self._phase("reserve_refilled", refilling=True, completed=completed, last_error=None)

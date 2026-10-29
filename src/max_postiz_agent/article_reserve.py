@@ -12,14 +12,20 @@ from uuid import NAMESPACE_URL, uuid5
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from .article_attribution import illustrated_presentation
 from .config import AgentError, fingerprint
-from .db import now, uid
+from .db import Audit, now, uid
 from .hub import ACTIVE
 from .hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Target, TargetApproval, Variant
 from .server_models import EditorialControl, EditorialLedger, EditorialPreparationClaim, PublicationSlot
 from .server_state import CONTROL_ID, LEDGER_ID, require_running
 
 RESERVE_CONTRACT = "article-reserve-v1"
+KNOWN_IMAGE_REJECTIONS = frozenset({
+    "ARTICLE_IMAGE_REQUIRED", "ARTICLE_IMAGE_SOURCE_NOT_SUPPORTED", "ARTICLE_IMAGE_RIGHTS_REQUIRED",
+    "ARTICLE_IMAGE_DOWNLOAD_REQUIRED", "ARTICLE_IMAGE_QUALITY_REQUIRED", "ARTICLE_IMAGE_SIZE_INVALID",
+    "ARTICLE_IMAGE_FORMAT_INVALID", "ARTICLE_IMAGE_SOURCE_UNAVAILABLE", "IMAGE_FORMAT_INVALID", "IMAGE_SIZE_INVALID",
+})
 ACTIVE_SLOT_STATES = {"assigned", "pending", "blocked_unknown", "delivered"}
 _IDENTITY = ("id", "target_id", "source_id", "url", "original_hash", "input_hash", "policy_hash",
              "source_published_at", "variant_id", "reserve_contract", "reserve_prepared_hash")
@@ -31,6 +37,13 @@ _TRANSITIONS = {
     "published": {"published"},
     "missed": {"missed"},
 }
+
+
+def ready_for_policy(record, policy):
+    """Прежний резерв сохраняется, но не заменяет обязательную новую иллюстрацию."""
+    marker = policy.get("presentation_contract")
+    return (record.get("state") == "quality_ready"
+            and (marker is None or record.get("presentation_contract") == marker))
 
 
 def _claim_view(row):
@@ -147,6 +160,97 @@ class ArticleReserveStore:
             row = session.scalar(select(EditorialPreparationClaim).where(
                 EditorialPreparationClaim.active_key == "models"))
             return _claim_view(row) if row else None
+
+    def finish_unbound_selection_on_pause(self, claim, *, expected_revision):
+        """Пауза закрывает только выбор источника, ещё не привязавший запись.
+
+        Control удерживается до commit: старый GET не сможет затем получить
+        право bind_preparation и начать модель под прежним fence.
+        """
+        code = "ARTICLE_RESERVE_PAUSED_SELECTION_NOT_SAFE"
+        if (not isinstance(claim, dict) or type(expected_revision) is not int
+                or type(claim.get("control_revision")) is not int):
+            raise AgentError(code, 409)
+        with self.core.db.session.begin() as session:
+            control = session.scalar(select(EditorialControl).where(
+                EditorialControl.id == CONTROL_ID).with_for_update())
+            row = session.scalar(select(EditorialPreparationClaim).where(
+                EditorialPreparationClaim.id == claim.get("id")).with_for_update())
+            ledger = session.scalar(select(EditorialLedger).where(
+                EditorialLedger.id == LEDGER_ID).with_for_update())
+            records = ledger.payload.get("records") if ledger and isinstance(ledger.payload, dict) else None
+            if (control is None or not control.paused or control.revision != expected_revision
+                    or control.revision <= claim["control_revision"]
+                    or row is None or row.token != claim.get("token")
+                    or row.control_revision != claim["control_revision"] or row.record_id is not None
+                    or row.state != "selecting" or row.active_key != "models" or row.error is not None
+                    or not isinstance(records, list) or any(not isinstance(r, dict) for r in records)
+                    or any(r.get("reserve_claim") is not None and (
+                        not isinstance(r["reserve_claim"], dict) or r["reserve_claim"].get("id") == row.id)
+                        for r in records)
+                    or session.scalar(select(Audit).where(Audit.entity == row.id,
+                        Audit.action == "reserve_preparation_bound"))):
+                raise AgentError(code, 409)
+            row.state, row.active_key, row.error, row.updated_at = "no_source", None, "EDITORIAL_PAUSED", now()
+            self.core.db.audit(session, "article_reserve", "reserve_unbound_selection_paused", row.id,
+                previous_revision=row.control_revision, control_revision=control.revision,
+                error="EDITORIAL_PAUSED", model_calls=0, bound_records=0)
+            return _claim_view(row)
+
+    def reject_image_preparation(self, claim, record_id, error):
+        """Атомарно закрыть только завершённый отказ изображения ДО первой модели.
+
+        Нет retry GET, снятия model unknown, правки внешней очереди или старого
+        источника. Отмена записи и освобождение claim фиксируются вместе.
+        """
+        from .db import Story
+        code = "ARTICLE_IMAGE_REJECTION_NOT_SAFE"
+        if (error not in KNOWN_IMAGE_REJECTIONS or not isinstance(record_id, str)
+                or re.fullmatch(r"[A-Za-z0-9-]{1,80}", record_id) is None):
+            raise AgentError(code, 409)
+        with self.core.db.session.begin() as session:
+            row = self._preparation(session, claim, record_id)
+            ledger = session.scalar(select(EditorialLedger).where(
+                EditorialLedger.id == LEDGER_ID).with_for_update())
+            payload = copy.deepcopy(ledger.payload) if ledger else {}
+            records = [r for r in payload.get("records", []) if r.get("id") == record_id]
+            record = records[0] if len(records) == 1 else {}
+            attempts = record.get("preparation_attempts", [])
+            attempt = attempts[0] if isinstance(attempts, list) and len(attempts) == 1 else {}
+            if (not record or record.get("state") != "needs_attention" or record.get("error") != error
+                    or not illustrated_presentation(record.get("presentation_contract"))
+                    or record.get("reserve_contract") != RESERVE_CONTRACT
+                    or record.get("reserve_claim") != claim or record.get("illustration") is not None
+                    or record.get("model_result_unknown")
+                    or any(record.get(k) for k in ("variant_id", "postiz_id", "dispatch_id", "due_at", "prepared_hash",
+                        "automatic_repair_attempts", "automatic_corrections", "review_protocol_recoveries"))
+                    or attempt.get("number") != 1 or attempt.get("state") != "needs_attention"
+                    or attempt.get("error") != error or attempt.get("finished_at") is None
+                    or attempt.get("image_preparation_state") != "failed"
+                    or attempt.get("presentation_contract") != record.get("presentation_contract")
+                    or attempt.get("model_started_at") is not None):
+                raise AgentError(code, 409)
+            expected = "data/hourly-articles/quality-" + record_id + ".local.jsonl"
+            if record.get("quality_trace") != expected:
+                raise AgentError(code, 409)
+            trace = self.core.settings.root / expected
+            if trace.exists() or trace.is_symlink():
+                raise AgentError(code, 409)
+            if (session.scalar(select(Story).where(Story.text_hash == fingerprint({"hourly_article": record_id})))
+                    or any(v.metadata_json.get("record_id") == record_id for v in session.scalars(select(Variant)))
+                    or session.scalar(select(PublicationSlot).where(PublicationSlot.record_id == record_id))):
+                raise AgentError(code, 409)
+            stamp = now()
+            record.setdefault("preparation_actions", []).append({"at": stamp,
+                "action": "image_rejected_before_models", "previous_state": record["state"], "error": error})
+            record.update(state="cancelled", cancelled_at=stamp)
+            ledger.payload, ledger.revision, ledger.updated_at = payload, ledger.revision + 1, stamp
+            row.state, row.error, row.updated_at, row.active_key = "rejected", error, stamp, None
+            self.core.db.audit(session, "article_reserve", "reserve_image_rejected_before_models", record_id,
+                claim_id=row.id, control_revision=row.control_revision, error=error,
+                source_hash=record.get("original_hash"), policy_hash=record.get("policy_hash"),
+                model_calls=0, source_remains_used=True)
+            return _claim_view(row)
 
     def _record(self, session, record_id):
         ledger = session.get(EditorialLedger, LEDGER_ID)
@@ -300,6 +404,23 @@ class ArticleReserveStore:
         if not isinstance(remote, dict) or remote.get("state") != "ERROR":
             raise AgentError(code, 409)
         body, media, observed_due, remote_hash = MaxBridge.normalize(remote)
+        # Проверяем bytes изображения до транзакции, не удерживая SQL locks на GET.
+        observed_media, image_proof_hash = None, None
+        with self.core.db.session() as probe:
+            assigned = probe.get(PublicationSlot, slot_id)
+            ledger = probe.get(EditorialLedger, LEDGER_ID)
+            matches = [r for r in ledger.payload.get("records", [])
+                       if assigned and r.get("id") == assigned.record_id] if ledger else []
+            pre_record = matches[0] if len(matches) == 1 else {}
+            pre_record = copy.deepcopy(pre_record)
+            target = probe.get(Target, assigned.target_id) if assigned else None
+        if illustrated_presentation(pre_record.get("presentation_contract")):
+            from .article_images import validate_article_image
+            expected_media = validate_article_image(self.core, pre_record)
+            observed_media = self.core.bridge._media(media, target)
+            image_proof_hash = pre_record.get("illustration_proof_hash")
+            if observed_media != expected_media:
+                raise AgentError(code, 409)
         with self.core.db.session.begin() as session:
             control = self._control(session)
             if type(expected_revision) is not int or control.revision != expected_revision:
@@ -330,6 +451,15 @@ class ArticleReserveStore:
             metadata = snapshot.get("metadata", {}) if isinstance(snapshot, dict) else {}
             if not isinstance(snapshot, dict) or not isinstance(metadata, dict):
                 raise AgentError(code, 409)
+            illustrated = illustrated_presentation(record.get("presentation_contract"))
+            if illustrated:
+                if variant is None:
+                    raise AgentError(code, 409)
+                validate_article_image(self.core, record, variant)
+                media_safe = (observed_media == variant.media == snapshot.get("media")
+                    and record.get("illustration_proof_hash") == image_proof_hash)
+            else:
+                media_safe = not media and snapshot.get("media") == []
             unsafe = (
                 row is None or variant is None or target is None or dispatch is None
                 or approval is None or link is None or not record
@@ -360,7 +490,7 @@ class ArticleReserveStore:
                 or target.platform != "max" or target.route != "max_browser" or not target.enabled
                 or target.paused is not True
                 or variant.target_id != target.id or variant.body != snapshot.get("body")
-                or variant.media != snapshot.get("media") or snapshot.get("media") != []
+                or variant.media != snapshot.get("media") or not media_safe
                 or row.text_hash != record.get("reserve_prepared_hash")
                 or metadata.get("machine_review_evidence_hash") != row.evidence_hash
                 or variant.metadata_json.get("machine_review_evidence_hash") != row.evidence_hash
@@ -368,7 +498,7 @@ class ArticleReserveStore:
                 or link.remote_state != "ERROR" or link.remote_hash != remote_hash
                 or not _stamp(link.due_at) or abs(link.due_at - row.due_at) >= .001
                 or link.mutation_owner is not None or link.mutation_until != 0
-                or remote.get("id") != link.post_id or body != snapshot.get("body") or media
+                or remote.get("id") != link.post_id or body != snapshot.get("body")
                 or not _stamp(observed_due) or abs(observed_due - row.due_at) >= .001
                 or remote.get("group") != link.group_id
                 or remote.get("integration", {}).get("id") != link.integration_id

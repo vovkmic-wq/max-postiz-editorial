@@ -1,5 +1,10 @@
 {
-  "base_image_id": "sha256:7940324a4e3d4f7193826b90679dfba192689b335fb9d8c53071277d01fb82e9",
-  "source_sha256": "3dad84f6dc1dec74fc524ab7ceb1b2846c6b40fe06b721447044893640215a38",
-  "compiled_sha256": "115ad369493d1faa41aa4e80984d51394a4ecabd4e949053db5df2274f66b568"
+  "contract": "max-browser-cas-draft-schedule-v1",
+  "base_image": "max-postiz-linux:0.10.8-reliability",
+  "base_image_id": "sha256:baf71837f59c612f2809d15ffa53006c29fa565292e35db3bcd7cc04c37e558b",
+  "target_image": "max-postiz-linux:0.11.2-illustrated-cas",
+  "target_source_sha256": "7066055b1c62f57231fe96dba09bdc8160622087685f52223a3f1ca0062f4d84",
+  "target_compiled_sha256": "44fff80002917f8d92612d73e19e1b0235137fcde655230041aac8798e046322",
+  "source_sha256": "7b51c7df9d2658368c73d777d685567cf852711e6312967825381cb61c153ec0",
+  "compiled_sha256": "80f2962e12c4787a6a064aa3b2283093cb1b59b4dd3f250736f1cec9b59d8194"
 }

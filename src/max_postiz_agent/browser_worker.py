@@ -9,9 +9,91 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from .article_attribution import illustrated_presentation
 from .browser_runtime import COMPOSER, ensure_channel, matching_posts, session
 from .config import AgentError, Settings, fingerprint, inside
+
+ILLUSTRATED_CONTRACT = "article-illustrated-v1"
+_PRESENTATION_FIELDS = ("presentation_contract", "illustration_proof_hash", "illustration_dimensions",
+                        "title_text", "title_format")
+
+
+class _MatchedPosts:
+    def __init__(self, values):
+        self.values = values
+
+    def count(self):
+        return len(self.values)
+
+    @property
+    def last(self):
+        return self.values[-1]
+
+
+def _matched_posts(page, text, *, illustrated=False):
+    if not illustrated:
+        return matching_posts(page, text)
+    posts = page.get_by_role("listitem")
+    indices = posts.evaluate_all("""(posts, text) => posts.flatMap((post, index) => {
+      const nodes = [post, ...post.querySelectorAll('*')];
+      const found = nodes.some(node => (node.innerText === text || node.textContent === text) &&
+        node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0);
+      return found ? [index] : [];
+    })""", text)
+    return _MatchedPosts([posts.nth(index) for index in indices])
+
+
+def _caption_nodes(post, text):
+    nodes = post.locator("*")
+    indices = nodes.evaluate_all("""(nodes, text) => nodes.flatMap((node, index) => {
+      const exact = value => value.innerText === text || value.textContent === text;
+      return exact(node) && ![...node.children].some(exact) &&
+        node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0 ? [index] : [];
+    })""", text)
+    if indices:
+        return [nodes.nth(index) for index in indices]
+    exact_root = post.evaluate("(element, text) => element.innerText === text || element.textContent === text", text)
+    return [post] if exact_root else []
+
+
+def _image_dimensions(path):
+    from PIL import Image
+
+    with Image.open(path) as image:
+        width, height = image.size
+    if max(width, height) < 1600 or min(width, height) < 800:
+        raise AgentError("BROWSER_ARTICLE_IMAGE_QUALITY_INVALID")
+    return [width, height]
+
+
+def _bind_presentation(settings, payload, snapshot):
+    """Служебные признаки берём из подписанного dispatch, а не из запроса."""
+    metadata = snapshot.get("metadata", {})
+    contract = metadata.get("presentation_contract")
+    if contract is None:
+        for field in _PRESENTATION_FIELDS:
+            payload.pop(field, None)
+        return
+    illustration = metadata.get("illustration")
+    media = snapshot.get("media", [])
+    if (not illustrated_presentation(contract) or not isinstance(illustration, dict)
+            or illustration.get("contract") != contract
+            or metadata.get("illustration_proof_hash") != fingerprint(illustration)
+            or len(media) != 1 or media[0].get("mime") not in {"image/png", "image/jpeg"}):
+        raise AgentError("BROWSER_ARTICLE_IMAGE_INVALID")
+    dimensions = [illustration.get("width"), illustration.get("height")]
+    if (any(type(value) is not int for value in dimensions)
+            or _image_dimensions(inside(settings.root, media[0]["path"])) != dimensions):
+        raise AgentError("BROWSER_ARTICLE_IMAGE_QUALITY_INVALID")
+    title = snapshot.get("title")
+    if (not isinstance(title, str) or not title.strip() or "\n" in title
+            or not isinstance(snapshot.get("body"), str) or not snapshot["body"].startswith(title + "\n")):
+        raise AgentError("BROWSER_ARTICLE_TITLE_INVALID")
+    payload.update(presentation_contract=contract,
+        illustration_proof_hash=metadata["illustration_proof_hash"],
+        illustration_dimensions=dimensions, title_text=title, title_format="bold")
 
 
 def authorize_dispatch(settings, db, payload):
@@ -48,6 +130,7 @@ def authorize_dispatch(settings, db, payload):
                     raise AgentError("BROWSER_DISPATCH_NOT_APPROVED")
             # Repeat the authoritative Postiz check immediately before the browser click.
             core.bridge.guard_send(dispatch, target)
+            _bind_presentation(settings, payload, dispatch.snapshot)
             return True
         finally:
             core.close()
@@ -66,6 +149,8 @@ def authorize(settings, payload):
     try:
         if authorize_dispatch(settings, db, payload):
             return
+        for field in _PRESENTATION_FIELDS:
+            payload.pop(field, None)
         # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
         with db.session() as session_db:
             intent = session_db.get(Intent, payload["request_id"])
@@ -158,18 +243,217 @@ def snapshot_video(settings, attachment, request_id):
 
 
 # Проверяем признаки успешной операции в интерфейсе MAX.
-def receipt(page, state):
-    posts = matching_posts(page, state["text"])
+def receipt(page, state, *, _load_deadline=None):
+    marker = state.get("presentation_contract")
+    if marker is not None and not illustrated_presentation(marker):
+        return None
+    posts = _matched_posts(page, state["text"],
+        illustrated=illustrated_presentation(marker))
     # Обрабатываем ветвь при условии: posts.count() != state['before_count'] + 1.
     if posts.count() != state["before_count"] + 1:
         return None
-    selector = ('video, [aria-label^="Прикрепленные"]' if state.get("attachment_type") == "browser-video"
-                else 'img[src^="blob:"], img[src*="static.max"], [aria-label^="Прикрепленные"]')
-    # Обрабатываем ветвь при условии: state.get('attachment') and (not posts.last.locator(selector).count()).
-    if state.get("attachment") and not posts.last.locator(selector).count():
+    result = {"state": "confirmed", "external_id": "browser-" + state["request_id"],
+              "permalink": None}
+    if illustrated_presentation(marker):
+        scrolled = _scroll_illustration(posts.last, state)
+        image_proof = illustrated_receipt(posts.last, state)
+        deadline = time.monotonic() + 2
+        if _load_deadline is not None:
+            deadline = min(deadline, _load_deadline)
+        while image_proof is None and scrolled and time.monotonic() < deadline:
+            page.wait_for_timeout(100)
+            posts = _matched_posts(page, state["text"], illustrated=True)
+            if posts.count() != state["before_count"] + 1:
+                return None
+            image_proof = illustrated_receipt(posts.last, state)
+        if image_proof is None:
+            return None
+        result["image_proof"] = image_proof
+    else:
+        selector = ('video, [aria-label^="Прикрепленные"]' if state.get("attachment_type") == "browser-video"
+                    else 'img[src^="blob:"], img[src*="static.max"], [aria-label^="Прикрепленные"]')
+        if state.get("attachment") and not posts.last.locator(selector).count():
+            return None
+    return result
+
+
+def _max_image_source(source):
+    """Проверяем origin, не сохраняем подписанный URL или его query в proof."""
+    if not isinstance(source, str):
+        return False
+    try:
+        parsed = urlsplit(source)
+        if parsed.scheme == "blob":
+            parsed = urlsplit(source[5:])
+            hosts = {"web.max.ru", "max.ru"}
+        else:
+            hosts = {"static.max.ru", "i.oneme.ru"}
+        return (parsed.scheme == "https" and parsed.hostname in hosts
+                and not parsed.username and not parsed.password and parsed.port in {None, 443})
+    except ValueError:
+        return False
+
+
+def _illustrated_title(post, state):
+    if state.get("title_format") != "bold":
         return None
-    return {"state": "confirmed", "external_id": "browser-" + state["request_id"],
-            "permalink": None}
+    for caption in _caption_nodes(post, state["text"]):
+        if caption.is_visible():
+            proof = _text_formatting_proof(caption, state.get("title_text"), state["text"])
+            if proof.get("title_bold") is True and proof.get("body_unbold") is True:
+                return proof
+    return None
+
+
+def _scroll_illustration(post, state):
+    """Только чтение/прокрутка фото выше точной подписи в одном найденном посте."""
+    from playwright.sync_api import Error as PlaywrightError
+    title = _illustrated_title(post, state)
+    if not title or type(title.get("title_top")) not in {int, float}:
+        return False
+    elements = post.locator(".image-placeholder, img")
+    for index in range(elements.count()):
+        element = elements.nth(index)
+        try:
+            box = element.bounding_box()
+            if (not element.is_visible() or not box or box["width"] < 120 or box["height"] < 60
+                    or box["y"] + box["height"] > title["title_top"] + 4):
+                continue
+            info = element.evaluate("element => ({placeholder: element.classList.contains('image-placeholder'), source: element.currentSrc || element.src || ''})")
+            if not info.get("placeholder") and not _max_image_source(info.get("source")):
+                continue
+            element.scroll_into_view_if_needed(timeout=1000)
+            return True
+        except PlaywrightError:
+            # Lazy replacement can detach the placeholder; the caller re-reads
+            # the exact post and never treats the placeholder itself as proof.
+            return True
+    return False
+
+
+def illustrated_receipt(post, state):
+    """Проверяем крупное изображение перед подписью; DOM не доказывает SHA пикселей."""
+    dimensions = state.get("illustration_dimensions")
+    if (not illustrated_presentation(state.get("presentation_contract"))
+            or state.get("attachment_type") != "browser-image" or not state.get("attachment")
+            or not isinstance(dimensions, list) or len(dimensions) != 2
+            or any(type(value) is not int or value <= 0 for value in dimensions)):
+        return None
+    title_proof = _illustrated_title(post, state)
+    if title_proof is None:
+        return None
+    caption_top = title_proof.get("title_top")
+    if type(caption_top) not in {int, float}:
+        return None
+    expected_ratio = dimensions[0] / dimensions[1]
+    images = post.locator('img')
+    for index in range(images.count()):
+        image = images.nth(index)
+        if not image.is_visible():
+            continue
+        box = image.bounding_box()
+        natural = image.evaluate("element => ({width: element.naturalWidth, height: element.naturalHeight, complete: element.complete, source: element.currentSrc || element.src, declared_source: element.src})")
+        if (not _max_image_source(natural.get("source"))
+                or not _max_image_source(natural.get("declared_source", natural.get("source")))
+                or not box or not natural.get("complete") or box["width"] < 120 or box["height"] < 60
+                or max(natural["width"], natural["height"]) < 640
+                or min(natural["width"], natural["height"]) < 320
+                or abs((natural["width"] / natural["height"]) / expected_ratio - 1) > .2
+                or box["y"] + box["height"] > caption_top + 4):
+            continue
+        return {"contract": state["presentation_contract"],
+            "illustration_proof_hash": state.get("illustration_proof_hash"),
+            "uploaded_sha256": state.get("illustration_image_sha256"),
+            "natural_width": natural["width"], "natural_height": natural["height"],
+            "rendered_width": box["width"], "rendered_height": box["height"],
+            "image_bottom": box["y"] + box["height"], "caption_top": caption_top,
+            "image_before_caption": True, "delivered_pixels_sha256_verified": False,
+            "title_format": "bold", "title_proof": title_proof}
+    return None
+
+
+def _text_formatting_proof(element, title, text):
+    """Проверяем реальную жирность текстовых узлов, не Markdown-символы."""
+    if not isinstance(title, str) or not title or not text.startswith(title + "\n"):
+        return {}
+    return element.evaluate("""(element, expected) => {
+      const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+      const nodes = []; let node;
+      while ((node = walker.nextNode())) nodes.push(node);
+      const joined = nodes.map(n => n.textContent).join('');
+      if (!joined.startsWith(expected.title) ||
+          (element.innerText !== expected.text && element.textContent !== expected.text)) return {};
+      let offset = 0, heading = '', body = '', titleBold = true, bodyUnbold = true, lastTitle = null, lastOffset = 0;
+      for (const node of nodes) {
+        const value = node.textContent, length = Math.max(0, Math.min(value.length, expected.title.length - offset));
+        const first = value.slice(0, length), rest = value.slice(length);
+        const weight = Number.parseFloat(getComputedStyle(node.parentElement).fontWeight);
+        heading += first; body += rest;
+        if (first) {lastTitle = node; lastOffset = first.length;}
+        if (first.trim() && !(weight >= 600)) titleBold = false;
+        if (rest.trim() && !(weight < 600)) bodyUnbold = false;
+        offset += value.length;
+      }
+      if (!lastTitle || !nodes.length) return {};
+      const range = document.createRange(); range.setStart(nodes[0], 0); range.setEnd(lastTitle, lastOffset);
+      return {title_text: expected.title, title_bold: heading === expected.title && titleBold,
+              body_unbold: Boolean(body.trim()) && bodyUnbold, body_characters: body.trim().length,
+              title_top: range.getBoundingClientRect().top};
+    }""", {"title": title, "text": text})
+
+
+def _bold_title(page, composer, title, text):
+    """Выделяем весь логический заголовок и применяем один нативный Ctrl+B."""
+    if composer.inner_text() != text:
+        raise AgentError("BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE")
+    before = _text_formatting_proof(composer, title, text)
+    if before.get("title_bold") and before.get("body_unbold"):
+        return before
+    if not before.get("body_unbold"):
+        raise AgentError("BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE")
+    selected = composer.evaluate("""(element, title) => {
+      const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+      const nodes = []; let node;
+      while ((node = walker.nextNode())) if (node.textContent) nodes.push(node);
+      if (!nodes.length || !nodes.map(n => n.textContent).join('').startsWith(title)) return false;
+      let remaining = title.length, end = null, endOffset = 0;
+      for (const node of nodes) {
+        if (remaining <= node.textContent.length) {end = node; endOffset = remaining; break;}
+        remaining -= node.textContent.length;
+      }
+      if (!end) return false;
+      element.focus();
+      const range = document.createRange(); range.setStart(nodes[0], 0); range.setEnd(end, endOffset);
+      const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+      return selection.toString() === title;
+    }""", title)
+    if selected is not True:
+        raise AgentError("BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE")
+    page.keyboard.press("Control+b")
+    page.keyboard.press("ArrowRight")
+    proof = _text_formatting_proof(composer, title, text)
+    if (composer.inner_text() != text or proof.get("title_bold") is not True
+            or proof.get("body_unbold") is not True):
+        raise AgentError("BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE")
+    return proof
+
+
+def _loaded_receipt(page, state):
+    """После reload ждём загрузку картинки, не делая второго Send."""
+    deadline = time.monotonic() + 15
+    found = receipt(page, state, _load_deadline=deadline)
+    if found or not illustrated_presentation(state.get("presentation_contract")):
+        return found
+    while time.monotonic() < deadline:
+        # Header/composer могут загрузиться раньше истории. Отсутствующая
+        # подпись ждёт тот же deadline; лишнее совпадение сразу блокирует proof.
+        if _matched_posts(page, state["text"], illustrated=True).count() > state["before_count"] + 1:
+            return None
+        page.wait_for_timeout(200)
+        found = receipt(page, state, _load_deadline=deadline)
+        if found:
+            return found
+    return None
 
 
 # Проверяем доступность ресурса и его разрешённые свойства.
@@ -197,7 +481,7 @@ def reconcile(settings, chat_id, request_id):
     # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
     with session(settings) as page:
         ensure_channel(page, settings, chat_id)
-        found = receipt(page, state)
+        found = _loaded_receipt(page, state)
         # Обрабатываем ветвь при условии: found.
         if found:
             page.screenshot(path=str(path.with_suffix(".png")))
@@ -213,6 +497,23 @@ def publish(settings, payload, *, authorize_before_click=None):
     # Обрабатываем ветвь при условии: not isinstance(text, str) or not text.strip() or len(text) > 4000.
     if not isinstance(text, str) or not text.strip() or len(text) > 4000:
         raise AgentError("BROWSER_TEXT_INVALID")
+    marker = payload.get("presentation_contract")
+    illustrated = illustrated_presentation(marker)
+    if marker is not None and not illustrated:
+        raise AgentError("BROWSER_ARTICLE_IMAGE_INVALID")
+    if illustrated:
+        attachment = payload.get("attachment")
+        dimensions = payload.get("illustration_dimensions")
+        if (not isinstance(attachment, dict) or attachment.get("type") != "browser-image"
+                or not re.fullmatch(r"[a-f0-9]{64}", str(payload.get("illustration_proof_hash", "")))
+                or not isinstance(dimensions, list) or len(dimensions) != 2
+                or any(type(value) is not int or value <= 0 for value in dimensions)
+                or max(dimensions) < 1600 or min(dimensions) < 800):
+            raise AgentError("BROWSER_ARTICLE_IMAGE_INVALID")
+        if (payload.get("title_format") != "bold" or not isinstance(payload.get("title_text"), str)
+                or not payload["title_text"] or "\n" in payload["title_text"]
+                or not text.startswith(payload["title_text"] + "\n")):
+            raise AgentError("BROWSER_ARTICLE_TITLE_INVALID")
     path = ledger_path(settings, request_id)
     content_hash = fingerprint(payload)
     # Обрабатываем ветвь при условии: path.exists().
@@ -233,8 +534,10 @@ def publish(settings, payload, *, authorize_before_click=None):
         # Обрабатываем ветвь при условии: page.get_by_role('button', name='Отменить загрузку', exact=True).count().
         if page.get_by_role("button", name="Отменить загрузку", exact=True).count():
             raise AgentError("BROWSER_COMPOSER_NOT_EMPTY")
-        before = matching_posts(page, text).count()
+        before = _matched_posts(page, text, illustrated=illustrated).count()
         upload = snapshot_attachment(settings, payload.get("attachment"), request_id)
+        if illustrated and _image_dimensions(upload) != payload["illustration_dimensions"]:
+            raise AgentError("BROWSER_ARTICLE_IMAGE_QUALITY_INVALID")
         # Обрабатываем ветвь при условии: upload.
         if upload:
             page.get_by_role("button", name="Загрузить файл", exact=True).click()
@@ -243,6 +546,7 @@ def publish(settings, payload, *, authorize_before_click=None):
                 page.get_by_text("Фото или видео", exact=True).click()
             chooser.value.set_files(str(upload))
         composer.fill(text)
+        title_proof = _bold_title(page, composer, payload["title_text"], text) if illustrated else None
         send = page.get_by_role("button", name="Отправить сообщение", exact=True)
         send.wait_for(state="visible")
         upload_deadline = time.monotonic() + 30
@@ -261,6 +565,10 @@ def publish(settings, payload, *, authorize_before_click=None):
                  "attachment_type": payload.get("attachment", {}).get("type") if upload else None,
                  "before_count": before,
                  "content_hash": content_hash, "started_at": time.time()}
+        if illustrated:
+            state.update({field: payload[field] for field in _PRESENTATION_FIELDS})
+            state["illustration_image_sha256"] = payload["attachment"]["payload"]["sha256"]
+            state["composer_title_proof"] = title_proof
         # An interrupted click must never allow another automatic click.
         save(path, state)
         # Выполняем операцию с отдельной обработкой возможных ошибок.
@@ -270,17 +578,17 @@ def publish(settings, payload, *, authorize_before_click=None):
             # Продолжаем цикл, пока выполняется условие: time.monotonic() < deadline.
             while time.monotonic() < deadline:
                 # Обрабатываем ветвь при условии: matching_posts(page, text).count() == before + 1 and (not composer.inner_text().strip()).
-                if matching_posts(page, text).count() == before + 1 and not composer.inner_text().strip():
+                if _matched_posts(page, text, illustrated=illustrated).count() == before + 1 and not composer.inner_text().strip():
                     # MAX first renders an optimistic post. Reloading immediately can
                     # abort its in-flight upload/send request and discard the post.
                     page.wait_for_timeout(5000)
                     # Обрабатываем ветвь при условии: matching_posts(page, text).count() != before + 1.
-                    if matching_posts(page, text).count() != before + 1:
+                    if _matched_posts(page, text, illustrated=illustrated).count() != before + 1:
                         continue
                     page.screenshot(path=str(path.with_suffix(".before-reload.png")))
                     page.reload(wait_until="domcontentloaded")
                     ensure_channel(page, settings, chat_id, navigate=False)
-                    found = receipt(page, state)
+                    found = _loaded_receipt(page, state)
                     # Обрабатываем ветвь при условии: found.
                     if found:
                         page.screenshot(path=str(path.with_suffix(".png")))

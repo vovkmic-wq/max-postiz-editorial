@@ -9,6 +9,7 @@ from uuid import NAMESPACE_URL, uuid5
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from .article_attribution import presentation_binding
 from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACTS
 from .article_repair import (REPAIR_CONTRACT, REPAIR_CONTRACTS, REPAIR_MODEL,
                              repair_context, repair_prompt_name, repair_reference_contract, repair_replay_hash)
@@ -26,7 +27,7 @@ QUARANTINE_ERRORS = {"ARTICLE_REPAIR_RESPONSE_INVALID", "ARTICLE_REPAIR_PATCH_IN
                      "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"}
 _BINDING = ("id", "number", "contract", "model", "input_hash", "policy_hash", "slot",
             "parent_trace_hash", "parent_trace_bytes", "snapshot_hash", "snapshot_path", "prompts", "target_binding_hash",
-            "source_config_hash", "reference_contract", "review_rubric")
+            "source_config_hash", "reference_contract", "review_rubric", "presentation_contract", "image_credit")
 
 
 def _now():
@@ -217,6 +218,7 @@ class AutomaticArticleRepair:
         try:
             from .article_cycle import automatic_review_rubric, review_rubric_binding, scientific_contract_binding
             rubric = automatic_review_rubric(record)
+            presentation = presentation_binding(record.get("presentation_contract"), record.get("image_credit"))
             with self.core.db.session() as session:
                 scientific_contract = scientific_contract_binding(self.core, session, record)
                 review_rubric_binding(self.core, session, record)
@@ -232,6 +234,7 @@ class AutomaticArticleRepair:
                 require(isinstance(event, dict) and event.get("record_id") == record["id"]
                         and isinstance(event.get("phase"), str)
                         and type(event.get("attempt")) is int and 1 <= event["attempt"] <= 3)
+                require(presentation_binding(event.get("presentation_contract"), event.get("image_credit")) == presentation)
                 stamp = timestamp(event.get("at"))
                 require(stamp >= previous)
                 previous = stamp
@@ -329,7 +332,7 @@ class AutomaticArticleRepair:
                         require(fingerprint(supplied) == attempt["candidate_raw_hash"])
                     tail, retry = block[1:], None
                 translated = candidate["title"] + "\n\n" + candidate["body"]
-                full = translated + "\n\n" + article_footer(article["url"])
+                full = translated + "\n\n" + article_footer(article["url"], **presentation)
                 gate_error = None
                 try:
                     rubric_translation_gate(original, translated, rubric,
@@ -393,6 +396,7 @@ class AutomaticArticleRepair:
                 "gate_rejected", "review_returned", "review_parsed", "spelling_returned", "spelling_adjudicated", "retry", "rejected"}]}
             payload = {"article": article, "candidate": candidate, "feedback": feedback,
                        "parent_trace_hash": _sha(raw), "rejected_replay_hashes": sorted(rejected)}
+            payload.update(presentation)
             if reference_contract != LEGACY_REFERENCE_CONTRACT:
                 payload["reference_contract"] = reference_contract
             if scientific_contract is not None:
@@ -439,6 +443,7 @@ class AutomaticArticleRepair:
             "old_candidate_hash": fingerprint(snapshot["candidate"]),
             "old_replay_hash": repair_replay_hash(snapshot["candidate"]),
             "feedback_hash": fingerprint(snapshot["feedback"])}
+        expected.update(presentation_binding(claim.get("presentation_contract"), claim.get("image_credit")))
         if claim["contract"] in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}:
             expected["reference_contract"] = self._claim_reference(claim)
         article = snapshot["article"]
@@ -473,7 +478,8 @@ class AutomaticArticleRepair:
                 return events[1]["raw"], {}
 
         replay = ArticleRepair(SavedResponse(), prompt_dir=self.core.settings.root / "prompts",
-                               contract=claim["contract"])
+                               contract=claim["contract"],
+                               **presentation_binding(claim.get("presentation_contract"), claim.get("image_credit")))
         try:
             replay.propose(article, snapshot["candidate"], snapshot["feedback"],
                 rejected_replay_hashes=snapshot["rejected_replay_hashes"])
@@ -619,7 +625,10 @@ class AutomaticArticleRepair:
         snapshot_raw = inside(self.core.settings.root, claim["snapshot_path"]).read_bytes()
         snapshot = parse_json(snapshot_raw.decode("utf-8"))
         references = self._claim_reference(claim)
+        presentation = presentation_binding(record.get("presentation_contract"), record.get("image_credit"))
         if (_sha(snapshot_raw) != claim["snapshot_hash"] or snapshot["article"] != article
+                or presentation_binding(snapshot.get("presentation_contract"), snapshot.get("image_credit")) != presentation
+                or presentation_binding(claim.get("presentation_contract"), claim.get("image_credit")) != presentation
                 or snapshot.get("review_rubric") != record.get("review_rubric")
                 or claim.get("review_rubric") != record.get("review_rubric")
                 or snapshot.get("scientific_spelling_contract") != record.get("scientific_spelling_contract")
@@ -711,6 +720,7 @@ class AutomaticArticleRepair:
                 "source_config_hash": fingerprint(source),
                 "repair_trace": f"data/hourly-articles/repair-{claim_id}.local.jsonl",
                 "owner_authorization": "2026-10-22 bounded automatic translation corrections"}
+            claim.update(presentation_binding(record.get("presentation_contract"), record.get("image_credit")))
             if REPAIR_CONTRACT in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}:
                 claim["reference_contract"] = payload["reference_contract"]
             if "review_rubric" in record:
@@ -729,7 +739,8 @@ class AutomaticArticleRepair:
             cycle._save(ledger)
             expected = fingerprint(record)
             try:
-                editor = cycle._repair(self._trace(record, claim))
+                editor = cycle._repair(self._trace(record, claim),
+                    **presentation_binding(claim.get("presentation_contract"), claim.get("image_credit")))
                 if (editor.contract != claim["contract"]
                         or editor.prompt_hash != claim["prompts"][repair_prompt_name(claim["contract"])]):
                     raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
@@ -754,6 +765,7 @@ class AutomaticArticleRepair:
                     "old_candidate_hash": fingerprint(payload["candidate"]),
                     "old_replay_hash": repair_replay_hash(payload["candidate"]),
                     "feedback_hash": fingerprint(payload["feedback"])}
+                expected_binding.update(presentation_binding(claim.get("presentation_contract"), claim.get("image_credit")))
                 if claim["contract"] in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}:
                     expected_binding["reference_contract"] = self._claim_reference(claim)
                 times = [e.get("at") for e in repair_events]

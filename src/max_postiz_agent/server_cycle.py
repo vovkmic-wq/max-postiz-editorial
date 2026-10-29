@@ -8,6 +8,7 @@ import math
 
 from sqlalchemy import select
 
+from .article_attribution import illustrated_presentation
 from .article_cycle import HourlyArticleCycle
 from .automatic_policy import automatic_evidence
 from .config import AgentError, fingerprint, inside
@@ -88,6 +89,12 @@ class ServerCycle:
             policies = policies[offset:] + policies[:offset]
             failures = []
             for current in policies:
+                if (illustrated_presentation(current.get("presentation_contract"))
+                        and current["source_id"] not in {"noirlab_iotw", "esahubble_potw"}):
+                    # В этом формате пока доказаны только собственные JPEG
+                    # двух научных источников; NASA-текст не теряем из-за
+                    # отсутствия отдельного разрешения на конкретное фото.
+                    continue
                 self.state.assert_running()
                 try:
                     if current["source_id"] == policy["source_id"]:
@@ -163,6 +170,13 @@ class ServerCycle:
         # Это только GET. Ни создание approval, ни повтор HTTP-планирования не нужны.
         remote = self.core.postiz.get_post(record["postiz_id"])
         body, media, observed_due, remote_hash = self.core.bridge.normalize(remote)
+        illustrated = illustrated_presentation(record.get("presentation_contract"))
+        if illustrated:
+            from .article_images import validate_article_image
+            expected_media = validate_article_image(self.core, record)
+            media_matches = self.core.bridge._media(media, target) == expected_media
+        else:
+            media_matches = not media
         with self.core.db.session.begin() as session:
             # Порядок согласован с глобальной паузой и отправкой: Control→Variant→Target→Dispatch.
             require_running(self.core, session, lock=True)
@@ -170,6 +184,8 @@ class ServerCycle:
             target = session.scalar(select(Target).where(Target.id == variant.target_id).with_for_update())
             dispatch = session.scalar(select(Dispatch).where(Dispatch.id == dispatch_id).with_for_update())
             approval = session.get(TargetApproval, dispatch.approval_id) if dispatch else None
+            if illustrated:
+                validate_article_image(self.core, record, variant)
             # Подписанная дата остаётся точной: Postiz возвращает её с точностью
             # до миллисекунд. Допуск относится только к наблюдаемому GET.
             due = dispatch.due_at if dispatch else None
@@ -199,7 +215,7 @@ class ServerCycle:
                 or dispatch.snapshot != snapshot or dispatch.snapshot_hash != bound or approval.snapshot_hash != bound
                 or automatic_evidence(session, variant) is None
                 or remote.get("id") != record["postiz_id"] or remote.get("state") != "QUEUE"
-                or body != snapshot["body"] or media or abs(observed_due - due) >= .001
+                or body != snapshot["body"] or not media_matches or abs(observed_due - due) >= .001
                 or due != approval.scheduled_at
                 or due != record.get("due_at") or not self.clock() - 3600 <= due <= self.clock() + 3700
                 or link.variant_id != variant.id or not link.active or link.error or link.remote_state != "QUEUE"

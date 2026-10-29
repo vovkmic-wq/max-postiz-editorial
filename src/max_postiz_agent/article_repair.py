@@ -10,7 +10,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .article_attribution import article_footer
+from .article_attribution import article_footer, presentation_binding
 from .article_links import LEGACY_REFERENCE_CONTRACT, reference_urls
 from .article_quality import (
     MEANING_FIRST_REVIEW_RUBRIC,
@@ -279,12 +279,15 @@ def _patch_candidate(previous, output, source, *, contract=REPAIR_CONTRACT):
 class ArticleRepair:
     """Вызывающая сторона заранее фиксирует durable claim, источник и известный отказ."""
 
-    def __init__(self, editor, *, prompt_dir=None, trace=None, contract=REPAIR_CONTRACT):
+    def __init__(self, editor, *, prompt_dir=None, trace=None, contract=REPAIR_CONTRACT,
+                 presentation_contract=None, image_credit=None):
         _require(getattr(editor, "model", None) == REPAIR_MODEL, "ARTICLE_REPAIR_MODEL_REQUIRED")
         _require(trace is None or callable(trace), "ARTICLE_REPAIR_TRACE_INVALID")
         _require(isinstance(contract, str) and contract in REPAIR_CONTRACTS,
                  "ARTICLE_REPAIR_CONTRACT_INVALID")
         self.editor, self.trace = editor, trace
+        presentation_binding(presentation_contract, image_credit)
+        self.presentation_contract, self.image_credit = presentation_contract, image_credit
         self.contract = contract
         prompts = Path(prompt_dir) if prompt_dir else Path(__file__).resolve().parents[2] / "prompts"
         self.instruction = (prompts / repair_prompt_name(contract)).read_text(encoding="utf-8")
@@ -319,6 +322,7 @@ class ArticleRepair:
         binding = {"contract": self.contract, "model": REPAIR_MODEL, "prompt_hash": self.prompt_hash,
                    "input_hash": fingerprint(article), "old_candidate_hash": fingerprint(previous),
                    "old_replay_hash": repair_replay_hash(previous), "feedback_hash": fingerprint(diagnostic)}
+        binding.update(presentation_binding(self.presentation_contract, self.image_credit))
         if self.contract in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}:
             binding["reference_contract"] = repair_reference_contract(self.contract)
         context = repair_context(article, previous, diagnostic, contract=self.contract)
@@ -354,7 +358,8 @@ class ArticleRepair:
             text = proposed["title"] + "\n\n" + proposed["body"]
             rubric_translation_gate(source, text, MEANING_FIRST_REVIEW_RUBRIC,
                                     reference_contract=repair_reference_contract(self.contract))
-            _require(len(text + "\n\n" + article_footer(url)) <= 3500,
+            _require(len(text + "\n\n" + article_footer(url,
+                **presentation_binding(self.presentation_contract, self.image_credit))) <= 3500,
                      "ARTICLE_POST_TOO_LONG")
             evidence.update(outcome="candidate", new_candidate_hash=fingerprint(proposed),
                             replay_hash=replay, actual_changes_hash=fingerprint(actual),

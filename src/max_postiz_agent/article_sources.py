@@ -6,10 +6,11 @@
 """
 
 import copy
+from pathlib import Path
 import re
 from urllib.parse import urlsplit
 
-from .config import AgentError
+from .config import AgentError, fingerprint, parse_json
 
 _SOURCES = {
     "noirlab_iotw": {
@@ -98,11 +99,60 @@ def registered_policies(base, settings):
     return result
 
 
+def _historical_policy(policy, settings, record):
+    """Вернуть только точную неизменяемую политику существующей записи.
+
+    Архив не выбирает источники и не разрешает повтор. Его имя и содержимое
+    должны совпасть с уже закреплённым в PostgreSQL hash записи.
+    """
+    expected = record.get("policy_hash")
+    root = getattr(settings, "root", None)
+    if (not isinstance(expected, str) or re.fullmatch(r"[a-f0-9]{64}", expected) is None
+            or fingerprint(policy) == expected or root is None):
+        return policy
+    root = Path(root).resolve()
+    directory = root / "data/hourly-policy-history"
+    path = directory / (expected + ".local.json")
+    if not path.exists() and not path.is_symlink():
+        return policy
+    try:
+        if (root.is_symlink() or (root / "data").is_symlink() or directory.is_symlink()
+                or path.is_symlink() or path.resolve() != path or not path.is_file()
+                or not 0 < path.stat().st_size <= 64 * 1024):
+            raise ValueError
+        saved = parse_json(path.read_text(encoding="utf-8"))
+        if (not isinstance(saved, dict) or fingerprint(saved) != expected or set(saved) != set(policy)
+                or any(saved.get(key) != policy.get(key) for key in
+                       ("source_id", "target_id", "allowed_hosts", "rights_evidence",
+                        "presentation_contract", "presentation_owner_instruction"))
+                or saved.get("presentation_contract") != record.get("presentation_contract")):
+            raise ValueError
+    except (OSError, ValueError, TypeError, KeyError, AgentError) as exc:
+        raise AgentError("ARTICLE_POLICY_HISTORY_INVALID", 409) from exc
+    return saved
+
+
 def policy_for_record(base, settings, record):
     if not isinstance(record, dict) or not isinstance(record.get("source_id"), str):
         raise AgentError("EDITORIAL_SOURCE_POLICY_REQUIRED", 409)
-    for policy in registered_policies(base, settings):
+    from .article_attribution import illustrated_presentation
+    selected_base = copy.deepcopy(base)
+    presentation = record.get("presentation_contract")
+    if presentation is None:
+        # Настройка нового оформления не переписывает прежние policy hashes,
+        # согласования и машинные доказательства уже подготовленных статей.
+        selected_base.pop("presentation_contract", None)
+        selected_base.pop("presentation_owner_instruction", None)
+    elif not illustrated_presentation(presentation) or not illustrated_presentation(selected_base.get("presentation_contract")):
+        raise AgentError("ARTICLE_PRESENTATION_CONTRACT_INVALID", 409)
+    else:
+        # При смене только оформления исходное поручение остаётся буквальным.
+        # Историческая версия воспроизводит прежний policy hash; новый резерв
+        # принимает только текущий marker через ready_for_policy.
+        selected_base["presentation_contract"] = presentation
+    for policy in registered_policies(selected_base, settings):
         if record["source_id"] == policy["source_id"]:
+            policy = _historical_policy(policy, settings, record)
             if record["source_id"] in _SOURCES:
                 validate_source_url(record["source_id"], record.get("url"))
             else:
@@ -127,7 +177,8 @@ def policy_for_article(base, settings, article):
         if host == spec["host"]:
             # Не принимаем другие разделы на том же домене под общей лицензией.
             validate_source_url(source_id, article["url"])
-            return policy_for_record(base, settings, {"source_id": source_id, "url": article["url"]})
+            return policy_for_record(base, settings, {"source_id": source_id, "url": article["url"],
+                **({"presentation_contract": base["presentation_contract"]} if "presentation_contract" in base else {})})
     if host in base["allowed_hosts"]:
         return copy.deepcopy(base)
     raise AgentError("EDITORIAL_SOURCE_POLICY_REQUIRED", 409)

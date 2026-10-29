@@ -3,16 +3,18 @@
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 from sqlalchemy import select
 
-from .config import AgentError, fingerprint, inside
+from .config import AgentError, fingerprint, inside, parse_json
 from .db import Cursor, Material
 from .reddit import text_hash
 
@@ -20,6 +22,8 @@ API = "https://svs.gsfc.nasa.gov/api/"
 MAX_BYTES = 2 * 1024 * 1024
 RIGHTS = re.compile(r"copyright|all rights reserved|©|licensed music|music:", re.I)
 CHECKPOINT_ID = "server_nasa_svs"
+SCIENCE_MAILTO_CONTRACT = "science-mailto-v1"
+SCIENCE_MAILTO_HREFS = frozenset({"mailto:comms@noirlab.edu", "mailto:info@noirlab.edu"})
 
 
 def _get(client, url, params=None):
@@ -44,7 +48,7 @@ def _get(client, url, params=None):
     return value, bytes(raw)
 
 
-def _parser():
+def _parser(*, science_mailto=False):
     # Используем проверенный links-v1 extractor с сохранением видимых href.
     path = Path(__file__).resolve().parents[2] / "scripts/fetch_nasa_article.py"
     spec = importlib.util.spec_from_file_location("max_postiz_nasa_extractor", path)
@@ -52,6 +56,22 @@ def _parser():
         raise AgentError("NASA_EXTRACTOR_UNAVAILABLE", 503)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if science_mailto is True:
+        original_href = module._narrative_href
+
+        def science_href(href, base):
+            # Два адреса официального блока сохраняются буквально. Это только
+            # текст ссылки: сборщик не открывает mailto и не отправляет письма.
+            if (isinstance(href, str) and href in SCIENCE_MAILTO_HREFS
+                    and isinstance(base, str)
+                    and re.fullmatch(r"https://noirlab\.edu/public/images/iotw[0-9]{4}[a-z]/", base)):
+                return href
+            return original_href(href, base)
+
+        module._narrative_href = science_href
+        module.science_extraction_contract = SCIENCE_MAILTO_CONTRACT
+    elif science_mailto is not False:
+        raise AgentError("SCIENCE_EXTRACTION_CONTRACT_INVALID", 409)
     return module
 
 
@@ -60,34 +80,150 @@ def _grams(value):
     return {tuple(words[i : i + 5]) for i in range(max(0, len(words) - 4))}
 
 
+def _pre_model_image_narrative(core, session, record):
+    """Исходник отмены до моделей остаётся в dedup; это не восстановление статьи."""
+    from .article_attribution import illustrated_presentation
+    from .article_reserve import KNOWN_IMAGE_REJECTIONS, RESERVE_CONTRACT
+    from .db import Audit, Story
+    from .hub_models import Variant
+    from .server_models import EditorialLedger, EditorialPreparationClaim, PublicationSlot
+
+    def require(value):
+        if not value:
+            raise ValueError
+
+    def stamp(value):
+        require(type(value) in {int, float} and math.isfinite(value) and value >= 0)
+        return value
+
+    def absent(path):
+        require(path.resolve() == path and not path.exists() and not path.is_symlink())
+
+    def audit(action, entity, actor, details):
+        rows = list(session.scalars(select(Audit).where(Audit.action == action, Audit.entity == entity)))
+        require(len(rows) == 1 and rows[0].actor == actor
+                and fingerprint(rows[0].details) == fingerprint(details))
+
+    try:
+        ident, error = record['id'], record.get('error')
+        require(isinstance(ident, str) and re.fullmatch(r'[A-Za-z0-9-]{1,80}', ident)
+                and record.get('state') == 'cancelled' and error in KNOWN_IMAGE_REJECTIONS
+                and illustrated_presentation(record.get('presentation_contract'))
+                and record.get('reserve_contract') == RESERVE_CONTRACT
+                and not record.get('model_result_unknown') and record.get('illustration') is None
+                and record.get('image_credit') is None and record.get('illustration_proof_hash') is None
+                and not any(record.get(key) for key in ('variant_id', 'postiz_id', 'dispatch_id', 'due_at',
+                    'prepared_hash', 'reserve_prepared_hash', 'material_id', 'story_id', 'draft_id',
+                    'publication_slot_id', 'automatic_repair_attempts', 'automatic_corrections',
+                    'review_protocol_recoveries')))
+        ledger = session.get(EditorialLedger, 'hourly')
+        saved = [row for row in ledger.payload['records'] if row.get('id') == ident] if ledger else []
+        require(len(saved) == 1 and fingerprint(saved[0]) == fingerprint(record))
+        attempts = record.get('preparation_attempts')
+        require(isinstance(attempts, list) and len(attempts) == 1 and isinstance(attempts[0], dict))
+        attempt = attempts[0]
+        require(type(attempt.get('number')) is int and attempt['number'] == 1
+                and attempt.get('state') == 'needs_attention' and attempt.get('error') == error
+                and attempt.get('image_preparation_state') == 'failed'
+                and attempt.get('presentation_contract') == record['presentation_contract']
+                and attempt.get('operator_retry') is False and attempt.get('model_started_at') is None
+                and not any(attempt.get(key) for key in ('candidate_hash', 'automatic_repair_claim',
+                    'image_credit', 'illustration_proof_hash')))
+        require(stamp(record['claimed_at']) <= stamp(attempt['started_at'])
+                <= stamp(attempt['finished_at']) <= stamp(record['cancelled_at']))
+        actions = [row for row in record.get('preparation_actions', [])
+                   if row.get('action') == 'image_rejected_before_models']
+        require(len(actions) == 1 and actions[0].get('previous_state') == 'needs_attention'
+                and actions[0].get('error') == error and actions[0].get('at') == record['cancelled_at'])
+        claim = record.get('reserve_claim')
+        require(isinstance(claim, dict) and isinstance(claim.get('id'), str)
+                and isinstance(claim.get('token'), str) and type(claim.get('control_revision')) is int)
+        row = session.get(EditorialPreparationClaim, claim['id'])
+        require(row is not None and row.record_id == ident and row.token == claim['token']
+                and row.control_revision == claim['control_revision'] and row.active_key is None
+                and row.state == 'rejected' and row.error == error and row.updated_at == record['cancelled_at'])
+        binding = {key: record.get(key) for key in ('id', 'reserve_contract', 'reserve_claim', 'input_hash',
+            'policy_hash', 'target_id', 'source_id', 'original_hash', 'source_published_at')}
+        binding_hash = fingerprint(binding)
+        durable = session.get(Audit, str(uuid5(NAMESPACE_URL, 'max-postiz:reserve-binding:' + ident)))
+        require(durable is not None and durable.actor == 'article_reserve' and durable.entity == ident
+                and durable.action == 'article_reserve_preparation_binding'
+                and fingerprint(durable.details) == fingerprint({'binding': binding, 'binding_hash': binding_hash})
+                and record.get('reserve_binding_hash') == binding_hash)
+        audit('reserve_preparation_claim', row.id, 'article_reserve',
+              {'control_revision': row.control_revision, 'contract': RESERVE_CONTRACT})
+        audit('reserve_preparation_bound', row.id, 'article_reserve',
+              {'record_id': ident, 'control_revision': row.control_revision})
+        audit('hourly_article_prepare_error', ident, 'article_quality', {'attempt': 1, 'error': error})
+        audit('reserve_image_rejected_before_models', ident, 'article_reserve',
+              {'claim_id': row.id, 'control_revision': row.control_revision, 'error': error,
+               'source_hash': record.get('original_hash'), 'policy_hash': record.get('policy_hash'),
+               'model_calls': 0, 'source_remains_used': True})
+        require(not session.scalar(select(Audit).where(Audit.entity == ident,
+                    Audit.action == 'hourly_article_prepare_attempt'))
+                and not session.scalar(select(Story).where(Story.text_hash == fingerprint({'hourly_article': ident})))
+                and not session.scalar(select(PublicationSlot).where(PublicationSlot.record_id == ident))
+                and not any(v.metadata_json.get('record_id') == ident for v in session.scalars(select(Variant))))
+        root = core.settings.root
+        expected = f'data/hourly-articles/quality-{ident}.local.jsonl'
+        require(record.get('quality_trace') == expected)
+        absent(root / expected)
+        expected = f'data/hourly-articles/input-{ident}.local.json'
+        require(record.get('input_file') == expected)
+        path = root / expected
+        require(path.resolve() == path and not path.is_symlink() and path.is_file()
+                and 0 < path.stat().st_size <= 40000)
+        raw = path.read_bytes()
+        require(hashlib.sha256(raw).hexdigest() == record.get('input_file_hash'))
+        article = parse_json(raw.decode('utf-8'))
+        require(isinstance(article, dict) and set(article) == {'url', 'title', 'original', 'published_at'}
+                and all(isinstance(article[key], str) and article[key].strip() for key in ('url', 'title', 'original'))
+                and stamp(article['published_at']) == record['source_published_at']
+                and fingerprint(article) == record['input_hash'] and article['url'] == record['url']
+                and text_hash(article['original']) == record['original_hash'])
+        require(not session.scalar(select(Material).where((Material.url == record['url'])
+            | Material.text_hash.in_({record['original_hash'], fingerprint(' '.join(article['original'].casefold().split()))}))))
+        return article['original']
+    except (ValueError, TypeError, KeyError, AttributeError, OSError, UnicodeError, RuntimeError, AgentError) as exc:
+        raise AgentError('NASA_DEDUP_CORPUS_INCOMPLETE', 409) from exc
+
+
 def _used_narratives(core, ledger):
     records = [r for r in ledger["records"] if r.get("original_hash")]
     with core.db.session() as session:
         materials = list(session.scalars(select(Material)))
         by_url = {m.url: m.text for m in materials if m.text}
-    result = []
-    for record in records:
-        value = by_url.get(record.get("url"), "")
-        if not value or text_hash(value) != record["original_hash"]:
-            trace = inside(core.settings.root, record.get("quality_trace", ""))
-            if not trace.is_file() or trace.stat().st_size > MAX_BYTES:
+        result = []
+        for record in records:
+            value = by_url.get(record.get("url"), "")
+            attempts = record.get('preparation_attempts', [])
+            image_failed = isinstance(attempts, list) and any(isinstance(attempt, dict)
+                and attempt.get('image_preparation_state') == 'failed' for attempt in attempts)
+            if image_failed:
+                value = _pre_model_image_narrative(core, session, record)
+            elif not value or text_hash(value) != record["original_hash"]:
+                trace = inside(core.settings.root, record.get("quality_trace", ""))
+                if not trace.exists() and not trace.is_symlink():
+                    value = _pre_model_image_narrative(core, session, record)
+                else:
+                    if not trace.is_file() or trace.stat().st_size > MAX_BYTES:
+                        raise AgentError("NASA_DEDUP_CORPUS_INCOMPLETE", 409)
+                    value = ""
+                    for line in trace.read_text(encoding="utf-8").splitlines():
+                        event = json.loads(line)
+                        source = event.get("source_untrusted") or event.get("context", {}).get(
+                            "source_untrusted"
+                        )
+                        if (
+                            isinstance(source, dict)
+                            and isinstance(source.get("body"), str)
+                            and text_hash(source["body"]) == record["original_hash"]
+                        ):
+                            value = source["body"]
+                            break
+            if not value or text_hash(value) != record["original_hash"]:
                 raise AgentError("NASA_DEDUP_CORPUS_INCOMPLETE", 409)
-            value = ""
-            for line in trace.read_text(encoding="utf-8").splitlines():
-                event = json.loads(line)
-                source = event.get("source_untrusted") or event.get("context", {}).get(
-                    "source_untrusted"
-                )
-                if (
-                    isinstance(source, dict)
-                    and isinstance(source.get("body"), str)
-                    and text_hash(source["body"]) == record["original_hash"]
-                ):
-                    value = source["body"]
-                    break
-        if not value or text_hash(value) != record["original_hash"]:
-            raise AgentError("NASA_DEDUP_CORPUS_INCOMPLETE", 409)
-        result.append(value)
+            result.append(value)
     return result
 
 
