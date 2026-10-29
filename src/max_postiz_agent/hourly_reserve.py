@@ -184,10 +184,10 @@ class ReserveServerCycle(ServerCycle):
         if not settings["reserve"]["enabled"]:
             return self._phase("reserve_disabled")
         for record in candidates:
-            if self.reserve.disqualify_semantic_ready(record["id"], cycle=self.cycle):
-                continue
             claim = self.reserve.active_preparation()
             if claim and claim.get("record_id") == record["id"]:
+                continue
+            if self.reserve.disqualify_semantic_ready(record["id"], cycle=self.cycle):
                 continue
             # Любая ошибка exact доказательства блокирует этот материал до отдельной сверки.
             due = self._due(settings, self.cycle._policy_for_record(record))

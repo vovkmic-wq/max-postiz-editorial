@@ -746,3 +746,18 @@ def test_ready_cleanup_precedes_capacity_and_preserves_another_pending_dispatch_
         d = s.get(Dispatch, pending_before["id"]); slot = s.get(PublicationSlot, slot_before["id"])
         assert {k: getattr(d, k) for k in pending_before} == pending_before
         assert {k: getattr(slot, k) for k in slot_before} == slot_before
+
+
+def test_sender_skips_owned_ready_candidate_before_closed_validation_then_producer_disqualifies(reserve_controller, monkeypatch):
+    from max_postiz_agent.server_models import PublicationSlot
+    value = reserve_controller
+    claim, record, calls = accepted_mass_candidate(value, monkeypatch, close_claim=False)
+    owned = copy.deepcopy(value.store.active_preparation())
+    trace = value.core.settings.root / record["quality_trace"]; raw = trace.read_bytes()
+    assert value.controller.run_once()["phase"] == "reserve_empty"
+    assert value.store.active_preparation() == owned and trace.read_bytes() == raw
+    with value.core.db.session() as s:
+        assert s.query(PublicationSlot).count() == s.query(Dispatch).count() == s.query(TargetApproval).count() == 0
+    assert value.controller._finish_candidate(claim, record) == "semantic_rejected"
+    assert value.store.active_preparation() is None and len(calls) == 1 and not value.writes
+    assert value.cycle._record(value.cycle._load(), record["id"])["state"] == "cancelled"
