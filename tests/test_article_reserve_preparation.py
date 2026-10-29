@@ -582,3 +582,167 @@ def test_preflight_with_changed_illustration_evidence_cannot_release_claim(illus
         value.store.reject_translation_preflight(claim, original["id"], error, cycle=value.cycle)
     assert value.store.active_preparation() is not None and value.cycle._load()["records"][0]["state"] == "needs_attention"
     assert calls == [] and not value.posts and not value.writes
+
+
+MASS_EN = ("A small galaxy contains many bright stars and active star forming regions. "
+    "Despite being only 10–20% as massive as the Milky Way galaxy, the small galaxy forms many new stars in a nearby region.")
+MASS_RU = ("Небольшая галактика содержит много ярких звёзд и активных областей звездообразования. "
+    "Несмотря на то, что оно только на 10-20% массивнее Млечного Пути, эта небольшая галактика образует много новых звёзд в соседней области.")
+
+
+def mass_finding(english=MASS_EN, russian=MASS_RU):
+    from max_postiz_agent.article_reserve import mass_relation_finding
+    return mass_relation_finding({"title": "A galaxy comparison", "body": english, "url": "https://science.example.org/article/"},
+        {"title": "Сравнение галактик", "body": russian})
+
+
+def test_unique_small_fraction_to_percent_more_finding_binds_exact_quotes_codepoints_and_full_hashes():
+    result = mass_finding()
+    assert result["lower_percent"] == "10" and result["upper_percent"] == "20"
+    a, b = result["source_codepoint_span"], result["candidate_codepoint_span"]
+    assert MASS_EN[a[0]:a[1]] == result["source_quote"]
+    assert MASS_RU[b[0]:b[1]] == result["candidate_quote"]
+    assert result["candidate_hash"] == fingerprint({"title": "Сравнение галактик", "body": MASS_RU})
+
+
+@pytest.mark.parametrize("english,russian", [
+    (MASS_EN, MASS_RU.replace("только на 10-20% массивнее", "имеет только 10-20% массы")),
+    (MASS_EN, MASS_RU.replace("10-20%", "11-20%")),
+    (MASS_EN.replace("10–20%", "100–120%"), MASS_RU.replace("10-20%", "100-120%")),
+    (MASS_EN.replace("10–20%", "0–20%"), MASS_RU.replace("10-20%", "0-20%")),
+    (MASS_EN.replace("10–20%", "20–10%"), MASS_RU.replace("10-20%", "20-10%")),
+    (MASS_EN.replace("Milky Way", "Andromeda"), MASS_RU),
+    (MASS_EN, MASS_RU.replace("Млечного Пути", "галактики Андромеды")),
+    (MASS_EN.replace("Despite", "It is false that despite"), MASS_RU),
+    (MASS_EN, MASS_RU.replace("Несмотря", "Неверно, что несмотря")),
+    (MASS_EN, MASS_RU.replace("массивнее", "не массивнее")),
+    ('"' + MASS_EN[MASS_EN.index("Despite"):] + '"', MASS_RU),
+    (MASS_EN, '«' + MASS_RU[MASS_RU.index("Несмотря"):] + '»'),
+    (MASS_EN + " " + MASS_EN, MASS_RU),
+    (MASS_EN, MASS_RU + " " + MASS_RU),
+    (MASS_EN.replace("nearby region", "nearby region, but the statement is uncertain"), MASS_RU),
+    (MASS_EN, MASS_RU.replace("соседней области", "соседней области, но это лишь предположение")),
+    (MASS_EN.replace("galaxy,", "galaxy cluster,"), MASS_RU),
+    (MASS_EN.replace("galaxy,", "galaxy's central bulge,"), MASS_RU),
+    (MASS_EN + " Another object is as massive as a star.", MASS_RU),
+])
+def test_ambiguous_changed_correct_or_other_mass_relations_produce_no_disqualification(english, russian):
+    assert mass_finding(english, russian) is None
+
+
+def accepted_mass_candidate(value, monkeypatch, *, close_claim):
+    import httpx
+    from max_postiz_agent.article_quality import ArticleQuality
+    from test_automatic_policy import Model
+    article = {**value.article, "url": value.article["url"].rstrip("/") + "/mass-comparison/",
+               "title": "A galaxy comparison", "original": MASS_EN}
+    calls = []
+
+    def quality(record_id=None, review_only=False):
+        calls.append("initial fixture QA only")
+        return ArticleQuality(Model({"title": "Сравнение галактик", "body": MASS_RU}, "hy-mt2-7b-q8"),
+            Model({"approved": True, "topic": "science", "issues": [], "warnings": []}, "ministral"),
+            prompt_dir=value.core.settings.root / "prompts", trace=value.cycle._trace_writer(record_id),
+            review_rubric="meaning-first-v1", transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"matches": []})))
+
+    monkeypatch.setattr(value.cycle, "_quality", quality)
+    claim = value.store.begin_preparation()
+    result = value.cycle.prepare(article, reserve_claim=claim)
+    if close_claim:
+        value.store.finish_preparation(claim, "quality_ready")
+    record = value.cycle._record(value.cycle._load(), result["id"])
+    return claim, record, calls
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+@pytest.mark.parametrize("active", [False, True])
+def test_semantic_eligibility_cancel_preserves_true_machine_verdict_raw_variant_and_closed_history(request, backend, active, monkeypatch):
+    from max_postiz_agent.db import Audit
+    from max_postiz_agent.server_models import EditorialPreparationClaim
+    value = request.getfixturevalue("reserve_pg" if backend == "postgres" else "reserve")
+    claim, record, calls = accepted_mass_candidate(value, monkeypatch, close_claim=not active)
+    trace = value.core.settings.root / record["quality_trace"]; raw = trace.read_bytes()
+    with value.core.db.session() as s:
+        before = copy.deepcopy(s.get(Variant, record["variant_id"]).metadata_json)
+        body = s.get(Variant, record["variant_id"]).body
+        closed = {k: getattr(s.get(EditorialPreparationClaim, claim["id"]), k) for k in ("state", "active_key", "error", "updated_at")}
+    assert value.store.disqualify_semantic_ready(record["id"], cycle=value.cycle, claim=claim if active else None) is True
+    final = value.cycle._record(value.cycle._load(), record["id"])
+    assert final["state"] == "cancelled" and final.get("error") == record.get("error")
+    assert trace.read_bytes() == raw and final["preparation_attempts"] == record["preparation_attempts"]
+    assert len(calls) == 1 and not value.writes
+    with value.core.db.session() as s:
+        v = s.get(Variant, record["variant_id"]); p = s.get(EditorialPreparationClaim, claim["id"])
+        assert v.body == body and v.metadata_json == before and before["machine_review_evidence"]["review"]["approved"] is True
+        if active: assert p.state == "rejected" and p.active_key is None
+        else: assert {k: getattr(p, k) for k in closed} == closed
+        a = s.query(Audit).filter_by(entity=record["id"], action="reserve_semantic_publication_ineligible").one()
+        assert a.details["machine_verdict_preserved"] is True and a.details["model_calls"] == 0
+        assert s.query(Dispatch).count() == s.query(TargetApproval).count() == s.query(RemoteDraft).count() == 0
+
+
+@pytest.mark.parametrize("damage", ["trace", "input", "claim", "unknown", "repair", "postiz", "snapshot"])
+def test_semantic_disqualification_cannot_waive_unknown_or_stale_binding(reserve, monkeypatch, damage):
+    from max_postiz_agent.server_models import EditorialPreparationClaim
+    value = reserve
+    claim, record, calls = accepted_mass_candidate(value, monkeypatch, close_claim=True)
+    if damage in {"trace", "input"}:
+        name = record["quality_trace"] if damage == "trace" else record["input_file"]
+        path = value.core.settings.root / name; path.write_bytes(path.read_bytes() + b" ")
+    elif damage == "claim":
+        with value.core.db.session.begin() as s: s.get(EditorialPreparationClaim, claim["id"]).state = "blocked_unknown"
+    elif damage == "snapshot":
+        with value.core.db.session.begin() as s:
+            v = s.get(Variant, record["variant_id"]); v.metadata_json = {**v.metadata_json, "changed": True}
+    else:
+        ledger = value.cycle._load(); r = value.cycle._record(ledger, record["id"])
+        if damage == "unknown": r["model_result_unknown"] = True
+        elif damage == "repair": r["automatic_repair_attempts"] = [{"state": "correcting"}]
+        else: r["postiz_id"] = "unexpected"
+        value.cycle._save(ledger)
+    before = copy.deepcopy(value.cycle._load())
+    with pytest.raises(AgentError): value.store.disqualify_semantic_ready(record["id"], cycle=value.cycle)
+    assert value.cycle._load() == before and len(calls) == 1 and not value.writes
+
+
+def test_fresh_mass_inversion_is_rejected_before_claim_can_become_available_ready(reserve, monkeypatch):
+    from max_postiz_agent.hourly_reserve import ReserveServerCycle
+    from max_postiz_agent.db import Audit
+    value = reserve
+    claim, record, calls = accepted_mass_candidate(value, monkeypatch, close_claim=False)
+    controller = ReserveServerCycle(value.core, state=ServerState(value.core), cycle=value.cycle, reserve_store=value.store)
+    assert controller._finish_candidate(claim, record) == "semantic_rejected"
+    assert value.store.active_preparation() is None and len(calls) == 1 and not value.writes
+    with value.core.db.session() as s:
+        assert not s.query(Audit).filter_by(entity=claim["id"], action="reserve_preparation_finished").first()
+
+
+def test_ready_cleanup_precedes_capacity_and_preserves_another_pending_dispatch_and_good_stock(reserve_controller, monkeypatch):
+    from max_postiz_agent.server_models import EditorialControl, PublicationSlot
+    value = reserve_controller
+    value.controller.prepare_once(); value.controller.run_once()
+    extra = {**value.article, "url": value.article["url"].rstrip("/") + "/extra-ready/",
+             "original": value.article["original"] + " Additional observations are retained in the complete report."}
+    extra_claim = value.store.begin_preparation(); good = value.cycle.prepare(extra, reserve_claim=extra_claim)
+    value.store.finish_preparation(extra_claim, "quality_ready")
+    claim, bad, calls = accepted_mass_candidate(value, monkeypatch, close_claim=True)
+    with value.core.db.session.begin() as s:
+        control = s.get(EditorialControl, "main")
+        control.settings = {**control.settings, "reserve": {**control.settings["reserve"], "target": 2, "low": 1}}
+        control.runtime = {**control.runtime, "preparation": {"next_run_at": 0, "refilling": False}}
+    with value.core.db.session() as s:
+        pending = s.query(Dispatch).filter_by(state="pending").one()
+        pending_before = {k: copy.deepcopy(getattr(pending, k)) for k in ("id", "state", "snapshot", "due_at", "attempts")}
+        slot = s.query(PublicationSlot).filter_by(dispatch_id=pending.id).one()
+        slot_before = {k: copy.deepcopy(getattr(slot, k)) for k in ("id", "record_id", "due_at", "state", "token")}
+    writes = copy.deepcopy(value.writes); value.controller._refilling = False
+    value.controller.selector = lambda *_args, **_kwargs: None
+    assert value.controller.prepare_once()["phase"] == "no_source"
+    records = value.cycle._load()["records"]
+    assert value.cycle._record({"records": records}, bad["id"])["state"] == "cancelled"
+    assert value.cycle._record({"records": records}, good["id"])["state"] == "quality_ready"
+    assert value.writes == writes and len(calls) == 1
+    with value.core.db.session() as s:
+        d = s.get(Dispatch, pending_before["id"]); slot = s.get(PublicationSlot, slot_before["id"])
+        assert {k: getattr(d, k) for k in pending_before} == pending_before
+        assert {k: getattr(slot, k) for k in slot_before} == slot_before

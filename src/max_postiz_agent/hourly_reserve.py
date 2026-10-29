@@ -184,6 +184,8 @@ class ReserveServerCycle(ServerCycle):
         if not settings["reserve"]["enabled"]:
             return self._phase("reserve_disabled")
         for record in candidates:
+            if self.reserve.disqualify_semantic_ready(record["id"], cycle=self.cycle):
+                continue
             claim = self.reserve.active_preparation()
             if claim and claim.get("record_id") == record["id"]:
                 continue
@@ -211,6 +213,8 @@ class ReserveServerCycle(ServerCycle):
     def _finish_candidate(self, claim, record):
         for _ in range(2):
             if record["state"] == "quality_ready":
+                if self.reserve.disqualify_semantic_ready(record["id"], cycle=self.cycle, claim=claim):
+                    return "semantic_rejected"
                 self.reserve.finish_preparation(claim, "quality_ready")
                 return "quality_ready"
             status = self._automatic_repair_status(record)
@@ -228,6 +232,8 @@ class ReserveServerCycle(ServerCycle):
                         raise
             record = self.cycle._record(self.cycle._load(), record["id"])
         if record["state"] == "quality_ready":
+            if self.reserve.disqualify_semantic_ready(record["id"], cycle=self.cycle, claim=claim):
+                return "semantic_rejected"
             self.reserve.finish_preparation(claim, "quality_ready")
             return "quality_ready"
         status = self._automatic_repair_status(record)
@@ -252,6 +258,9 @@ class ReserveServerCycle(ServerCycle):
         if not options["enabled"]:
             return {"phase": "reserve_disabled"}
         self.state.assert_running()
+        for ready in self.cycle._load()["records"]:
+            if ready.get("state") == "quality_ready" and ready.get("reserve_contract") == RESERVE_CONTRACT:
+                self.reserve.disqualify_semantic_ready(ready["id"], cycle=self.cycle)
         if self.reserve.active_preparation():
             return self._phase("blocked", last_error={"code": "ARTICLE_RESERVE_PREPARATION_ACTIVE"})
         active, leased = self._inventory()

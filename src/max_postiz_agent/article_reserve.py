@@ -8,6 +8,7 @@ import hashlib
 import math
 import re
 from collections import Counter
+from decimal import Decimal
 from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import select
@@ -22,6 +23,7 @@ from .server_models import EditorialControl, EditorialLedger, EditorialPreparati
 from .server_state import CONTROL_ID, LEDGER_ID, require_running
 
 RESERVE_CONTRACT = "article-reserve-v1"
+MASS_RELATION_CONTRACT = "milky-way-small-mass-ratio-inversion-v1"
 KNOWN_IMAGE_REJECTIONS = frozenset({
     "ARTICLE_IMAGE_REQUIRED", "ARTICLE_IMAGE_SOURCE_NOT_SUPPORTED", "ARTICLE_IMAGE_RIGHTS_REQUIRED",
     "ARTICLE_IMAGE_DOWNLOAD_REQUIRED", "ARTICLE_IMAGE_QUALITY_REQUIRED", "ARTICLE_IMAGE_SIZE_INVALID",
@@ -45,6 +47,54 @@ def ready_for_policy(record, policy):
     marker = policy.get("presentation_contract")
     return (record.get("state") == "quality_ready"
             and (marker is None or record.get("presentation_contract") == marker))
+
+
+def mass_relation_finding(source, candidate):
+    """Only the unique, explicit fraction -> percent-more Milky Way template."""
+    if (not isinstance(source, dict) or not isinstance(candidate, dict)
+            or not all(isinstance(source.get(k), str) for k in ("title", "body", "url"))
+            or not all(isinstance(candidate.get(k), str) for k in ("title", "body"))):
+        return None
+    en, ru = source["body"], candidate["body"]
+    def interval(decimal):
+        number = rf"(?:0|[1-9][0-9]*)(?:{decimal}[0-9]+)?"
+        return rf"(?P<lower>{number})\s*[-–—]\s*(?P<upper>{number})\s*%"
+
+    end = r"(?=\s*(?:[,.;!?]|$))"
+    english = re.compile(rf"\bDespite\s+being\s+only\s+{interval('[.]')}\s+as\s+massive\s+as\s+the\s+Milky\s+Way\s+galaxy\b{end}", re.I)
+    russian = re.compile(rf"\bНесмотря\s+на\s+то\s*,\s*что\s+оно\s+только\s+на\s+{interval('[.,]')}\s+массивнее\s+Млечного\s+Пути\b{end}", re.I)
+    left, right = list(english.finditer(en)), list(russian.finditer(ru))
+    if len(left) != 1 or len(right) != 1:
+        return None
+    a, b = left[0], right[0]
+    ranges = [tuple(Decimal(m[k].replace(",", ".")) for k in ("lower", "upper")) for m in (a, b)]
+    if ranges[0] != ranges[1] or not 0 < ranges[0][0] <= ranges[0][1] < 100:
+        return None
+
+    def unambiguous(text, match, *, english):
+        prefix, suffix = text[:match.start()], text[match.end():]
+        start = max((prefix.rfind(c) for c in ".!?\n"), default=-1) + 1
+        end = min((match.end() + i for i, c in enumerate(suffix) if c in ".!?\n"), default=len(text))
+        clause = text[start:end].strip()
+        if not clause.startswith(match[0]):
+            return False
+        # Quoted/meta/negated or multiple comparative clauses provide no proof.
+        quoted = re.sub(r"(?<=[A-Za-zА-Яа-я])['’](?=[A-Za-zА-Яа-я])", "", clause)
+        if any(c in quoted for c in "\"'‘’“”«»„‟"):
+            return False
+        exclusions = (r"\b(?:not|no|never|neither|nor|without|false|incorrect|if|whether|or|however|but)\b" if english
+                      else r"\b(?:не|нет|ни|никогда|неверно|ошибочно|если|ли|или|якобы|но|однако)\b")
+        return re.search(exclusions, clause, re.I) is None
+
+    if (not unambiguous(en, a, english=True) or not unambiguous(ru, b, english=False)
+            or len(re.findall(r"\bas\s+massive\s+as\b", en, re.I)) != 1
+            or len(re.findall(r"\bмассивнее\b", ru, re.I)) != 1):
+        return None
+    return {"contract": MASS_RELATION_CONTRACT, "source_hash": fingerprint(source),
+            "candidate_hash": fingerprint(candidate), "lower_percent": str(ranges[0][0]),
+            "upper_percent": str(ranges[0][1]), "source_quote": a[0], "candidate_quote": b[0],
+            "source_codepoint_span": [a.start(), a.end()], "candidate_codepoint_span": [b.start(), b.end()],
+            "source_relation": "fraction_of_milky_way_mass", "candidate_relation": "percent_more_massive_than_milky_way"}
 
 
 def _claim_view(row):
@@ -386,6 +436,98 @@ class ArticleReserveStore:
         if len(matches) != 1:
             raise AgentError("ARTICLE_RESERVE_RECORD_MISMATCH", 409)
         return matches[0]
+
+    def disqualify_semantic_ready(self, record_id, *, cycle, claim=None):
+        """Separate future eligibility decision; never rewrite machine QA/history."""
+        from .automatic_policy import automatic_evidence, _reference_binding
+        from .article_cycle import review_rubric_binding, scientific_contract_binding
+        from .article_quality import rubric_translation_gate
+        from .article_repair_cycle import AutomaticArticleRepair
+        from .config import inside, parse_json
+        from .human_review import candidate_body, source_data
+        from .reddit import text_hash
+        code = "ARTICLE_SEMANTIC_DISQUALIFICATION_NOT_SAFE"
+
+        def require(value):
+            if not value:
+                raise AgentError(code, 409)
+
+        with self.core.db.session() as probe:
+            previous = copy.deepcopy(self._record(probe, record_id))
+            if previous.get("state") != "quality_ready":
+                return False  # Historical failures, publications and pending slots are untouched.
+            variant = self.core._variant(probe, previous["variant_id"])
+            source = source_data(probe, variant)
+            candidate = {"title": variant.title, "body": candidate_body(variant, source)}
+            finding = mass_relation_finding(source, candidate)
+            if finding is None:
+                return False
+            snapshot_hash = fingerprint(self.core.snapshot(variant, self.core._target(probe, variant.target_id)))
+        # The already closed reserve uses the complete native validator. An active
+        # owned claim is validated below without exposing a quality_ready claim.
+        closed_validation = cycle.validate_reserve(record_id) if claim is None else None
+        with self.core.db.session.begin() as session:
+            control = self._control(session)
+            variant = self.core._variant(session, previous["variant_id"], True)
+            target = session.scalar(select(Target).where(Target.id == variant.target_id).with_for_update())
+            ledger = session.scalar(select(EditorialLedger).where(EditorialLedger.id == LEDGER_ID).with_for_update())
+            payload = copy.deepcopy(ledger.payload)
+            record = next((r for r in payload["records"] if r.get("id") == record_id), {})
+            require(record == previous and record.get("state") == "quality_ready"
+                and record.get("reserve_contract") == RESERVE_CONTRACT and not record.get("model_result_unknown")
+                and not any(record.get(k) is not None for k in ("postiz_id", "dispatch_id", "due_at", "publication_slot_id"))
+                and record.get("prepared_hash") == record.get("reserve_prepared_hash") == snapshot_hash
+                and fingerprint(self.core.snapshot(variant, target)) == snapshot_hash
+                and not session.scalar(select(PublicationSlot).where(PublicationSlot.record_id == record_id))
+                and not session.scalar(select(TargetApproval).where(TargetApproval.variant_id == variant.id))
+                and not session.scalar(select(Dispatch).where(Dispatch.variant_id == variant.id))
+                and not session.scalar(select(BridgePost).where(BridgePost.variant_id == variant.id))
+                and session.get(RemoteDraft, variant.id) is None)
+            require(claim is None or record["reserve_claim"] == claim)
+            cycle._reserve_record(record, active=claim is not None, session=session)
+            preparation = self._preparation(session, record["reserve_claim"], record_id, active=claim is not None)
+            require(preparation.state == ("preparing" if claim is not None else "quality_ready"))
+            policy = cycle._policy_for_record(record)
+            require(policy.get("approval_mode") == "automatic" and fingerprint(policy) == record["policy_hash"])
+            cycle._source_target(policy)
+            AutomaticArticleRepair(cycle).assert_complete(record, session)
+            source = source_data(session, variant)
+            candidate = {"title": variant.title, "body": candidate_body(variant, source)}
+            require(mass_relation_finding(source, candidate) == finding)
+            evidence = automatic_evidence(session, variant)
+            require(evidence is not None and evidence["review"]["approved"] is True
+                and (closed_validation is None or closed_validation["reserve_evidence_hash"] == evidence["evidence_hash"]))
+            _reference_binding(session, variant, record)
+            review_rubric_binding(self.core, session, record, variant)
+            scientific_contract_binding(self.core, session, record, variant)
+            rubric_translation_gate(source["title"] + "\n\n" + source["body"], candidate["title"] + "\n\n" + candidate["body"],
+                policy["review_rubric"], reference_contract=record.get("reference_contract", "article-links-v1"))
+            raw = inside(self.core.settings.root, record["input_file"]).read_bytes()
+            article = parse_json(raw.decode("utf-8"))
+            require(hashlib.sha256(raw).hexdigest() == record["input_file_hash"]
+                and fingerprint(article) == record["input_hash"] and article == {"title": source["title"], "original": source["body"],
+                    "url": source["url"], "published_at": record["source_published_at"]}
+                and text_hash(article["original"]) == record["original_hash"])
+            trace = inside(self.core.settings.root, record["quality_trace"])
+            trace_hash = hashlib.sha256(trace.read_bytes()).hexdigest()
+            require(trace_hash == variant.metadata_json["machine_review_evidence"]["trace_hash"])
+            if illustrated_presentation(record.get("presentation_contract")):
+                from .article_images import validate_article_image
+                validate_article_image(self.core, record, variant)
+            self.core._quality(session, variant, target)
+            stamp = now()
+            disposition = {"contract": MASS_RELATION_CONTRACT, "finding": finding, "at": stamp,
+                "machine_review_evidence_hash": evidence["evidence_hash"], "trace_hash": trace_hash,
+                "source_remains_used": True, "machine_verdict_preserved": True}
+            record.update(state="cancelled", cancelled_at=stamp, semantic_publication_ineligibility=disposition)
+            ledger.payload, ledger.revision, ledger.updated_at = payload, ledger.revision + 1, stamp
+            if claim is not None:
+                preparation.state, preparation.active_key, preparation.updated_at = "rejected", None, stamp
+                preparation.error = "ARTICLE_COMPARATIVE_MASS_RELATION_INVERTED"
+            self.core.db.audit(session, "article_reserve", "reserve_semantic_publication_ineligible", record_id,
+                **disposition, control_revision=control.revision, preparation_claim_id=preparation.id,
+                preparation_claim_changed=claim is not None, model_calls=0)
+            return True
 
     def assign(self, record, due_at, *, text_hash, evidence_hash, min_gap_seconds=3600):
         """Назначить один готовый кандидат; никакой вызов Postiz здесь не выполняется."""
