@@ -1,4 +1,35 @@
 # Развёртывание и перенос
+
+## Действующий порядок 0.11.5
+
+Единственная панель — Postiz `/editorial`, один Linux server owner в
+`/opt/max-postiz`, сервис `max-postiz-editorial.service`. Установлены Python
+0.11.5 и схема 0008; Postiz image имеет отдельную версию
+`max-postiz-linux:0.11.2-illustrated-cas`.
+
+```sh
+cd /opt/max-postiz
+systemctl status max-postiz-editorial.service --no-pager
+curl --fail --silent http://127.0.0.1:8092/health
+.venv/bin/python deployment/linux/check-stack.py
+```
+
+Эти команды диагностические, не публикуют и не вызывают модели. Для обновления
+сначала сверяют QUEUE, sending/unknown, claims и leases, сохраняют закрытые
+backup обеих БД/runtime. Пауза агента не останавливает уже назначенный Postiz
+QUEUE. API оставляют онлайн во время долгих QA/backup; короткий перезапуск
+требует проверки времени до due и последующего health.
+
+Не запускайте старые Windows/Hub workers параллельно. `git clone` содержит
+только исходники и безопасные примеры: он не восстанавливает секреты, обе
+БД, custom image, медиа, модели и авторизованный браузер. Откат с активным
+или неизвестным внешним исходом требует сверки; удаление истории не является откатом.
+
+Действующая подробная процедура: [VM_EDITORIAL](VM_EDITORIAL.md).
+Результаты и открытые ограничения: [выпуск 0.11.5](RELEASE_0.11.5.md).
+
+## Исторические процедуры и датированные проверки
+
 ## Windows / Linux
 Python 3.12 и Node/npm для OpenCode. Windows: scripts/install.ps1 -Browser -SkipOpenCode (если бинарник уже установлен), Linux: sh scripts/install.sh. Опция Images устанавливает прежний необязательный image backend; для текста/загрузки PNG он не нужен.
 
@@ -49,4 +80,3 @@ pending/status; публиковать может только согласов�
 Все восемь образов этой установки закреплены по digest. Перед сетевым
 развёртыванием создайте least-privilege роли и настройте TLS/резервирование;
 замените локальные URL и удалите NOT_SECURED=true.
-
