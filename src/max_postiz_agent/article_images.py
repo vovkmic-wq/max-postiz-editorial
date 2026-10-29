@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -39,6 +40,56 @@ def _require(ok, code='ARTICLE_IMAGE_PROOF_INVALID'):
 
 def _sha(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+def _rights_contact_hash(html):
+    """Только CF-кодировка контакта: все остальные исходные символы значимы."""
+    offsets = [0] + [match.end() for match in re.finditer('\n', html)]
+    replacements = []
+    attribute = re.compile(r'''\s+([^\s/>=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?''')
+    prefix = '/cdn-cgi/l/email-protection#'
+
+    class Contacts(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            if not any(tag == 'span' and key == 'data-cfemail' or tag == 'a' and key == 'href'
+                       and isinstance(value, str) and value.startswith(prefix) for key, value in attrs):
+                return
+            _require(len(attrs) == len({key for key, _ in attrs}))
+            raw = self.get_starttag_text()
+            start = offsets[self.getpos()[0] - 1] + self.getpos()[1]
+            position = re.match(r'<[^\s/>]+', raw).end()
+            while (match := attribute.match(raw, position)) is not None:
+                position = match.end()
+                name = match[1].lower()
+                group = next((i for i in (2, 3, 4) if match[i] is not None), None)
+                if group is None:
+                    _require(not (tag == 'span' and name == 'data-cfemail'))
+                    continue
+                value, lead = match[group], ''
+                if tag == 'a' and name == 'href' and value.startswith(prefix):
+                    lead, value = prefix, value[len(prefix):]
+                elif not (tag == 'span' and name == 'data-cfemail'):
+                    continue
+                _require(8 <= len(value) <= 642 and len(value) % 2 == 0
+                         and re.fullmatch('[0-9a-fA-F]+', value) is not None)
+                encoded = bytes.fromhex(value)
+                try:
+                    email = bytes(char ^ encoded[0] for char in encoded[1:]).decode('utf-8')
+                except UnicodeError as exc:
+                    raise AgentError('ARTICLE_IMAGE_PROOF_INVALID', 409) from exc
+                _require(email.isprintable() and re.fullmatch(r'[^@\s<>]+@[^@\s<>]+', email) is not None)
+                replacements.append((start + match.start(group), start + match.end(group),
+                                     lead + 'decoded-email:' + email.encode('utf-8').hex()))
+            _require(re.fullmatch(r'\s*/?>', raw[position:]) is not None)
+
+        handle_startendtag = handle_starttag
+
+    parser = Contacts(convert_charrefs=False)
+    parser.feed(html)
+    parser.close()
+    for start, end, value in reversed(replacements):
+        html = html[:start] + value + html[end:]
+    return _sha(html.encode('utf-8'))
 
 
 def _write(path, value):
@@ -199,7 +250,7 @@ def _source_proof(core, article, source_id):
         candidate = image_candidate(source_id, article['url'], proof['page_html'])
         checked.append((path, proof, candidate))
     # Несколько catalog checkpoints допустимы только при одних странице/условиях/картинке.
-    _require(len({fingerprint({'page': p['hashes']['page'], 'rights': p['hashes']['rights'],
+    _require(len({fingerprint({'page': p['hashes']['page'], 'rights': _rights_contact_hash(p['rights_html']),
                               'image': c}) for _, p, c in checked}) == 1)
     return checked[0]
 

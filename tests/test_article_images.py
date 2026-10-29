@@ -13,7 +13,8 @@ from PIL import Image
 
 from max_postiz_agent.article_attribution import CC_BY_URL
 from max_postiz_agent.article_images import (
-    CONTRACT, HOSTS, MAX_BYTES, MAX_PARTS, PART_BYTES, image_candidate, prepare_article_image, validate_article_image,
+    CONTRACT, HOSTS, MAX_BYTES, MAX_PARTS, PART_BYTES, _rights_contact_hash,
+    image_candidate, prepare_article_image, validate_article_image,
 )
 from max_postiz_agent.config import AgentError, fingerprint
 
@@ -73,6 +74,129 @@ def rewrite_proof(value, proof):
     path = value.root / "data/article-images/image-record-1.proof.local.json"
     path.write_text(json.dumps(proof, ensure_ascii=False), encoding="utf-8")
     value.record.update(illustration=proof, image_credit=proof["credit"], illustration_proof_hash=fingerprint(proof))
+
+
+def cf_contact(key, email=b"contact@example.test", style="double"):
+    encoded = bytes([key]) + bytes(char ^ key for char in email)
+    href = "/cdn-cgi/l/email-protection#" + encoded.hex()
+    quote = {"double": '"', "single": "'", "bare": ""}.get(style, '"')
+    result = (f'<a href={quote}{href}{quote} title="Public contact">'
+        f'<span class="__cf_email__" data-cfemail={quote}{encoded.hex()}{quote}>'
+        '[email&#160;protected]</span></a>')
+    if style == "uppercase":
+        result = result.replace(encoded.hex(), encoded.hex().upper()).replace("href=", "HREF=")
+    if style == "multiline":
+        result = "\r\n" + result.replace(" data-cfemail=", "\r\n\tdata-cfemail=")
+    return result
+
+
+@pytest.mark.parametrize("style", ["double", "single", "bare", "uppercase", "multiline"])
+def test_only_cloudflare_key_representation_is_equivalent_with_exact_offsets(style):
+    before, after = ("<!--keep-->" + cf_contact(key, style=style) + "\n<p>CC BY 4.0</p>" for key in (17, 93))
+    assert before != after and _rights_contact_hash(before) == _rights_contact_hash(after)
+    assert _rights_contact_hash(before) != hashlib.sha256(before.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("change", ["email", "terms", "license", "other_href", "other_attribute", "space", "quote", "comment"])
+def test_contact_equivalence_preserves_every_other_literal_html_character(change):
+    before = cf_contact(17) + '<p>CC BY 4.0</p><a href="https://example.test/license">License</a>'
+    after = cf_contact(93) + '<p>CC BY 4.0</p><a href="https://example.test/license">License</a>'
+    if change == "email":
+        after = after.replace(cf_contact(93), cf_contact(93, b"other@example.test"))
+    elif change == "terms":
+        after = after.replace("CC BY 4.0", "CC BY-NC 4.0")
+    elif change == "license":
+        after = after.replace("/license", "/other-license")
+    elif change == "other_href":
+        after += '<a href="https://other.test/">Other</a>'
+    elif change == "other_attribute":
+        after = after.replace("Public contact", "Different contact label")
+    elif change == "space":
+        after = after.replace("<p>", "<p >")
+    elif change == "quote":
+        after = after.replace('title="Public contact"', "title='Public contact'")
+    else:
+        after += "<!--different-->"
+    assert _rights_contact_hash(before) != _rights_contact_hash(after)
+
+
+@pytest.mark.parametrize("payload", ["", "01", "010", "not-hex", "00ff4041", "006140620a", "00616263", "00" * 322])
+def test_invalid_cloudflare_contact_payload_fails_closed(payload):
+    with pytest.raises(AgentError, match="ARTICLE_IMAGE_PROOF_INVALID"):
+        _rights_contact_hash('<span data-cfemail="' + payload + '">Contact</span>')
+
+
+@pytest.mark.parametrize("html", ["<span data-cfemail>Contact</span>",
+    '<span data-cfemail="00614062" data-cfemail="00614062">Contact</span>'])
+def test_missing_or_duplicate_contact_attributes_are_not_normalized(html):
+    with pytest.raises(AgentError, match="ARTICLE_IMAGE_PROOF_INVALID"):
+        _rights_contact_hash(html)
+
+
+def test_normalization_does_not_match_attribute_names_inside_comments_scripts_or_other_values():
+    contact = cf_contact(17)
+    html = ('<!--' + contact + '--><script>const html = ' + json.dumps(contact) + ';</script>'
+        '<p title="data-cfemail=00614062">Plain text</p><div data-cfemail="00614062">Other tag</div>')
+    assert _rights_contact_hash(html) == hashlib.sha256(html.encode()).hexdigest()
+
+
+def duplicate_cf_source_proofs(value, change=None):
+    first = json.loads(value.source_path.read_text())
+    first["rights_html"] = first["rights_html"].replace("</html>", cf_contact(17) + "</html>")
+    second = copy.deepcopy(first)
+    second["rights_html"] = second["rights_html"].replace(cf_contact(17), cf_contact(93))
+    if change == "email":
+        second["rights_html"] = second["rights_html"].replace(cf_contact(93), cf_contact(93, b"other@example.test"))
+    elif change == "terms":
+        second["rights_html"] = second["rights_html"].replace("Attribution 4.0", "Attribution-NonCommercial 4.0")
+    elif change == "other_href":
+        second["rights_html"] = second["rights_html"].replace("</html>", '<a href="https://other.test/">Other</a></html>')
+    elif change == "other_html":
+        second["rights_html"] = second["rights_html"].replace("</html>", "<!--different--></html>")
+    elif change == "license":
+        second["rights_html"] = second["rights_html"].replace('href="http://creativecommons.org/', 'href="https://creativecommons.org/')
+    elif change == "page":
+        second["page_html"] = second["page_html"].replace("</html>", "<!--different--></html>")
+    elif change == "image":
+        second["page_html"] = second["page_html"].replace(value.image_url, value.image_url.replace(".jpg", "-other.jpg"))
+    elif change == "credit":
+        second["page_html"] = second["page_html"].replace("Jane Scientist", "Other Owner")
+        second["credit"] = second["credit"].replace("Jane Scientist", "Other Owner")
+    elif change == "copyright":
+        second["page_html"] = second["page_html"].replace("Jane Scientist", "Jane Scientist, all rights reserved")
+        second["credit"] += ", all rights reserved"
+    for proof in (first, second):
+        for key in ("rights", "page"):
+            proof["hashes"][key] = hashlib.sha256(proof[key + "_html"].encode()).hexdigest()
+    if change == "raw_hash":
+        second["hashes"]["rights"] = "0" * 64
+    other = value.source_path.with_name(value.source.source_id + "-zz-cf-contact.local.json")
+    value.source_path.write_text(json.dumps(first), encoding="utf-8")
+    other.write_text(json.dumps(second), encoding="utf-8")
+    return first, other
+
+
+def test_duplicate_contact_obfuscation_keeps_raw_proofs_hashes_selection_and_one_download(illustration):
+    value = illustration
+    first, other = duplicate_cf_source_proofs(value)
+    raw = {path: path.read_bytes() for path in (value.source_path, other)}
+    proof, _ = prepare(value)
+    assert proof["source_proof"] == value.source_path.relative_to(value.root).as_posix()
+    assert proof["source_proof_sha256"] == hashlib.sha256(raw[value.source_path]).hexdigest()
+    assert proof["rights_sha256"] == first["hashes"]["rights"]
+    assert validate_article_image(value.core, value.record) == [proof["media"]]
+    assert all(path.read_bytes() == data for path, data in raw.items())
+
+
+@pytest.mark.parametrize("change", ["email", "terms", "other_href", "other_html", "license", "raw_hash",
+                                    "page", "image", "credit", "copyright"])
+def test_contact_equivalence_never_accepts_other_rights_page_image_or_credit_changes(illustration, change):
+    value = illustration
+    duplicate_cf_source_proofs(value, change)
+    with pytest.raises(AgentError):
+        prepare_article_image(value.core, value.article, value.record, value.policy,
+            transport=httpx.MockTransport(lambda _: pytest.fail("different proof reached image download")))
+    assert not (value.root / "data/article-images/image-record-1.claim.local.json").exists()
 
 
 def test_official_page_exact_download_credit_and_rights_yield_canonical_good_jpeg_once(illustration):
