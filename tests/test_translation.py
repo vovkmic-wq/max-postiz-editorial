@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -349,6 +350,111 @@ def test_formatter_does_not_correct_wrong_units_or_claim_semantic_fidelity():
     # Numerically equivalent spelling does not establish correct units or meaning.
     output, count = restore_numeric_spelling('A distance of 1.5 km.', 'Расстояние 1,5 мили.')
     assert output == 'Расстояние 1.5 мили.' and count == 1
+
+
+@pytest.mark.parametrize('source,translated,expected,count', [
+    ('The 2.4-metre telescope collected light.', 'Свет собран 2,4-метровым телескопом.',
+     'Свет собран 2.4-метровым телескопом.', 1),
+    ('A 0.35-meter telescope and a 1.0-foot and 1.15-foot instrument.',
+     'Телескоп 0,35-метровый и приборы 1,0-футовый и 1,15-футовый.',
+     'Телескоп 0.35-метровый и приборы 1.0-футовый и 1.15-футовый.', 3),
+    ('The aperture is 2.4 metres.', 'Апертура составляет 2,4 метра.', 'Апертура составляет 2.4 метра.', 1),
+    ('The aperture is 2.4meters.', 'Апертура составляет 2,4метра.', 'Апертура составляет 2.4метра.', 1),
+    ('The aperture is 2.4-meters.', 'Апертура 2,4‐метровая.', 'Апертура 2.4‐метровая.', 1),
+    ('A 1.5-feet instrument.', 'Прибор 1,5‑футовый.', 'Прибор 1.5‑футовый.', 1),
+    ('An offset of -2.4-metres.', 'Смещение −2,4 метра.', 'Смещение −2.4 метра.', 1),
+    ('An offset of +2.4-metre.', 'Смещение +2,4 метра.', 'Смещение +2.4 метра.', 1),
+    ('L2 ID-01 uses a 2.4-metre telescope and value 1.5.',
+     'L2 ID-01 использует 2,4-метровый телескоп и значение 1,5.',
+     'L2 ID-01 использует 2.4-метровый телескоп и значение 1.5.', 2),
+    ('Two 2.4-metre instruments.', 'Два прибора 2,4-метровых.', 'Два прибора 2.4-метровых.', 1),
+    ('A 2.4-metre mirror and a 2.4-metre lens.', 'Зеркало 2,4 метра и линза 2,4 метра.',
+     'Зеркало 2.4 метра и линза 2.4 метра.', 2),
+])
+def test_closed_unit_decimal_typography_restores_numeric_characters_only(source,translated,expected,count):
+    assert restore_numeric_spelling(source,translated)==(expected,count)
+    assert re.sub(r'[.,]','',expected)==re.sub(r'[.,]','',translated)
+
+
+@pytest.mark.parametrize('source,translated', [
+    ('A 2.4-metre telescope.', 'Телескоп 2,5-метровый.'),
+    ('A 2.4-metre telescope.', 'Телескоп 2,4-футовый.'),
+    ('A 2.4-foot telescope.', 'Телескоп 2,4-метровый.'),
+    ('A 2.4-metre telescope.', 'Телескоп 240-сантиметровый.'),
+    ('A 2.4-metre telescope and value 1.5.', 'Телескоп и значение 1,5.'),
+    ('A telescope and value 1.5.', 'Телескоп 2,4-метровый и значение 1,5.'),
+    ('Two 2.4-metre lenses: 2.4-metre each.', 'Линза 2,4 метра.'),
+    ('A 2.4-metre telescope and value 1.5.', 'Телескоп 2,4-футовый и значение 1,5.'),
+    ('A 2.4-metre and 1.5-foot instrument.', 'Прибор 1,5-метровый и 2,4-футовый.'),
+    ('A 2.4-metre telescope.', 'Телескоп +2,4-метровый.'),
+    ('A +2.4-metre telescope.', 'Телескоп 2,4-метровый.'),
+    ('A -2.4-metre telescope.', 'Телескоп 2,4-метровый.'),
+    ('A -0.0-metre offset.', 'Смещение 0,0 метра.'),
+    ('A 1.234-metre telescope.', 'Телескоп 1,234-метровый.'),
+    ('A 01.5-metre telescope.', 'Телескоп 1,5-метровый.'),
+    ('A 1.0-metre and a 1.00-metre telescope.', 'Телескопы 1,0 метра и 1,0 метра.'),
+    ('A 1.5-m telescope.', 'Телескоп 1,5-метровый.'),
+    ('A 1.5-centimetre telescope.', 'Телескоп 1,5-метровый.'),
+    ('The ID-2.4-metre value is 1.5.', 'Значение ID-2,4-метра равно 1,5.'),
+    ('The X2.4-metre value is 1.5.', 'Значение X2,4-метра равно 1,5.'),
+    ('The 2.4-metre-ID value is 1.5.', 'Значение 2,4-метра-ID равно 1,5.'),
+    ('L2 has a 2.4-metre mirror.', 'L1 имеет 2,4-метровое зеркало.'),
+    ('ID-01 has a 2.4-metre mirror.', 'ID-1 имеет 2,4-метровое зеркало.'),
+    ('Range 1-2.4-metre.', 'Диапазон 1-2,4-метра.'),
+    ('Range 1 - 2.4-metre.', 'Диапазон 1 - 2,4-метра.'),
+    ('Ratio 1 / 2.4-metre.', 'Отношение 1 / 2,4-метра.'),
+    ('Offset -\n2.4-metre.', 'Смещение 2,4 метра.'),
+    ('On 2024-02-08 a 2.4-metre telescope.', 'Телескоп 2,4 метра 08.02.2024.'),
+    ('Value 1.5 and https://example.test/2.4-metre', 'Значение 1,5 и https://example.test/2,4-метровый'),
+    ('Value 1.5 and mailto:2.4-metre@example.test', 'Значение 1,5 и mailto:2,4-метровый@example.test'),
+])
+def test_unit_typography_refuses_changes_ambiguity_ids_ranges_and_partial_measurements(source,translated):
+    assert restore_numeric_spelling(source,translated)==(translated,0)
+
+
+@pytest.mark.parametrize('label', ['ID=', 'ID＝', 'ID:', 'ID： ', 'ID ', 'Code = ', 'Identifier: ', 'version ',
+    'Код ', 'Идентификатор: ', 'Версия ', 'ID#', 'ID "', "ID '"])
+def test_explicit_id_labels_never_become_measurement_exceptions(label):
+    source='Detector '+label+'1.15-meter.'
+    translated='Датчик '+label+'1,15-метровый.'
+    assert restore_numeric_spelling(source,translated)==(translated,0)
+
+
+@pytest.mark.parametrize('operator', ['±','∓','－','＋','﹢','﹣','⁺','⁻','₊','₋','≈'])
+@pytest.mark.parametrize('space', ['', ' ', '\n'])
+def test_unrecognized_adjacent_or_detached_operator_does_not_hide_a_lost_sign(operator,space):
+    source='The '+operator+space+'1.15-meter uncertainty.'
+    translated='Погрешность 1,15-метровая.'
+    assert restore_numeric_spelling(source,translated)==(translated,0)
+
+
+def test_ordinary_label_colon_is_preserved_without_becoming_a_numeric_ratio():
+    source='Aperture: 1.15-meter.'
+    translated='Апертура: 1,15-метровая.'
+    assert restore_numeric_spelling(source,translated)==('Апертура: 1.15-метровая.',1)
+    ratio='Ratio 1: 1.15-meter.'
+    assert restore_numeric_spelling(ratio,translated)==(translated,0)
+
+
+def test_grouped_number_is_not_reinterpreted_as_a_partial_unit_value():
+    source='The 1 234.5-meter instrument.'
+    translated='Прибор 1 234,5-метровый.'
+    assert restore_numeric_spelling(source,translated)==(translated,0)
+
+
+def test_measurement_typography_alone_passes_old_number_gate_but_not_changed_values():
+    from max_postiz_agent.editorial import translation_gate
+    source='The 2.4-metre telescope observes 17 stars and 1.5-foot mirrors.'
+    raw='2,4-метровый телескоп наблюдает 17 звёзд и зеркала 1,5 фута.'
+    with pytest.raises(AgentError,match='TRANSLATION_NUMBER_CHANGED'):
+        translation_gate(source,raw)
+    restored,count=restore_numeric_spelling(source,raw)
+    assert count==2
+    translation_gate(source,restored)
+    wrong=raw.replace('17','18')
+    assert restore_numeric_spelling(source,wrong)==(wrong,0)
+    with pytest.raises(AgentError,match='TRANSLATION_NUMBER_CHANGED'):
+        translation_gate(source,wrong)
 
 
 def test_real_roman_reference_passes_unchanged_raw_number_gate_after_typography_only():

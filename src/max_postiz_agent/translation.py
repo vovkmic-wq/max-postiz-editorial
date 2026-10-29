@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -26,13 +27,51 @@ AUTOMATIC_TRANSLATION_MODELS = frozenset({"hy-mt2-7b-q8", MADLAD_MODEL})
 MODELS = {"hy-mt2-1.8b-q8", "hy-mt2-7b-q8", "translategemma-12b-q4", "opus-mt-en-ru-int8", MADLAD_MODEL}
 _NUMBER = re.compile(r"(?P<sign>[+\-−][ \t]*)?(?P<number>\d+(?:(?:[.,]\d+)|(?:[ \u00a0\u202f]\d{3}))*)")
 _SPACE = r"[ \u00a0\u202f]"
+_MEASUREMENT_EN = {form: unit for unit, forms in {
+    "metre": ("meter", "meters", "metre", "metres"), "foot": ("foot", "feet"),
+}.items() for form in forms}
+_MEASUREMENT_RU = {stem + ending: unit for stem, unit in (("метр", "metre"), ("фут", "foot"))
+    for ending in ("", "а", "у", "ом", "е", "ы", "ов", "ам", "ами", "ах", "овый", "овая",
+                   "овое", "овые", "ового", "овой", "овому", "овым", "овую", "овом", "овых", "овыми")}
 
 
-def _numeric_tokens(text):
+def _measurement_spans(text, *, english):
+    """Closed decimal/unit pairs only; IDs, URLs and conversions stay protected."""
+    units = _MEASUREMENT_EN if english else _MEASUREMENT_RU
+    decimal = r"[0-9]+\.[0-9]+" if english else r"[0-9]+[.,][0-9]+"
+    pattern = (rf"(?<![\w.,+\-−–—/@])(?P<sign>[+\-−][ \t]*)?(?P<number>{decimal})"
+               rf"{_SPACE}*(?:[-‐‑]{_SPACE}*)?(?P<unit>{'|'.join(sorted(units, key=len, reverse=True))})"
+               r"(?![\w\-−–—/@])")
+    urls = [match.span() for match in re.finditer(r'''(?:https?://|mailto:)[^\s<>"']+''', text, re.I)]
+    matches, values = [], Counter()
+    for match in re.finditer(pattern, text, re.I):
+        if any(match.start() < end and match.end() > start for start, end in urls):
+            continue
+        prefix = text[:match.start()]
+        before, after = prefix.rstrip(), text[match.end():].lstrip()
+        if (re.search(r"[+\-−–—/=]\s*$", prefix)
+                or re.search(r"[0-9]\s*:\s*$", prefix)
+                or re.search(r"\b(?:id|identifier|code|version|код|идентификатор|версия)\W*$", prefix, re.I)
+                or re.search(r"[0-9]\s*$", prefix)
+                or before and unicodedata.category(before[-1]) in {'Sm', 'Pd'}
+                or after and unicodedata.category(after[0]) in {'Sm', 'Pd'}):
+            return None, None  # Detached sign or a spaced range/ratio is not a unit adjective.
+        numbers = _decimal_spellings(match['number'], english=english)
+        if len(numbers) != 1:
+            return None, None
+        sign = (match['sign'] or '').strip()
+        sign = '-' if sign in {'-', '−'} else sign
+        values[next(iter(numbers)), sign, units[match['unit'].casefold()]] += 1
+        matches.append(match.span())
+    return matches, values
+
+
+def _numeric_tokens(text, *, measurements=()):
     # Keep alphanumeric identifiers (including L2, ID-01 and attached units) exact.
     identifiers = [match for match in re.finditer(r"\w+(?:[-.]\w+)*", text)
                    if any(char.isalpha() or char == '_' for char in match[0])
-                   and any(char.isdigit() for char in match[0])]
+                   and any(char.isdigit() for char in match[0])
+                   and not any(start <= match.start() and match.end() <= end for start, end in measurements)]
     protected = Counter(match[0] for match in identifiers)
     tokens = []
     for match in _NUMBER.finditer(text):
@@ -83,8 +122,15 @@ def restore_numeric_spelling(original, translated):
     Any missing/extra value, ambiguous interpretation or source spelling disables
     every replacement for the segment.
     """
-    source, source_ids = _numeric_tokens(original)
-    target, target_ids = _numeric_tokens(translated)
+    try:
+        source_units, source_values = _measurement_spans(original, english=True)
+        target_units, target_values = _measurement_spans(translated, english=False)
+    except InvalidOperation:
+        return translated, 0
+    if source_values is None or target_values is None or source_values != target_values:
+        return translated, 0
+    source, source_ids = _numeric_tokens(original, measurements=source_units)
+    target, target_ids = _numeric_tokens(translated, measurements=target_units)
     if source is None or target is None or source_ids != target_ids or len(source) != len(target):
         return translated, 0
     spellings, forms, required = {}, defaultdict(set), Counter()
