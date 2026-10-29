@@ -313,6 +313,11 @@ class ReserveServerCycle(ServerCycle):
                         self.reserve.reject_image_preparation(claim, bound["record_id"], exc.code)
                         completed.append("image_rejected")
                         continue
+                    if (exc.code == "TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT" and bound
+                            and bound["id"] == claim["id"] and bound.get("record_id")):
+                        self.reserve.reject_translation_preflight(claim, bound["record_id"], exc, cycle=self.cycle)
+                        completed.append("translation_preflight_rejected")
+                        continue
                     if exc.code != "ARTICLE_QUALITY_REJECTED" or not bound or not bound.get("record_id"):
                         raise
                     record = self.cycle._record(self.cycle._load(), bound["record_id"])

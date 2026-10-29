@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .config import AgentError
+from .config import AgentError, fingerprint
 
 MADLAD_MODEL = "madlad400-3b-q4k-causal-v2"
 MADLAD_BACKEND_CONTRACT = "madlad400-candle-causal-v2"
@@ -149,7 +149,9 @@ def segments(text, limit=1400):
         while len(paragraph) > limit:
             # Prefer complete sentences; otherwise retain all words in bounded chunks.
             matches = list(re.finditer(r"[.!?][\"']?\s+", paragraph[:limit]))
-            cut = matches[-1].end() if matches else paragraph.rfind(" ", 0, limit)
+            cut = matches[-1].end() if matches else -1
+            if cut < limit // 3:
+                cut = paragraph.rfind(" ", 0, limit)
             if cut < limit // 3:
                 raise AgentError("TRANSLATION_UNSPLITTABLE_INPUT")
             result.append((paragraph[:cut].strip(), True))
@@ -158,6 +160,27 @@ def segments(text, limit=1400):
         if paragraph:
             result.append((paragraph, True))
     return result
+
+
+def preflight_segments(title, body, *, limit=1400):
+    """Pure whole-source validation before any title/body model request."""
+    for field, value in (("title", title), ("body", body)):
+        try:
+            segments(value, limit=limit)
+        except AgentError as exc:
+            if exc.code == "TRANSLATION_UNSPLITTABLE_INPUT":
+                failure = AgentError("TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT")
+                failure.failed_field = field
+                raise failure from exc
+            raise
+
+
+class TranslationPreflightError(AgentError):
+    """Actual dedicated-route local failure before any model HTTP request."""
+
+    def __init__(self, evidence):
+        self.preflight_evidence = copy.deepcopy(evidence)
+        super().__init__("TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT")
 
 
 def translation_messages(model, text, prompt):
@@ -195,6 +218,7 @@ class DedicatedTranslator:
         if (type(self.segment_chars) is not int or not 400 <= self.segment_chars <= 1400
                 or self.segment_chars != 1400 and self.model != MADLAD_MODEL):
             raise AgentError("TRANSLATION_CONFIG_INVALID")
+        self.config_hash = fingerprint(config)
         self.url = url.rstrip("/")
         self.client = httpx.Client(timeout=600, trust_env=False, transport=transport,
                                    follow_redirects=False)
@@ -255,6 +279,18 @@ class DedicatedTranslator:
         # A translation-only model cannot edit against reviewer feedback. Reuse the exact
         # candidate within this instance; ArticleQuality retains its independent refusal.
         self._cached_source = self._cached_result = None
+        # Проверяем оба поля целиком до первого HTTP, включая все абзацы тела.
+        try:
+            preflight_segments(title, body, limit=self.segment_chars)
+        except AgentError as exc:
+            if exc.code != "TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT":
+                raise
+            raise TranslationPreflightError({
+                "contract": "dedicated-translation-preflight-v1", "model": self.model,
+                "segment_chars": self.segment_chars, "source_hash": fingerprint(source),
+                "config_hash": self.config_hash, "failed_field": exc.failed_field,
+                "underlying_error": "TRANSLATION_UNSPLITTABLE_INPUT", "no_model_requests": True,
+            }) from exc
         translated_title, title_metrics = self.translate(title)
         translated_body, body_metrics = self.translate(body)
         info = {"model": self.model, "segments": title_metrics + body_metrics, "cache_reused": False}

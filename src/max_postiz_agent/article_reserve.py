@@ -4,6 +4,7 @@
 не освобождают модели или адресата и не дают права повторить внешний запрос.
 """
 import copy
+import hashlib
 import math
 import re
 from collections import Counter
@@ -250,6 +251,133 @@ class ArticleReserveStore:
                 claim_id=row.id, control_revision=row.control_revision, error=error,
                 source_hash=record.get("original_hash"), policy_hash=record.get("policy_hash"),
                 model_calls=0, source_remains_used=True)
+            return _claim_view(row)
+
+    def reject_translation_preflight(self, claim, record_id, rejection, *, cycle):
+        """Только доказанный локальный отказ разбиения до первого HTTP модели."""
+        from .article_quality import numbers
+        from .config import inside, parse_json
+        from .db import Story
+        from .reddit import text_hash
+        from .translation import MADLAD_MODEL, TranslationPreflightError, preflight_segments
+        code = "ARTICLE_TRANSLATION_PREFLIGHT_NOT_SAFE"
+        error = "TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT"
+
+        def require(value):
+            if not value:
+                raise AgentError(code, 409)
+
+        def sha256(raw):
+            return hashlib.sha256(raw).hexdigest()
+
+        require(type(rejection) is TranslationPreflightError and rejection.code == error
+            and cycle.core is self.core and cycle.quality_factory is None
+            and isinstance(record_id, str) and re.fullmatch(r"[a-f0-9-]{36}", record_id))
+        with self.core.db.session.begin() as session:
+            row = self._preparation(session, claim, record_id)
+            ledger = session.scalar(select(EditorialLedger).where(
+                EditorialLedger.id == LEDGER_ID).with_for_update())
+            payload = copy.deepcopy(ledger.payload) if ledger else {}
+            records = [r for r in payload.get("records", []) if r.get("id") == record_id]
+            record = records[0] if len(records) == 1 else {}
+            attempts = record.get("preparation_attempts", [])
+            attempt = attempts[0] if isinstance(attempts, list) and len(attempts) == 1 else {}
+            require(record.get("state") == "needs_attention" and record.get("error") == error
+                and record.get("reserve_contract") == RESERVE_CONTRACT and record.get("reserve_claim") == claim
+                and not record.get("model_result_unknown") and not any(record.get(k) for k in (
+                    "variant_id", "postiz_id", "dispatch_id", "due_at", "prepared_hash", "material_id", "story_id",
+                    "automatic_repair_attempts", "automatic_corrections", "review_protocol_recoveries", "preparation_actions"))
+                and type(attempt.get("number")) is int and attempt["number"] == 1
+                and attempt.get("state") == "needs_attention" and attempt.get("error") == error
+                and attempt.get("operator_retry") is False and attempt.get("candidate_hash") is None
+                and not attempt.get("automatic_repair_claim") and _stamp(attempt.get("started_at"))
+                and _stamp(attempt.get("finished_at")) and attempt["finished_at"] >= attempt["started_at"])
+            cycle._reserve_record(record, active=True, session=session)
+            policy = cycle._policy_for_record(record)
+            require(policy.get("approval_mode") == "automatic" and fingerprint(policy) == record.get("policy_hash"))
+            root = self.core.settings.root
+            paths = {"input": f"data/hourly-articles/input-{record_id}.local.json",
+                     "trace": f"data/hourly-articles/quality-{record_id}.local.jsonl",
+                     "config": "config/translation.json"}
+            require(record.get("input_file") == paths["input"] and record.get("quality_trace") == paths["trace"])
+            files = {}
+            for name, relative in paths.items():
+                path = root / relative
+                require(path.resolve() == path and inside(root, relative) == path
+                    and not path.is_symlink() and path.is_file() and 0 < path.stat().st_size <= 100000)
+                files[name] = path.read_bytes()
+            article, config = parse_json(files["input"].decode()), parse_json(files["config"].decode())
+            require(isinstance(article, dict) and set(article) == {"title", "original", "url", "published_at"}
+                and all(isinstance(article[k], str) and article[k].strip() for k in ("title", "original", "url"))
+                and sha256(files["input"]) == record.get("input_file_hash")
+                and fingerprint(article) == record.get("input_hash")
+                and text_hash(article["original"]) == record.get("original_hash")
+                and article["url"] == record.get("url") and article["published_at"] == record.get("source_published_at")
+                and isinstance(config, dict) and config.get("enabled") is True
+                and config.get("model") == MADLAD_MODEL and config.get("segment_chars") == 600)
+            source = {"title": article["title"].strip(), "body": article["original"].strip(), "url": article["url"]}
+            proof = copy.deepcopy(rejection.preflight_evidence)
+            require(isinstance(proof, dict) and set(proof) == {"contract", "model", "segment_chars", "source_hash",
+                "config_hash", "failed_field", "underlying_error", "no_model_requests"}
+                and proof == {"contract": "dedicated-translation-preflight-v1", "model": MADLAD_MODEL,
+                    "segment_chars": 600, "source_hash": fingerprint(source), "config_hash": fingerprint(config),
+                    "failed_field": proof.get("failed_field"), "underlying_error": "TRANSLATION_UNSPLITTABLE_INPUT",
+                    "no_model_requests": True} and proof["no_model_requests"] is True)
+            try:
+                preflight_segments(source["title"], source["body"], limit=600)
+            except AgentError as exc:
+                require(exc.code == error and getattr(exc, "failed_field", None) == proof["failed_field"])
+            else:
+                raise AgentError(code, 409)
+            events = [parse_json(line) for line in files["trace"].decode().splitlines() if line]
+            require(len(events) == 2 and all(isinstance(e, dict) for e in events)
+                and [e.get("phase") for e in events] == ["translation_started", "translation_failed"])
+            markers = ({key: record[key] for key in ("presentation_contract", "image_credit")}
+                       if illustrated_presentation(record.get("presentation_contract")) else {})
+            context = {"instruction": (root / "prompts/ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8"),
+                "source_untrusted": source, "numeric_tokens_must_match_exactly": sorted(numbers(source["title"] + "\n\n" + source["body"]))}
+            if record.get("scientific_spelling_contract"):
+                context["scientific_spelling_contract"] = record["scientific_spelling_contract"]
+            if record.get("reference_contract") == "article-links-v2":
+                context["reference_contract"] = record["reference_contract"]
+            require(all(isinstance(e, dict) and e.get("record_id") == record_id and type(e.get("attempt")) is int
+                and e["attempt"] == 1 and _stamp(e.get("at")) for e in events)
+                and events[0] == {"phase": "translation_started", "attempt": 1, **markers,
+                    "context": context, "at": events[0]["at"], "record_id": record_id}
+                and events[1] == {"phase": "translation_failed", "attempt": 1, **markers,
+                    "error": error, "at": events[1]["at"], "record_id": record_id}
+                and attempt["started_at"] <= events[0]["at"] <= events[1]["at"] <= attempt["finished_at"])
+            audits = list(session.scalars(select(Audit).where(Audit.entity == record_id)))
+            started = [a for a in audits if a.action == "hourly_article_prepare_attempt"]
+            failed = [a for a in audits if a.action == "hourly_article_prepare_error"]
+            require(len(started) == len(failed) == 1 and started[0].actor == failed[0].actor == "article_quality"
+                and all(started[0].details.get(k) == v for k, v in {"attempt": 1, "operator_retry": False,
+                    "source_hash": record["original_hash"], "input_hash": record["input_hash"],
+                    "policy_hash": record["policy_hash"], "candidate_hash": None, "automatic_repair_claim": None}.items())
+                and failed[0].details == {"attempt": 1, "error": error}
+                and not any(a.actor == "automatic_article_repair" for a in audits)
+                and not session.scalar(select(Story).where(Story.text_hash == fingerprint({"hourly_article": record_id})))
+                and not any(v.metadata_json.get("record_id") == record_id for v in session.scalars(select(Variant)))
+                and not session.scalar(select(PublicationSlot).where(PublicationSlot.record_id == record_id)))
+            if markers:
+                from .article_images import validate_article_image
+                validate_article_image(self.core, record)
+                require(attempt.get("image_preparation_state") == "ready"
+                    and all(attempt.get(k) == record[k] == started[0].details.get(k)
+                        for k in ("presentation_contract", "image_credit", "illustration_proof_hash")))
+            require(all((root / relative).read_bytes() == files[name] for name, relative in paths.items()))
+            stamp = now()
+            evidence = {"preflight": proof, "trace_hash": sha256(files["trace"]),
+                        "input_file_hash": sha256(files["input"]), "config_file_hash": sha256(files["config"])}
+            record.setdefault("preparation_actions", []).append({"at": stamp, "action": "translation_preflight_rejected",
+                "previous_state": record["state"], "error": error, **evidence})
+            record.update(state="cancelled", cancelled_at=stamp)
+            ledger.payload, ledger.revision, ledger.updated_at = payload, ledger.revision + 1, stamp
+            row.state, row.error, row.updated_at, row.active_key = "rejected", error, stamp, None
+            self.core.db.audit(session, "article_reserve", "reserve_translation_preflight_rejected", record_id,
+                claim_id=row.id, control_revision=row.control_revision, error=error,
+                source_hash=record["original_hash"], policy_hash=record["policy_hash"],
+                dedicated_translation_http_requests=0, source_remains_used=True, **evidence)
             return _claim_view(row)
 
     def _record(self, session, record_id):

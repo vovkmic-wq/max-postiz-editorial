@@ -16,7 +16,7 @@ from max_postiz_agent.db import Database, uid
 from max_postiz_agent.hub_models import Dispatch, RemoteDraft, Target, TargetApproval, Variant
 from max_postiz_agent.server_state import DatabaseArticleLedger, ServerState
 
-pytest_plugins = ["test_automatic_policy"]
+pytest_plugins = ["test_automatic_policy", "test_illustrated_article_flow"]
 
 
 @pytest.fixture
@@ -401,3 +401,184 @@ def test_postgres_pipeline_preserves_evidence_through_single_draft_and_exact_app
         assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 1
     with pytest.raises(AgentError):
         value.cycle.publish(result["id"], pending["content_hash"], due_at=slot["due_at"])
+
+
+def preflight_quality(value, monkeypatch):
+    """Real dedicated generate_text; transport/model reviewers must stay unused."""
+    import httpx
+    from max_postiz_agent.article_quality import ArticleQuality
+    from max_postiz_agent.translation import DedicatedTranslator, MADLAD_MODEL
+    from test_automatic_policy import Model
+    config = {"enabled": True, "model": MADLAD_MODEL, "base_url": "http://127.0.0.1:8765", "segment_chars": 600}
+    (value.core.settings.root / "config/translation.json").write_text(json.dumps(config), encoding="utf-8")
+    calls = []
+
+    def forbidden(request):
+        calls.append(str(request.url))
+        raise AssertionError("No translation/review/spelling HTTP may precede local input rejection")
+
+    def quality(record_id=None, review_only=False):
+        record = value.cycle._record(value.cycle._load(), record_id)
+        reviewer = Model({}, "proxmox/qwen25-coder-7b")
+        reviewer.generate_text = lambda *_: forbidden(SimpleNamespace(url="reviewer"))
+        presentation = ({k: record[k] for k in ("presentation_contract", "image_credit")}
+                        if record.get("presentation_contract") else {})
+        return ArticleQuality(DedicatedTranslator(config, transport=httpx.MockTransport(forbidden)), reviewer,
+            prompt_dir=value.core.settings.root / "prompts", trace=value.cycle._trace_writer(record_id),
+            review_rubric="meaning-first-v1", transport=httpx.MockTransport(forbidden), **presentation)
+
+    monkeypatch.setattr(value.cycle, "_quality", quality)
+    return calls, quality
+
+
+def captured_preflight(value, monkeypatch):
+    from max_postiz_agent.translation import TranslationPreflightError
+    calls, _ = preflight_quality(value, monkeypatch)
+    article = {**value.article, "original": value.article["original"] + " " + "Z" * 601}
+    claim = value.store.begin_preparation()
+    with pytest.raises(TranslationPreflightError) as caught:
+        value.cycle.prepare(article, reserve_claim=claim)
+    record = value.cycle._load()["records"][-1]
+    return claim, record, caught.value, calls
+
+
+def assert_no_preflight_external(value):
+    from max_postiz_agent.server_models import PublicationSlot
+    with value.core.db.session() as session:
+        assert all(session.query(model).count() == 0 for model in (Variant, Dispatch, TargetApproval, RemoteDraft, PublicationSlot))
+    assert not getattr(value, "writes", [])
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_exact_native_translation_preflight_rejection_preserves_source_trace_and_releases_claim(request, backend, monkeypatch):
+    from max_postiz_agent.db import Audit
+    value = request.getfixturevalue("reserve_pg" if backend == "postgres" else "reserve")
+    claim, original, error, calls = captured_preflight(value, monkeypatch)
+    trace = value.core.settings.root / original["quality_trace"]
+    before = trace.read_bytes()
+    finished = value.store.reject_translation_preflight(claim, original["id"], error, cycle=value.cycle)
+    final = value.cycle._record(value.cycle._load(), original["id"])
+    assert final["state"] == "cancelled" and final["error"] == error.code and finished["state"] == "rejected"
+    assert final["preparation_attempts"] == original["preparation_attempts"] and trace.read_bytes() == before
+    assert final["input_hash"] == original["input_hash"] and final["original_hash"] == original["original_hash"]
+    assert value.store.active_preparation() is None and calls == []
+    from max_postiz_agent.server_nasa import _used_narratives
+    raw = json.loads((value.core.settings.root / original["input_file"]).read_bytes())
+    assert _used_narratives(value.core, value.cycle._load()) == [raw["original"]]
+    with value.core.db.session() as session:
+        audit = session.query(Audit).filter_by(action="reserve_translation_preflight_rejected").one()
+        assert audit.details["preflight"] == error.preflight_evidence
+        assert audit.details["dedicated_translation_http_requests"] == 0 and audit.details["source_remains_used"] is True
+    assert_no_preflight_external(value)
+    next_claim = value.store.begin_preparation()
+    with pytest.raises(AgentError, match="ARTICLE_DUPLICATE_SOURCE"):
+        value.cycle.prepare(raw, reserve_claim=next_claim)
+
+
+def test_illustrated_preflight_keeps_verified_photo_and_does_not_treat_model_started_marker_as_http(illustrated, monkeypatch):
+    value = illustrated
+    claim, original, error, calls = captured_preflight(value, monkeypatch)
+    assert original["preparation_attempts"][0]["model_started_at"] is not None
+    value.store.reject_translation_preflight(claim, original["id"], error, cycle=value.cycle)
+    final = value.cycle._record(value.cycle._load(), original["id"])
+    assert final["illustration"] == original["illustration"] and value.image_path.is_file()
+    assert calls == [] and value.store.active_preparation() is None
+    assert_no_preflight_external(value)
+
+
+@pytest.mark.parametrize("damage", ["old_generic", "code_only", "alien_model", "unknown_requests", "proof_source",
+    "proof_config", "failed_field", "config", "input", "trace_returned", "trace_error", "trace_time",
+    "claim", "blocked_claim", "factory", "native_binding", "native_attempt", "repair", "external"])
+def test_preflight_classification_never_waives_other_routes_unknowns_or_changed_proof(reserve, monkeypatch, damage):
+    from max_postiz_agent.db import Audit
+    from max_postiz_agent.server_models import EditorialPreparationClaim
+    value = reserve
+    claim, original, error, calls = captured_preflight(value, monkeypatch)
+    path = value.core.settings.root / original["quality_trace"]
+    if damage == "old_generic": error = AgentError("TRANSLATION_UNSPLITTABLE_INPUT")
+    elif damage == "code_only": error = AgentError("TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT")
+    elif damage == "alien_model": error.preflight_evidence["model"] = "hy-mt2-7b-q8"
+    elif damage == "unknown_requests": error.preflight_evidence["no_model_requests"] = False
+    elif damage == "proof_source": error.preflight_evidence["source_hash"] = "0" * 64
+    elif damage == "proof_config": error.preflight_evidence["config_hash"] = "0" * 64
+    elif damage == "failed_field": error.preflight_evidence["failed_field"] = "title"
+    elif damage == "config": (value.core.settings.root / "config/translation.json").write_text("{}")
+    elif damage == "input": (value.core.settings.root / original["input_file"]).write_bytes(b"{}")
+    elif damage.startswith("trace_"):
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        if damage == "trace_returned": events.insert(1, {**events[0], "phase": "translation_returned", "raw": "unexpected"})
+        elif damage == "trace_error": events[1]["error"] = "TRANSLATION_SERVICE_UNAVAILABLE"
+        else: events[0]["at"] = events[1]["at"] + 1
+        path.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n", encoding="utf-8")
+    elif damage == "claim": claim = {**claim, "token": "changed"}
+    elif damage == "blocked_claim":
+        with value.core.db.session.begin() as session:
+            session.get(EditorialPreparationClaim, claim["id"]).state = "blocked_unknown"
+    elif damage == "factory": value.cycle.quality_factory = lambda: None
+    elif damage in {"native_binding", "native_attempt"}:
+        with value.core.db.session.begin() as session:
+            action = "article_reserve_preparation_binding" if damage == "native_binding" else "hourly_article_prepare_attempt"
+            session.query(Audit).filter_by(entity=original["id"], action=action).one().details = {}
+    else:
+        ledger = value.cycle._load()
+        record = value.cycle._record(ledger, original["id"])
+        if damage == "repair": record["automatic_repair_attempts"] = [{"state": "failed"}]
+        else: record["postiz_id"] = "unexpected"
+        value.cycle._save(ledger)
+    before = copy.deepcopy(value.cycle._load())
+    with pytest.raises(AgentError):
+        value.store.reject_translation_preflight(claim, original["id"], error, cycle=value.cycle)
+    assert value.cycle._load() == before and value.store.active_preparation() is not None and calls == []
+
+
+def test_preflight_rejection_continues_same_reserve_batch_with_distinct_source(reserve_controller, monkeypatch):
+    value = reserve_controller
+    bad = {**value.article, "original": value.article["original"] + " " + "Z" * 601}
+    good = {**value.article, "url": "https://science.example.org/article/after-local-preflight/"}
+    calls, local_quality = preflight_quality(value, monkeypatch)
+
+    def quality(record_id=None, review_only=False):
+        record = value.cycle._record(value.cycle._load(), record_id)
+        return local_quality(record_id) if record["url"] == bad["url"] else value.quality(record_id)
+
+    monkeypatch.setattr(value.cycle, "_quality", quality)
+    value.controller.selector = lambda *_args, **kw: next((copy.deepcopy(a) for a in (bad, good)
+        if not any(r["url"] == a["url"] for r in kw["ledger"]["records"])), None)
+    assert value.controller.prepare_once()["phase"] == "no_source"
+    records = value.cycle._load()["records"]
+    assert [r["state"] for r in records] == ["cancelled", "quality_ready"] and value.store.active_preparation() is None
+    assert records[0]["error"] == "TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT" and calls == []
+    assert len(value.model_calls) == 1 and not value.posts and not value.writes
+
+
+def test_legacy_generic_unsplittable_error_keeps_unknown_claim_and_never_tries_another_source(reserve_controller, monkeypatch):
+    from max_postiz_agent.translation import DedicatedTranslator
+    value = reserve_controller
+    calls, _ = preflight_quality(value, monkeypatch)
+    attempts = []
+
+    def old_error(*_args):
+        attempts.append("old generic output has no preflight proof")
+        raise AgentError("TRANSLATION_UNSPLITTABLE_INPUT")
+
+    monkeypatch.setattr(DedicatedTranslator, "generate_text", old_error)
+    with pytest.raises(AgentError, match="^TRANSLATION_UNSPLITTABLE_INPUT$"):
+        value.controller.prepare_once()
+    assert value.controller.prepare_once()["phase"] == "blocked"
+    record = value.cycle._load()["records"][0]
+    assert record["state"] == "needs_attention" and record["error"] == "TRANSLATION_UNSPLITTABLE_INPUT"
+    assert value.store.active_preparation()["state"] == "blocked_unknown" and len(attempts) == 1 and calls == []
+    assert not value.posts and not value.writes
+
+
+def test_preflight_with_changed_illustration_evidence_cannot_release_claim(illustrated, monkeypatch):
+    value = illustrated
+    claim, original, error, calls = captured_preflight(value, monkeypatch)
+    ledger = value.cycle._load()
+    record = value.cycle._record(ledger, original["id"])
+    record["illustration_proof_hash"] = "0" * 64
+    value.cycle._save(ledger)
+    with pytest.raises((AgentError, AssertionError)):
+        value.store.reject_translation_preflight(claim, original["id"], error, cycle=value.cycle)
+    assert value.store.active_preparation() is not None and value.cycle._load()["records"][0]["state"] == "needs_attention"
+    assert calls == [] and not value.posts and not value.writes

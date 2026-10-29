@@ -7,14 +7,143 @@ import httpx
 import pytest
 
 from max_postiz_agent.article_quality import ArticleQuality
-from max_postiz_agent.config import AgentError
+from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.translation import (DedicatedTranslator, MADLAD_ARTIFACT_SHA256,
-    MADLAD_BACKEND_CONTRACT, MADLAD_MODEL, MADLAD_SEGMENTATION_CONTRACT)
+    MADLAD_BACKEND_CONTRACT, MADLAD_MODEL, MADLAD_SEGMENTATION_CONTRACT,
+    TranslationPreflightError, preflight_segments, segments)
 
 
 def metrics():
     return {"backend_contract": MADLAD_BACKEND_CONTRACT, "artifact_sha256": MADLAD_ARTIFACT_SHA256,
             "seconds": 1}
+
+
+@pytest.mark.parametrize("limit", [400, 600, 1400])
+@pytest.mark.parametrize("boundary", ["Short fact. ", "Question? ", 'A short quote." '])
+def test_short_first_sentence_uses_safe_whitespace_fallback_without_losing_source(limit, boundary):
+    # Same shape as the saved failure: short sentence, then a long ordinary sentence.
+    text=boundary+" ".join(["ordinary"]*(limit//3))+" final observation.\n\nSecond paragraph has 17 results."
+    pieces=segments(text,limit=limit)
+    assert ''.join(part for part,_ in pieces)==text
+    assert all(0<len(part)<=limit for part,translate in pieces if translate)
+    assert any(part=='\n\n' and not translate for part,translate in pieces)
+
+
+def test_whitespace_fallback_keeps_full_url_and_numeric_tokens_literal():
+    url='https://science.example.test/observations/item-17?sample=3&unit=km'
+    text='Short fact. '+('The sensor recorded 17 samples at 3.5 km ' * 20)+url+' Final observation.'
+    pieces=segments(text,limit=600)
+    rebuilt=''.join(part for part,_ in pieces)
+    assert rebuilt==text and sum(url in part for part,translate in pieces if translate)==1
+    assert all(len(part)<=600 for part,translate in pieces if translate)
+
+
+@pytest.mark.parametrize("field", ['title','body'])
+def test_unbreakable_field_is_rejected_before_any_title_or_body_http(field):
+    calls=[]
+    translator=DedicatedTranslator({'model':MADLAD_MODEL,'base_url':'http://127.0.0.1:8094','segment_chars':600},
+        transport=httpx.MockTransport(lambda request:calls.append(request)))
+    source={'title':'A valid short title','body':'An ordinary body.'}
+    source[field]='x'*601
+    try:
+        with pytest.raises(TranslationPreflightError,match='^TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT$') as failed:
+            translator.generate_text(json.dumps({'source_untrusted':source}))
+    finally:
+        translator.client.close()
+    assert calls==[] and translator._cached_source is None and translator._cached_result is None
+    assert failed.value.preflight_evidence=={'contract':'dedicated-translation-preflight-v1','model':MADLAD_MODEL,
+        'segment_chars':600,'source_hash':fingerprint(source),'config_hash':translator.config_hash,
+        'failed_field':field,'underlying_error':'TRANSLATION_UNSPLITTABLE_INPUT','no_model_requests':True}
+    with pytest.raises(AgentError,match='^TRANSLATION_UNSPLITTABLE_INPUT$'):
+        segments(source[field],limit=600)
+
+
+def test_late_unbreakable_body_paragraph_preflights_all_source_before_http():
+    calls=[]
+    translator=DedicatedTranslator({'model':MADLAD_MODEL,'base_url':'http://127.0.0.1:8094','segment_chars':600},
+        transport=httpx.MockTransport(lambda request:calls.append(request)))
+    body=('A complete ordinary sentence. '*40)+'\n\n'+'x'*601
+    try:
+        with pytest.raises(AgentError,match='^TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT$'):
+            translator.generate_text(json.dumps({'source_untrusted':{'title':'Title','body':body}}))
+    finally:
+        translator.client.close()
+    assert calls==[]
+
+
+def test_direct_translate_keeps_existing_generic_error_semantics_without_http():
+    calls=[]
+    translator=DedicatedTranslator({'model':MADLAD_MODEL,'base_url':'http://127.0.0.1:8094','segment_chars':600},
+        transport=httpx.MockTransport(lambda request:calls.append(request)))
+    try:
+        with pytest.raises(AgentError,match='^TRANSLATION_UNSPLITTABLE_INPUT$'):
+            translator.translate('x'*601)
+    finally:
+        translator.client.close()
+    assert calls==[]
+
+
+def test_pure_preflight_replays_typed_failure_without_any_translator_instance():
+    assert preflight_segments('Title','A complete short body.',limit=600) is None
+    with pytest.raises(AgentError,match='^TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT$') as failed:
+        preflight_segments('Title','x'*601,limit=600)
+    assert type(failed.value) is AgentError and failed.value.failed_field=='body'
+
+
+def test_native_preflight_proof_binds_exact_source_url_and_full_validated_config():
+    calls=[]
+    source={'title':'Title','body':'x'*601,'url':'https://science.example.test/item-17/'}
+    config={'enabled':True,'model':MADLAD_MODEL,'base_url':'http://127.0.0.1:8094','segment_chars':600}
+    translator=DedicatedTranslator(config,transport=httpx.MockTransport(lambda request:calls.append(request)))
+    try:
+        with pytest.raises(TranslationPreflightError) as failed:
+            translator.generate_text(json.dumps({'source_untrusted':source}))
+    finally:
+        translator.client.close()
+    proof=failed.value.preflight_evidence
+    assert proof['source_hash']==fingerprint(source) and proof['config_hash']==fingerprint(config)
+    assert proof['source_hash']!=fingerprint({k:v for k,v in source.items() if k!='url'})
+    assert proof['config_hash']!=fingerprint({k:v for k,v in config.items() if k!='enabled'})
+    assert calls==[]
+
+
+def test_network_error_after_preflight_remains_generic_model_unavailable():
+    calls=[]
+    def fail(request):
+        calls.append(request)
+        return httpx.Response(503,json={'error':'unavailable'})
+    translator=DedicatedTranslator({'model':MADLAD_MODEL,'base_url':'http://127.0.0.1:8094','segment_chars':600},
+        transport=httpx.MockTransport(fail))
+    try:
+        with pytest.raises(AgentError,match='^TRANSLATION_SERVICE_UNAVAILABLE$') as failed:
+            translator.generate_text(json.dumps({'source_untrusted':{'title':'Title','body':'Body.'}}))
+    finally:
+        translator.client.close()
+    assert len(calls)==1 and type(failed.value) is AgentError and not hasattr(failed.value,'preflight_evidence')
+
+
+def test_fallback_source_reaches_http_as_bounded_complete_words_with_unchanged_evidence():
+    calls=[]
+    body='Tiny introduction. '+('ordinary measured values ' * 65)+'https://science.example.test/item-17'
+    def translate(request):
+        value=json.loads(request.content);calls.append(value['text'])
+        return httpx.Response(200,json={'model':MADLAD_MODEL,'complete':True,
+            'text':value['text'],'metrics':metrics()})
+    translator=DedicatedTranslator({'model':MADLAD_MODEL,'base_url':'http://127.0.0.1:8094','segment_chars':600},
+        transport=httpx.MockTransport(translate))
+    try:
+        raw,evidence=translator.generate_text(json.dumps({'source_untrusted':{'title':'Title','body':body}}))
+    finally:
+        translator.client.close()
+    assert json.loads(raw)=={'title':'Title','body':body}
+    assert ' '.join(calls[1:])==body and all(len(part)<=600 for part in calls)
+    assert len(evidence['segments'])==len(calls) and evidence['segmentation_contract']==MADLAD_SEGMENTATION_CONTRACT
+
+
+def test_short_sentence_does_not_allow_cutting_an_unbreakable_url():
+    url='https://science.example.test/'+('x'*650)
+    with pytest.raises(AgentError,match='^TRANSLATION_UNSPLITTABLE_INPUT$'):
+        segments('Tiny introduction. '+url,limit=600)
 
 
 @pytest.mark.parametrize("limit", [399, 1401, 600.0, "600", True, None])
