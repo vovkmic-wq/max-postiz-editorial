@@ -231,9 +231,14 @@ class ReserveServerCycle(ServerCycle):
             self.reserve.finish_preparation(claim, "quality_ready")
             return "quality_ready"
         status = self._automatic_repair_status(record)
-        if (not status["eligible"] and status["reason"] in {"EXHAUSTED", "NOT_REPAIRABLE", "NO_CHANGE"}
+        if (not status["eligible"] and status["reason"] in {"EXHAUSTED", "NOT_REPAIRABLE", "NO_CHANGE", "MODEL_INPUT_BUDGET"}
                 and self._known_rejection(record)):
+            if status["reason"] == "MODEL_INPUT_BUDGET":
+                from .article_repair_cycle import AutomaticArticleRepair
+                AutomaticArticleRepair(self.cycle).record_input_budget(record["id"], status["model_input"])
             self.cycle.cancel_preparation(record["id"],
+                "Reserve policy preserves the known rejection; compact editor input exceeds its pre-request budget"
+                if status["reason"] == "MODEL_INPUT_BUDGET" else
                 "Reserve policy preserves the completed rejection and both durable repair claims")
             self.reserve.finish_preparation(claim, "rejected", "ARTICLE_QUALITY_REJECTED")
             return "rejected"

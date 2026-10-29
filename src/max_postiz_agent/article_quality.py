@@ -47,13 +47,16 @@ MAX_PROTOCOL_REVIEW_BYTES = 65536
 LEGACY_REVIEW_RUBRIC = "legacy"
 MEANING_FIRST_REVIEW_RUBRIC = "meaning-first-v1"
 HOURLY_PRACTICAL_REVIEW_RUBRIC = "hourly-practical-v1"
-REVIEW_RUBRICS = {LEGACY_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC,
-                  HOURLY_PRACTICAL_REVIEW_RUBRIC}
+HOURLY_PRACTICAL_V2_REVIEW_RUBRIC = "hourly-practical-v2"
+PRACTICAL_REVIEW_RUBRICS = frozenset({HOURLY_PRACTICAL_REVIEW_RUBRIC, HOURLY_PRACTICAL_V2_REVIEW_RUBRIC})
+AUTOMATIC_REVIEW_RUBRICS = frozenset({MEANING_FIRST_REVIEW_RUBRIC, *PRACTICAL_REVIEW_RUBRICS})
+REVIEW_RUBRICS = {LEGACY_REVIEW_RUBRIC, *AUTOMATIC_REVIEW_RUBRICS}
 # Новое поручение владельца: редкие языковые замечания допустимы, массовые — нет.
 PRACTICAL_LT_MIN_FINDINGS = 8
 PRACTICAL_LT_WORDS_PER_FINDING = 10
 _PRACTICAL_LT_ISSUES = frozenset({"misspelling", "grammar", "typographical", "style",
                                   "register", "duplication", "locale-violation"})
+_PRACTICAL_V2_UNCATEGORIZED = {"GRAMMAR": "grammar", "STYLE": "style", "PUNCTUATION": "typographical"}
 _INLINE_ARTICLE_LINK = re.compile(r"(?<![!\\])\[([^\[\]\r\n]+)\]\((https?://)")
 
 
@@ -115,12 +118,12 @@ def normalize_rubric_review(value, rubric):
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
     if rubric == LEGACY_REVIEW_RUBRIC:
         return _normalize_review(value)
-    if rubric not in {MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC}:
+    if rubric not in AUTOMATIC_REVIEW_RUBRICS:
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
     if not isinstance(value, dict) or set(value) != {"approved", "topic", "issues", "warnings"}:
         raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
     normalized = _normalize_review({key: value[key] for key in ("approved", "topic", "issues")})
-    if rubric == HOURLY_PRACTICAL_REVIEW_RUBRIC and normalized["approved"] and normalized["issues"]:
+    if rubric in PRACTICAL_REVIEW_RUBRICS and normalized["approved"] and normalized["issues"]:
         # Противоречивый verdict не превращаем в passed или содержательное одобрение.
         raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
     warnings = value["warnings"]
@@ -368,7 +371,8 @@ def review_prompt_name(rubric):
     """Сохранённые рубрики всегда читают свой неизменённый review prompt."""
     names = {LEGACY_REVIEW_RUBRIC: "ARTICLE_REVIEW.txt",
              MEANING_FIRST_REVIEW_RUBRIC: "ARTICLE_REVIEW_MEANING_FIRST_V1.txt",
-             HOURLY_PRACTICAL_REVIEW_RUBRIC: "ARTICLE_REVIEW_HOURLY_PRACTICAL.txt"}
+             HOURLY_PRACTICAL_REVIEW_RUBRIC: "ARTICLE_REVIEW_HOURLY_PRACTICAL.txt",
+             HOURLY_PRACTICAL_V2_REVIEW_RUBRIC: "ARTICLE_REVIEW_HOURLY_PRACTICAL_V2.txt"}
     if not isinstance(rubric, str) or rubric not in names:
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
     return names[rubric]
@@ -384,12 +388,26 @@ def practical_language_budget(translated):
     return {"russian_words": word_count, "max_findings": maximum}
 
 
-def _ordinary_language_finding(match, translated):
+def _practical_issue_type(match, *, allow_uncategorized=False):
+    rule = match.get("rule")
+    if not isinstance(rule, dict):
+        return None
+    issue = rule.get("issueType")
+    if isinstance(issue, str) and issue in _PRACTICAL_LT_ISSUES:
+        return issue
+    category = rule.get("category")
+    if (allow_uncategorized is True and issue == "uncategorized" and isinstance(category, dict)
+            and isinstance(category.get("id"), str)):
+        return _PRACTICAL_V2_UNCATEGORIZED.get(category["id"])
+    return None
+
+
+def _ordinary_language_finding(match, translated, *, allow_uncategorized=False):
     """Повреждённый LT payload или неизвестный тип не становится советом."""
     rule, kind = match.get("rule"), match.get("type")
     offset, length = match.get("offset"), match.get("length")
     if (not isinstance(rule, dict) or not isinstance(rule.get("id"), str) or not rule["id"]
-            or rule.get("issueType") not in _PRACTICAL_LT_ISSUES
+            or _practical_issue_type(match, allow_uncategorized=allow_uncategorized) is None
             or not isinstance(rule.get("category"), dict)
             or not isinstance(rule["category"].get("id"), str) or not rule["category"]["id"]
             or not isinstance(kind, dict) or kind.get("typeName") not in
@@ -414,22 +432,26 @@ def rubric_spelling(original, translated, matches, rubric, *, allow_spacetime=Fa
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
     adjudicated, unresolved = adjudicate_scientific_spelling(original, translated, matches,
         allow_spacetime=allow_spacetime, allow_registered_terms=allow_registered_terms)
-    if rubric == HOURLY_PRACTICAL_REVIEW_RUBRIC:
+    if rubric in PRACTICAL_REVIEW_RUBRICS:
+        allow_uncategorized = rubric == HOURLY_PRACTICAL_V2_REVIEW_RUBRIC
         budget = practical_language_budget(translated)
         # Стиль и необязательная пунктуация не создают новый барьер по сравнению
         # с meaning-first-v1; ранее доказанные термины тоже не являются ошибками.
         optional = {"style", "register", "typographical"}
-        language_findings = sum(_ordinary_language_finding(match, translated)
-            and match["rule"]["issueType"] not in optional for match in unresolved)
+        language_findings = sum(_ordinary_language_finding(match, translated, allow_uncategorized=allow_uncategorized)
+            and _practical_issue_type(match, allow_uncategorized=allow_uncategorized) not in optional for match in unresolved)
         budget["nonstyle_readability_findings"] = language_findings
         over_budget = language_findings > budget["max_findings"]
         blocking = []
         for match in unresolved:
-            if (_ordinary_language_finding(match, translated)
-                    and (not over_budget or match["rule"]["issueType"] in optional)):
+            kind = _practical_issue_type(match, allow_uncategorized=allow_uncategorized)
+            if (_ordinary_language_finding(match, translated, allow_uncategorized=allow_uncategorized)
+                    and (not over_budget or kind in optional)):
                 adjudicated.append({"match": copy.deepcopy(match),
                     "reason": "NON_BLOCKING_PRACTICAL_LANGUAGE_ADVICE",
-                    "review_rubric": rubric, "readability_budget": budget.copy()})
+                    "review_rubric": rubric, "readability_budget": budget.copy(),
+                    **({"effective_issue_type": kind} if allow_uncategorized
+                       and match["rule"]["issueType"] == "uncategorized" else {})})
             else:
                 blocking.append(match)
         return adjudicated, blocking
@@ -720,7 +742,7 @@ class ArticleQuality:
                 raise
             self._emit("spelling_returned", attempt, matches=matches)
             adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric,
-                allow_spacetime=self.review_rubric in {MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC},
+                allow_spacetime=self.review_rubric in AUTOMATIC_REVIEW_RUBRICS,
                 allow_registered_terms=self.allow_registered_terms)
             self._emit("spelling_adjudicated", attempt, adjudicated=adjudicated, unresolved=unresolved,
                        **self._scientific_marker())
@@ -805,7 +827,7 @@ class ArticleQuality:
             raise
         self._emit("spelling_returned", 1, matches=matches)
         adjudicated, unresolved = rubric_spelling(source, text, matches, self.review_rubric,
-            allow_spacetime=self.review_rubric in {MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC},
+            allow_spacetime=self.review_rubric in AUTOMATIC_REVIEW_RUBRICS,
             allow_registered_terms=self.allow_registered_terms)
         self._emit("spelling_adjudicated", 1, adjudicated=adjudicated, unresolved=unresolved,
                    **self._scientific_marker())

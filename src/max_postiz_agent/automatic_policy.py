@@ -96,8 +96,8 @@ def scientific_trace_binding(trace_path, contract, *, expected_hash=None, expect
 
 
 def _validate(evidence, title, body, source):
-    from .article_quality import (FRESH_SPACETIME_SPELLING_CONTRACT, HOURLY_PRACTICAL_REVIEW_RUBRIC,
-                                  MAX_REVIEW_ISSUES, MEANING_FIRST_REVIEW_RUBRIC, TOPICS,
+    from .article_quality import (AUTOMATIC_REVIEW_RUBRICS, FRESH_SPACETIME_SPELLING_CONTRACT,
+                                  MAX_REVIEW_ISSUES, TOPICS,
                                   normalize_rubric_review, protocol_recovery_provenance,
                                   review_parser_contract, rubric_spelling, rubric_translation_gate)
     required = {"review_raw", "review", "spelling_matches", "spelling_adjudicated", "spelling_unresolved",
@@ -106,7 +106,7 @@ def _validate(evidence, title, body, source):
                 "scientific_spelling_contract", "presentation_contract", "image_credit"}
     if (not isinstance(evidence, dict) or not required <= set(evidence) <= required | optional
             or not isinstance(evidence["review_rubric"], str)
-            or evidence["review_rubric"] not in {MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC}
+            or evidence["review_rubric"] not in AUTOMATIC_REVIEW_RUBRICS
             or evidence["hard_gates_passed"] is not True
             or evidence["text_hash"] != text_hash(title, body)
             or evidence["source_hash"] != fingerprint({**source, "title": source["title"].strip(),

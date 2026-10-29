@@ -1,0 +1,118 @@
+[
+  {
+    "name": "gender",
+    "text": "Новый обсерватория наблюдает далёкую звезду.",
+    "match": {
+      "message": "Прилагательное не согласуется с существительным по роду.",
+      "offset": 0,
+      "length": 18,
+      "context": {
+        "text": "Новый обсерватория наблюдает далёкую звезду.",
+        "offset": 0,
+        "length": 18
+      },
+      "sentence": "Новый обсерватория наблюдает далёкую звезду.",
+      "type": {
+        "typeName": "Other"
+      },
+      "rule": {
+        "id": "Unify_Adj_NN_gender",
+        "subId": "2",
+        "sourceFile": "grammar.xml",
+        "description": "Согласование прилагательного с существительным",
+        "issueType": "uncategorized",
+        "category": {
+          "id": "GRAMMAR",
+          "name": "Грамматика"
+        }
+      }
+    }
+  },
+  {
+    "name": "comma",
+    "text": "Для таких объектов как звёзды нужны наблюдения.",
+    "match": {
+      "message": "Пропущена запятая: «таких, как»",
+      "offset": 4,
+      "length": 18,
+      "context": {
+        "text": "Для таких объектов как звёзды нужны наблюдения.",
+        "offset": 4,
+        "length": 18
+      },
+      "sentence": "Для таких объектов как звёзды нужны наблюдения.",
+      "type": {
+        "typeName": "Other"
+      },
+      "rule": {
+        "id": "TAKOJ_KAK",
+        "subId": "3",
+        "sourceFile": "grammar.xml",
+        "description": "Сложный союз «такой (такая, такое, такие) как»",
+        "issueType": "uncategorized",
+        "category": {
+          "id": "GRAMMAR",
+          "name": "Грамматика"
+        }
+      }
+    }
+  },
+  {
+    "name": "style_relative",
+    "text": "Видна галактика, которая светится и которая вращается.",
+    "match": {
+      "message": "Избыточные определения. В правильно составленном предложении не должно быть больше одного придаточного определения.",
+      "offset": 17,
+      "length": 26,
+      "context": {
+        "text": "Видна галактика, которая светится и которая вращается.",
+        "offset": 17,
+        "length": 26
+      },
+      "sentence": "Видна галактика, которая светится и которая вращается.",
+      "type": {
+        "typeName": "Other"
+      },
+      "rule": {
+        "id": "OPREDELENIA",
+        "subId": "1",
+        "sourceFile": "grammar.xml",
+        "description": "Избыточные придаточные определения",
+        "issueType": "uncategorized",
+        "category": {
+          "id": "STYLE",
+          "name": "Стиль"
+        }
+      }
+    }
+  },
+  {
+    "name": "style_nested",
+    "text": "Наблюдения содержат снимки, которые сделаны прибором, который работает ночью.",
+    "match": {
+      "message": "Избыточные определения. В правильно составленном предложении не должно быть больше одного придаточного определения.",
+      "offset": 28,
+      "length": 33,
+      "context": {
+        "text": "Наблюдения содержат снимки, которые сделаны прибором, который работает ночью.",
+        "offset": 28,
+        "length": 33
+      },
+      "sentence": "Наблюдения содержат снимки, которые сделаны прибором, который работает ночью.",
+      "type": {
+        "typeName": "Other"
+      },
+      "rule": {
+        "id": "OPREDELENIA",
+        "subId": "1",
+        "sourceFile": "grammar.xml",
+        "description": "Избыточные придаточные определения",
+        "issueType": "uncategorized",
+        "category": {
+          "id": "STYLE",
+          "name": "Стиль"
+        }
+      }
+    }
+  }
+]

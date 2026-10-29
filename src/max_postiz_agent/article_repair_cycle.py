@@ -11,8 +11,10 @@ from sqlalchemy.exc import IntegrityError
 
 from .article_attribution import presentation_binding
 from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACTS
-from .article_repair import (REPAIR_CONTRACT, REPAIR_CONTRACTS, REPAIR_MODEL,
-                             repair_context, repair_prompt_name, repair_reference_contract, repair_replay_hash)
+from .article_repair import (COMPACT_FEEDBACK_CONTRACT, COMPACT_REPAIR_PROMPT,
+                             REPAIR_CONTRACT, REPAIR_CONTRACTS, REPAIR_MODEL, compact_repair_input,
+                             feedback_prompt_name, repair_context, repair_prompt_name,
+                             repair_reference_contract, repair_replay_hash)
 from .browser_runtime import profile_lock
 from .config import AgentError, fingerprint, inside, parse_json
 from .db import Audit
@@ -27,7 +29,8 @@ QUARANTINE_ERRORS = {"ARTICLE_REPAIR_RESPONSE_INVALID", "ARTICLE_REPAIR_PATCH_IN
                      "ARTICLE_REPAIR_LATIN_MASK_FORBIDDEN"}
 _BINDING = ("id", "number", "contract", "model", "input_hash", "policy_hash", "slot",
             "parent_trace_hash", "parent_trace_bytes", "snapshot_hash", "snapshot_path", "prompts", "target_binding_hash",
-            "source_config_hash", "reference_contract", "review_rubric", "presentation_contract", "image_credit")
+            "source_config_hash", "reference_contract", "review_rubric", "presentation_contract", "image_credit",
+            "feedback_contract", "raw_feedback_hash", "model_input")
 
 
 def _now():
@@ -142,6 +145,9 @@ class AutomaticArticleRepair:
             return result
         if payload.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != repair_reference_contract(REPAIR_CONTRACT):
             return {**result, "reason": "REFERENCE_CONTRACT_CHANGED"}
+        if payload.get("feedback_contract") == COMPACT_FEEDBACK_CONTRACT:
+            if not payload["model_input"]["fits"]:
+                return {**result, "reason": "MODEL_INPUT_BUDGET", "model_input": payload["model_input"]}
         return {**result, "eligible": True, "reason": "READY"}
 
     @staticmethod
@@ -159,8 +165,26 @@ class AutomaticArticleRepair:
         repair_prompt = repair_prompt_name(REPAIR_CONTRACT if contract is None else contract)
         from .article_quality import review_prompt_name
         root = self.core.settings.root / "prompts"
-        return {name: _sha((root / name).read_bytes()) for name in (
-            "ARTICLE_TRANSLATE.txt", review_prompt_name(rubric), repair_prompt)}
+        from .article_quality import HOURLY_PRACTICAL_V2_REVIEW_RUBRIC
+        names = ["ARTICLE_TRANSLATE.txt", review_prompt_name(rubric), repair_prompt]
+        if rubric == HOURLY_PRACTICAL_V2_REVIEW_RUBRIC:
+            names.append(COMPACT_REPAIR_PROMPT)
+        return {name: _sha((root / name).read_bytes()) for name in names}
+
+    def _model_input(self, payload):
+        instruction = (self.core.settings.root / "prompts" / COMPACT_REPAIR_PROMPT).read_text(encoding="utf-8")
+        return compact_repair_input(payload["article"], payload["candidate"], payload["feedback"], instruction)
+
+    @staticmethod
+    def _feedback_kwargs(claim):
+        return ({"feedback_contract": claim["feedback_contract"], "model_input_proof": claim["model_input"]}
+                if claim.get("feedback_contract") is not None else {})
+
+    @staticmethod
+    def _feedback_binding(claim):
+        return ({"feedback_contract": claim["feedback_contract"], "raw_feedback_hash": claim["raw_feedback_hash"],
+                 "model_input_hash": fingerprint(claim["model_input"])}
+                if claim.get("feedback_contract") is not None else {})
 
     def _quiet(self, record, policy):
         require_running(self.core)
@@ -403,6 +427,10 @@ class AutomaticArticleRepair:
                 payload["scientific_spelling_contract"] = scientific_contract
             if "review_rubric" in record:
                 payload["review_rubric"] = rubric
+            from .article_quality import HOURLY_PRACTICAL_V2_REVIEW_RUBRIC
+            if rubric == HOURLY_PRACTICAL_V2_REVIEW_RUBRIC:
+                payload.update(feedback_contract=COMPACT_FEEDBACK_CONTRACT,
+                    raw_feedback_hash=fingerprint(feedback), model_input=self._model_input(payload)["proof"])
             return payload
         except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError, StopIteration, AgentError, OverflowError) as exc:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409) from exc
@@ -439,16 +467,17 @@ class AutomaticArticleRepair:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409)
         events = [parse_json(line) for line in raw.decode("utf-8").splitlines()]
         expected = {"contract": claim["contract"], "model": claim["model"],
-            "prompt_hash": claim["prompts"][repair_prompt_name(claim["contract"])], "input_hash": claim["input_hash"],
+            "prompt_hash": claim["prompts"][feedback_prompt_name(claim["contract"], claim.get("feedback_contract"))], "input_hash": claim["input_hash"],
             "old_candidate_hash": fingerprint(snapshot["candidate"]),
             "old_replay_hash": repair_replay_hash(snapshot["candidate"]),
             "feedback_hash": fingerprint(snapshot["feedback"])}
         expected.update(presentation_binding(claim.get("presentation_contract"), claim.get("image_credit")))
+        expected.update(self._feedback_binding(claim))
         if claim["contract"] in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}:
             expected["reference_contract"] = self._claim_reference(claim)
         article = snapshot["article"]
         expected_context = repair_context(article, snapshot["candidate"], snapshot["feedback"],
-                                          contract=claim["contract"])
+                                          contract=claim["contract"], feedback_contract=claim.get("feedback_contract"))
         if ([e.get("phase") for e in events] != ["repair_started", "repair_returned", "repair_failed"]
                 or any(e.get("record_id") != record["id"] or e.get("repair_claim") != claim["id"]
                        or e.get("attempt") != 1 or e.get("binding") != expected for e in events)
@@ -456,6 +485,9 @@ class AutomaticArticleRepair:
                        or e["at"] < claim["started_at"] for e in events)
                 or [e["at"] for e in events] != sorted(e["at"] for e in events)
                 or events[0].get("context") != expected_context
+                or claim.get("feedback_contract") is not None and (
+                    events[0].get("raw_feedback") != snapshot["feedback"]
+                    or events[0].get("model_input") != claim["model_input"])
                 or claim.get("finished_at") is not None and (
                     type(claim["finished_at"]) not in {int, float}
                     or not math.isfinite(claim["finished_at"])
@@ -482,7 +514,7 @@ class AutomaticArticleRepair:
                                **presentation_binding(claim.get("presentation_contract"), claim.get("image_credit")))
         try:
             replay.propose(article, snapshot["candidate"], snapshot["feedback"],
-                rejected_replay_hashes=snapshot["rejected_replay_hashes"])
+                rejected_replay_hashes=snapshot["rejected_replay_hashes"], **self._feedback_kwargs(claim))
         except AgentError as exc:
             if exc.code != code:
                 raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409) from exc
@@ -635,6 +667,19 @@ class AutomaticArticleRepair:
                 or snapshot.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != references
                 or record.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != references):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
+        from .article_quality import HOURLY_PRACTICAL_V2_REVIEW_RUBRIC
+        compact = record.get("review_rubric") == HOURLY_PRACTICAL_V2_REVIEW_RUBRIC
+        if compact:
+            expected = self._model_input(snapshot)["proof"]
+            if (snapshot.get("feedback_contract") != COMPACT_FEEDBACK_CONTRACT
+                    or claim.get("feedback_contract") != COMPACT_FEEDBACK_CONTRACT
+                    or snapshot.get("raw_feedback_hash") != fingerprint(snapshot["feedback"])
+                    or claim.get("raw_feedback_hash") != snapshot["raw_feedback_hash"]
+                    or snapshot.get("model_input") != expected or claim.get("model_input") != expected
+                    or not expected["fits"]):
+                raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
+        elif any(key in value for value in (snapshot, claim) for key in ("feedback_contract", "raw_feedback_hash", "model_input")):
+            raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         if record.get("input_file"):
             original = inside(self.core.settings.root, record["input_file"]).read_bytes()
             if _sha(original) != record["input_file_hash"] or parse_json(original.decode("utf-8")) != article:
@@ -690,6 +735,37 @@ class AutomaticArticleRepair:
                 raise AgentError("ARTICLE_AUTOMATIC_REPAIR_CLAIM_LOST", 409)
         return record, history[-1]
 
+    def record_input_budget(self, ident, expected):
+        """Полный известный отказ остаётся; это не editor claim и не model retry."""
+        with profile_lock(self.cycle._preparation_lock()):
+            record = self.cycle._record(self.cycle._load(), ident)
+            status = self.status(record)  # Неизвестные/потерянные claims проверяются первыми.
+            if status["reason"] != "MODEL_INPUT_BUDGET" or status.get("model_input") != expected:
+                raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
+            payload = self._payload(record)
+            self._quiet(record, self.cycle._policy_for_record(record))
+            for claim in record.get("automatic_repair_attempts", []):
+                self._files(record, claim, payload["article"])
+            relative = f"data/hourly-articles/repair-budget-{ident}.local.json"
+            hashed = _write_json(inside(self.core.settings.root, relative), payload)
+            audit_id = str(uuid5(NAMESPACE_URL, "max-postiz:model-input-budget:" + ident))
+            details = {"feedback_contract": COMPACT_FEEDBACK_CONTRACT, "snapshot_path": relative,
+                "snapshot_hash": hashed, "model_input": expected, "parent_trace_hash": payload["parent_trace_hash"],
+                "input_hash": record["input_hash"], "policy_hash": record["policy_hash"],
+                "editor_claim_created": False, "model_request_sent": False}
+            with self.core.db.session.begin() as session:
+                require_running(self.core, session, lock=True)
+                self._quiet_session(session)
+                audit = session.get(Audit, audit_id)
+                if audit is not None:
+                    if (audit.actor != "automatic_article_repair" or audit.entity != ident
+                            or audit.action != "automatic_article_repair_model_input_budget" or audit.details != details):
+                        raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
+                else:
+                    session.add(Audit(id=audit_id, actor="automatic_article_repair",
+                        action="automatic_article_repair_model_input_budget", entity=ident, details=details))
+            return details
+
     def run(self, ident):
         cycle, editor, claim = self.cycle, None, None
         with profile_lock(cycle._preparation_lock()):
@@ -725,6 +801,8 @@ class AutomaticArticleRepair:
                 claim["reference_contract"] = payload["reference_contract"]
             if "review_rubric" in record:
                 claim["review_rubric"] = record["review_rubric"]
+            if payload.get("feedback_contract") is not None:
+                claim.update({key: copy.deepcopy(payload[key]) for key in ("feedback_contract", "raw_feedback_hash", "model_input")})
             try:
                 with self.core.db.session.begin() as session:
                     require_running(self.core, session, lock=True)
@@ -745,7 +823,7 @@ class AutomaticArticleRepair:
                         or editor.prompt_hash != claim["prompts"][repair_prompt_name(claim["contract"])]):
                     raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
                 proposal = editor.propose(payload["article"], payload["candidate"], payload["feedback"],
-                                          rejected_replay_hashes=payload["rejected_replay_hashes"])
+                    rejected_replay_hashes=payload["rejected_replay_hashes"], **self._feedback_kwargs(claim))
                 fresh = cycle._load()
                 if fingerprint(cycle._record(fresh, ident)) != expected:
                     raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
@@ -761,11 +839,12 @@ class AutomaticArticleRepair:
                 repair_events = [parse_json(line) for line in repair_raw.decode("utf-8").splitlines()]
                 terminal = "repair_not_repairable" if proposal.get("repairable") is False else "repair_candidate"
                 expected_binding = {"contract": claim["contract"], "model": REPAIR_MODEL,
-                    "prompt_hash": claim["prompts"][repair_prompt_name(claim["contract"])], "input_hash": claim["input_hash"],
+                    "prompt_hash": claim["prompts"][feedback_prompt_name(claim["contract"], claim.get("feedback_contract"))], "input_hash": claim["input_hash"],
                     "old_candidate_hash": fingerprint(payload["candidate"]),
                     "old_replay_hash": repair_replay_hash(payload["candidate"]),
                     "feedback_hash": fingerprint(payload["feedback"])}
                 expected_binding.update(presentation_binding(claim.get("presentation_contract"), claim.get("image_credit")))
+                expected_binding.update(self._feedback_binding(claim))
                 if claim["contract"] in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}:
                     expected_binding["reference_contract"] = self._claim_reference(claim)
                 times = [e.get("at") for e in repair_events]
@@ -778,14 +857,18 @@ class AutomaticArticleRepair:
                         or _sha(proposal["raw"].encode("utf-8")) != proposal["evidence"].get("raw_sha256")
                         or proposal["evidence"].get("input_hash") != claim["input_hash"]
                         or proposal["evidence"].get("model") != REPAIR_MODEL
-                        or proposal["evidence"].get("prompt_hash") != claim["prompts"][repair_prompt_name(claim["contract"])]
+                        or proposal["evidence"].get("prompt_hash") != claim["prompts"][feedback_prompt_name(claim["contract"], claim.get("feedback_contract"))]
                         or any(type(t) not in {int, float} or not math.isfinite(t) or t < claim["started_at"] for t in times)
                         or times != sorted(times)
                         or repair_events[0].get("binding") != expected_binding
                         or repair_events[1].get("binding") != expected_binding
                         or any(proposal["evidence"].get(k) != v for k, v in expected_binding.items())
                         or repair_events[0].get("context") != repair_context(payload["article"],
-                            payload["candidate"], payload["feedback"], contract=claim["contract"])):
+                            payload["candidate"], payload["feedback"], contract=claim["contract"],
+                            feedback_contract=claim.get("feedback_contract"))
+                        or claim.get("feedback_contract") is not None and (
+                            repair_events[0].get("raw_feedback") != payload["feedback"]
+                            or repair_events[0].get("model_input") != claim["model_input"])):
                     raise AgentError("ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID", 409)
                 proposal_path = f"data/hourly-articles/repair-proposal-{claim_id}.local.json"
                 claim.update(proposal_path=proposal_path,

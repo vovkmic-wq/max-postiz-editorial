@@ -346,7 +346,7 @@ def image_page():
 
 @pytest.fixture
 def lazy_page(image_page):
-    def configure(mode="photo", dimensions=(1920, 1440), *, caption_delay_ms=0):
+    def configure(mode="photo", dimensions=(1920, 1440), *, caption_delay_ms=0, image_delay_ms=0):
         import io
         width, height = (96, 96) if mode == "avatar" else (400, 225) if mode == "lowres" else dimensions
         data = io.BytesIO()
@@ -357,7 +357,7 @@ def lazy_page(image_page):
         elif mode == "http":
             source = source.replace("https:", "http:")
         options = {"mode": mode, "source": source, "height": round(464 * dimensions[1] / dimensions[0]),
-            "caption_delay_ms": caption_delay_ms}
+            "caption_delay_ms": caption_delay_ms, "image_delay_ms": image_delay_ms}
         html = r'''<meta charset="utf-8"><h2 id="main-header-title">Окно чата с Тест</h2>
         <main id="history" style="height:420px;overflow:auto"></main>
         <div contenteditable role="textbox" aria-placeholder="Пост" style="white-space:pre-wrap"></div>
@@ -387,9 +387,10 @@ def lazy_page(image_page):
             history.append(item);
             const observer=new IntersectionObserver(entries=>{
               if(!entries.some(entry=>entry.isIntersecting)||options.mode==='placeholder')return;
-              observer.disconnect();const image=document.createElement('img');image.src=options.source;
-              image.style.cssText=options.mode==='avatar'?'display:block;width:48px;height:48px':'display:block;width:464px;height:'+options.height+'px';
-              placeholder.replaceWith(image);logEvent('lazy-photo');
+              observer.disconnect();const load=()=>{const image=document.createElement('img');image.src=options.source;
+                image.style.cssText=options.mode==='avatar'?'display:block;width:48px;height:48px':'display:block;width:464px;height:'+options.height+'px';
+                placeholder.replaceWith(image);logEvent('lazy-photo');};
+              if(options.image_delay_ms){setTimeout(load,options.image_delay_ms)}else{load();}
             },{root:history});observer.observe(placeholder);
           }history.scrollTop=history.scrollHeight;
         }
@@ -427,9 +428,38 @@ def delivered_lazy_post(page, state, mode="photo"):
 
 
 def test_direct_receipt_scrolls_only_exact_post_and_loads_signed_oneme_photo(receipt_state, lazy_page):
-    page = lazy_page()
+    page = lazy_page(image_delay_ms=2400)
     delivered_lazy_post(page, receipt_state)
     assert page.locator("#exact-post img").count() == 0
+    deadline = time.monotonic() + 15
+    # This direct-observation case starts from a fully laid out exact caption.
+    # Delayed caption hydration is exercised separately through _loaded_receipt.
+    title_ready = None
+    while time.monotonic() < deadline:
+        posts = browser_worker._matched_posts(page, receipt_state["text"], illustrated=True)
+        title_ready = browser_worker._illustrated_title(posts.last, receipt_state) if posts.count() == 1 else None
+        if title_ready:
+            break
+        page.wait_for_timeout(100)
+    assert title_ready and title_ready["title_bold"] is True and title_ready["body_unbold"] is True
+    before_scroll = page.evaluate("""() => ({top:document.querySelector('#history').scrollTop,
+        media:[...document.querySelectorAll('#exact-post .image-placeholder,#exact-post img')]
+            .map(image=>({tag:image.tagName,box:image.getBoundingClientRect().toJSON()}))})""")
+    # A direct receipt is a short observation, not a promise to finish loading
+    # within two seconds. It must trigger the exact post's real lazy loader.
+    browser_worker.receipt(page, receipt_state)
+    assert page.locator("#decoy img").count() == 0
+    loaded = False
+    while time.monotonic() < deadline:
+        loaded = page.locator("#exact-post img").evaluate_all("""images => images.some(image =>
+            image.complete && image.naturalWidth === 1920 && image.naturalHeight === 1440)""")
+        if loaded:
+            break
+        # Pump Playwright callbacks while the real routed image loads/decodes.
+        page.wait_for_timeout(100)
+    assert loaded, (before_scroll, title_ready, page.evaluate("""() => ({scrollTop:document.querySelector('#history').scrollTop,
+        events, images:[...document.querySelectorAll('#exact-post img')].map(image =>
+            ({width:image.naturalWidth,height:image.naturalHeight,complete:image.complete}))})"""))
     proof = browser_worker.receipt(page, receipt_state)
     assert proof["state"] == "confirmed"
     photo = proof["image_proof"]

@@ -27,9 +27,9 @@ from .reddit import text_hash
 
 def automatic_review_rubric(record):
     """Старый журнал без marker сохраняет прежние критерии при смене настройки."""
-    from .article_quality import HOURLY_PRACTICAL_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC
+    from .article_quality import AUTOMATIC_REVIEW_RUBRICS, MEANING_FIRST_REVIEW_RUBRIC
     rubric = record.get("review_rubric", MEANING_FIRST_REVIEW_RUBRIC)
-    if not isinstance(rubric, str) or rubric not in {MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC}:
+    if not isinstance(rubric, str) or rubric not in AUTOMATIC_REVIEW_RUBRICS:
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID", 409)
     return rubric
 
@@ -41,7 +41,7 @@ def automatic_review_prompt_name(record):
 
 def review_rubric_binding(core, session, record, variant=None):
     """Практические критерии требуют marker в записи, attempts и durable Audit."""
-    from .article_quality import HOURLY_PRACTICAL_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC
+    from .article_quality import PRACTICAL_REVIEW_RUBRICS, MEANING_FIRST_REVIEW_RUBRIC
     rubric = automatic_review_rubric(record)
     attempts = record.get("preparation_attempts", [])
     audits = list(session.scalars(select(Audit).where(
@@ -54,12 +54,12 @@ def review_rubric_binding(core, session, record, variant=None):
     markers.extend(a.details.get("review_rubric") for a in audits)
     if variant is not None:
         markers.append(variant.metadata_json.get("review_rubric"))
-    if HOURLY_PRACTICAL_REVIEW_RUBRIC not in markers:
+    if not any(marker in PRACTICAL_REVIEW_RUBRICS for marker in markers if isinstance(marker, str)):
         if rubric != MEANING_FIRST_REVIEW_RUBRIC or any(
                 marker is not None and marker != MEANING_FIRST_REVIEW_RUBRIC for marker in markers):
             raise AgentError("ARTICLE_REVIEW_RUBRIC_BINDING_INVALID", 409)
         return rubric
-    if (rubric != HOURLY_PRACTICAL_REVIEW_RUBRIC or not attempts
+    if (rubric not in PRACTICAL_REVIEW_RUBRICS or not attempts
             or any(marker != rubric for marker in markers)):
         raise AgentError("ARTICLE_REVIEW_RUBRIC_BINDING_INVALID", 409)
     for number, attempt in enumerate(attempts, 1):
@@ -174,13 +174,12 @@ class HourlyArticleCycle:
             required = {"enabled", "target_id", "source_id", "allowed_hosts", "rights_evidence",
                         "owner_instruction", "min_gap_seconds", "max_per_day", "max_source_age_hours"}
             mode = policy.get("approval_mode", "legacy")
-            from .article_quality import HOURLY_PRACTICAL_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC
+            from .article_quality import AUTOMATIC_REVIEW_RUBRICS
             keys = set(policy) - {"presentation_contract", "presentation_owner_instruction"}
             presentation = policy.get("presentation_contract")
             presentation_keys = set(policy) & {"presentation_contract", "presentation_owner_instruction"}
             valid_keys = (keys == required | {"approval_mode", "review_rubric"}
-                          and policy.get("review_rubric") in {MEANING_FIRST_REVIEW_RUBRIC,
-                                                             HOURLY_PRACTICAL_REVIEW_RUBRIC}) if mode == "automatic" else (
+                          and policy.get("review_rubric") in AUTOMATIC_REVIEW_RUBRICS) if mode == "automatic" else (
                               keys in (required, required | {"approval_mode"}))
             if (not valid_keys
                     or presentation_keys and (presentation_keys != {"presentation_contract", "presentation_owner_instruction"}
@@ -875,7 +874,8 @@ class HourlyArticleCycle:
                 if illustrated_presentation(policy.get("presentation_contract")):
                     # Формат закреплён до загрузки изображения и первого вызова модели.
                     record["presentation_contract"] = policy["presentation_contract"]
-                if policy.get("review_rubric") == "hourly-practical-v1":
+                from .article_quality import PRACTICAL_REVIEW_RUBRICS
+                if policy.get("review_rubric") in PRACTICAL_REVIEW_RUBRICS:
                     # Новая рубрика выбирается только явной политикой до первой модели.
                     record["review_rubric"] = policy["review_rubric"]
                 if self.reserve_mode:

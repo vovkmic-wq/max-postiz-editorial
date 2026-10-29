@@ -369,13 +369,12 @@ class HubService(Service):
             max_per_day = publication["max_posts_per_day"]
             tz = ZoneInfo(publication["timezone"])
         else:
-            from .article_quality import HOURLY_PRACTICAL_REVIEW_RUBRIC, MEANING_FIRST_REVIEW_RUBRIC
+            from .article_quality import AUTOMATIC_REVIEW_RUBRICS
             if (not isinstance(automatic_policy, dict)
                     or automatic_policy.get("approval_mode") != "automatic"
                     or automatic_policy.get("target_id") != target.id
                     or not isinstance(automatic_policy.get("review_rubric"), str)
-                    or automatic_policy.get("review_rubric") not in {
-                        MEANING_FIRST_REVIEW_RUBRIC, HOURLY_PRACTICAL_REVIEW_RUBRIC}
+                    or automatic_policy.get("review_rubric") not in AUTOMATIC_REVIEW_RUBRICS
                     or type(automatic_policy.get("min_gap_seconds")) is not int
                     or automatic_policy["min_gap_seconds"] < 3600
                     or type(automatic_policy.get("max_per_day")) is not int

@@ -31,6 +31,12 @@ REPAIR_MODEL = "proxmox/qwen35-9b"
 MAX_FEEDBACK_BYTES = 128 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_CHANGES = 8
+COMPACT_FEEDBACK_CONTRACT = "article-model-feedback-v1"
+COMPACT_REPAIR_PROMPT = "ARTICLE_REPAIR_COMPACT_V1.txt"
+MODEL_CONTEXT_TOKENS = 16384
+MODEL_OUTPUT_TOKENS = 4096
+MODEL_CHAT_RESERVE_TOKENS = 1024
+MAX_COMPACT_PROMPT_BYTES = MODEL_CONTEXT_TOKENS - MODEL_OUTPUT_TOKENS - MODEL_CHAT_RESERVE_TOKENS - 1
 
 
 def repair_replay_hash(candidate):
@@ -61,7 +67,90 @@ def repair_reference_contract(contract):
         "article-repair-v6", "article-repair-v7", "article-repair-v8"} else LEGACY_REFERENCE_CONTRACT
 
 
-def repair_context(article, candidate, feedback, *, contract=REPAIR_CONTRACT):
+def feedback_prompt_name(contract, feedback_contract=None):
+    name = repair_prompt_name(contract)
+    if feedback_contract is None:
+        return name
+    _require(feedback_contract == COMPACT_FEEDBACK_CONTRACT and contract == REPAIR_CONTRACT,
+             "ARTICLE_REPAIR_FEEDBACK_CONTRACT_INVALID")
+    return COMPACT_REPAIR_PROMPT
+
+
+def compact_model_feedback(feedback, candidate):
+    """Оставляем каждое замечание; повторы и транспорт остаются в полном snapshot."""
+    code = "ARTICLE_REPAIR_FEEDBACK_INVALID"
+    _require(isinstance(feedback, dict) and set(feedback) == {"events"}
+             and isinstance(feedback["events"], list) and feedback["events"], code)
+    reviews, language, gates = [], [], []
+    adjudicated_matches, terminal_matches = [], []
+    raw_review_seen = parsed_review_seen = False
+    text = (candidate["title"] + "\n\n" + candidate["body"]).encode("utf-16-le")
+
+    def unique(items, value):
+        if value not in items:
+            items.append(copy.deepcopy(value))
+
+    def review(value):
+        _require(isinstance(value, dict) and type(value.get("approved")) is bool
+                 and isinstance(value.get("topic"), str)
+                 and all(isinstance(value.get(k), list) and all(isinstance(s, str) for s in value[k])
+                         for k in ("issues", "warnings")), code)
+        existing = next((v for v in reviews if v["approved"] == value["approved"] and v["topic"] == value["topic"]), None)
+        if existing is None:
+            existing = {"approved": value["approved"], "topic": value["topic"], "issues": [], "warnings": []}
+            reviews.append(existing)
+        for key in ("issues", "warnings"):
+            for item in value[key]:
+                unique(existing[key], item)
+
+    for event in feedback["events"]:
+        _require(isinstance(event, dict) and event.get("phase") in {
+            "gate_rejected", "review_returned", "review_parsed", "spelling_returned",
+            "spelling_adjudicated", "retry", "rejected"}, code)
+        if event["phase"] == "review_parsed":
+            parsed_review_seen = True
+            review(event.get("review"))
+        if event["phase"] == "review_returned":
+            raw_review_seen = True
+        if event["phase"] == "spelling_adjudicated":
+            _require(isinstance(event.get("unresolved"), list), code)
+            for match in event["unresolved"]:
+                adjudicated_matches.append(match)
+                _require(isinstance(match, dict) and isinstance(match.get("message"), str)
+                    and type(match.get("offset")) is int and type(match.get("length")) is int
+                    and match["offset"] >= 0 and match["length"] > 0
+                    and (match["offset"] + match["length"]) * 2 <= len(text)
+                    and isinstance(match.get("replacements", []), list)
+                    and isinstance(match.get("rule"), dict), code)
+                try:
+                    text[:match["offset"] * 2].decode("utf-16-le")
+                    matched = text[match["offset"] * 2:(match["offset"] + match["length"]) * 2].decode("utf-16-le")
+                except UnicodeError as exc:
+                    raise AgentError(code, 409) from exc
+                value = {"message": match["message"], "offset": match["offset"], "length": match["length"],
+                    "matched_text": matched, "suggestions": copy.deepcopy(match.get("replacements", [])),
+                    "rule": {k: copy.deepcopy(match["rule"][k]) for k in ("id", "issueType", "category") if k in match["rule"]}}
+                if match.get("shortMessage"):
+                    value["short_message"] = copy.deepcopy(match["shortMessage"])
+                unique(language, value)
+        if "feedback" in event:
+            value = event["feedback"]
+            if isinstance(value, dict):
+                _require(isinstance(value.get("spelling_matches", []), list), code)
+                terminal_matches.extend(value.get("spelling_matches", []))
+                if "review_issues" in value:
+                    review({"approved": value.get("review_approved"), "topic": value.get("topic"),
+                            "issues": value["review_issues"], "warnings": []})
+                value = {k: v for k, v in value.items() if k not in {
+                    "review_approved", "topic", "review_issues", "spelling_matches"}}
+            if value:
+                unique(gates, value)
+    _require((not raw_review_seen or parsed_review_seen)
+             and all(match in adjudicated_matches for match in terminal_matches), code)
+    return {"reviews": reviews, "blocking_language": language, "hard_gates": gates}
+
+
+def repair_context(article, candidate, feedback, *, contract=REPAIR_CONTRACT, feedback_contract=None):
     """Чистый контекст для нового запроса и точного replay сохранённого trace."""
     repair_prompt_name(contract)
     title, body, source = _validated_source(article["title"], article["original"])
@@ -81,7 +170,26 @@ def repair_context(article, candidate, feedback, *, contract=REPAIR_CONTRACT):
             "current_urls": sorted(current), "missing_urls": sorted(required - current),
             "unexpected_urls": sorted(current - required),
         }
+    if feedback_contract is not None:
+        feedback_prompt_name(contract, feedback_contract)
+        context.update(feedback_contract=feedback_contract, raw_feedback_hash=fingerprint(feedback))
+        context["feedback_untrusted"] = compact_model_feedback(feedback, candidate)
     return context
+
+
+def compact_repair_input(article, candidate, feedback, instruction, *, contract=REPAIR_CONTRACT):
+    """Чистая верхняя граница: каждый UTF-8 byte может стоить один токен."""
+    context = repair_context(article, candidate, feedback, contract=contract,
+                             feedback_contract=COMPACT_FEEDBACK_CONTRACT)
+    prompt = instruction + "\n\nUNTRUSTED_JSON_DATA:\n" + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+    raw = prompt.encode("utf-8")
+    proof = {"contract": COMPACT_FEEDBACK_CONTRACT, "raw_feedback_hash": fingerprint(feedback),
+        "context_hash": fingerprint(context), "instruction_sha256": hashlib.sha256(instruction.encode()).hexdigest(),
+        "prompt_sha256": hashlib.sha256(raw).hexdigest(), "prompt_bytes": len(raw),
+        "max_prompt_bytes": MAX_COMPACT_PROMPT_BYTES, "context_tokens": MODEL_CONTEXT_TOKENS,
+        "output_tokens": MODEL_OUTPUT_TOKENS, "chat_reserve_tokens": MODEL_CHAT_RESERVE_TOKENS,
+        "fits": len(raw) <= MAX_COMPACT_PROMPT_BYTES}
+    return {"context": context, "prompt": prompt, "proof": proof}
 
 
 def _response_object(raw):
@@ -290,6 +398,7 @@ class ArticleRepair:
         self.presentation_contract, self.image_credit = presentation_contract, image_credit
         self.contract = contract
         prompts = Path(prompt_dir) if prompt_dir else Path(__file__).resolve().parents[2] / "prompts"
+        self.prompt_dir = prompts
         self.instruction = (prompts / repair_prompt_name(contract)).read_text(encoding="utf-8")
         self.prompt_hash = hashlib.sha256(self.instruction.encode("utf-8")).hexdigest()
 
@@ -300,7 +409,8 @@ class ArticleRepair:
             except Exception as exc:
                 raise AgentError("ARTICLE_REPAIR_TRACE_FAILED", 503) from exc
 
-    def propose(self, article, candidate, feedback, *, rejected_replay_hashes=()):
+    def propose(self, article, candidate, feedback, *, rejected_replay_hashes=(),
+                feedback_contract=None, model_input_proof=None):
         """Создать один изменённый кандидат либо явный безопасный отказ без новой оценки."""
         _require(isinstance(article, dict) and set(article) == {"url", "title", "original", "published_at"})
         _require(type(article["published_at"]) in {int, float}
@@ -325,9 +435,25 @@ class ArticleRepair:
         binding.update(presentation_binding(self.presentation_contract, self.image_credit))
         if self.contract in {"article-repair-v6", "article-repair-v7", "article-repair-v8"}:
             binding["reference_contract"] = repair_reference_contract(self.contract)
-        context = repair_context(article, previous, diagnostic, contract=self.contract)
-        prompt = self.instruction + "\n\nUNTRUSTED_JSON_DATA:\n" + json.dumps(context, ensure_ascii=False)
-        self._emit("repair_started", binding=binding, context=context)
+        trace_input = {}
+        if feedback_contract is None:
+            _require(model_input_proof is None, "ARTICLE_REPAIR_FEEDBACK_CONTRACT_INVALID")
+            context = repair_context(article, previous, diagnostic, contract=self.contract)
+            prompt = self.instruction + "\n\nUNTRUSTED_JSON_DATA:\n" + json.dumps(context, ensure_ascii=False)
+        else:
+            name = feedback_prompt_name(self.contract, feedback_contract)
+            instruction = (self.prompt_dir / name).read_text(encoding="utf-8")
+            prepared = compact_repair_input(article, previous, diagnostic, instruction, contract=self.contract)
+            proof, context, prompt = prepared["proof"], prepared["context"], prepared["prompt"]
+            _require(model_input_proof is None or model_input_proof == proof,
+                     "ARTICLE_REPAIR_MODEL_INPUT_CHANGED")
+            binding.update(feedback_contract=feedback_contract, raw_feedback_hash=fingerprint(diagnostic),
+                           model_input_hash=fingerprint(proof), prompt_hash=proof["instruction_sha256"])
+            trace_input = {"raw_feedback": diagnostic, "model_input": proof}
+            if not proof["fits"]:
+                self._emit("repair_input_budget_rejected", binding=binding, context=context, **trace_input)
+                raise AgentError("ARTICLE_REPAIR_MODEL_INPUT_BUDGET", 409)
+        self._emit("repair_started", binding=binding, context=context, **trace_input)
         try:
             # Не используем OpenCode.run: в нём есть дополнительные format repairs.
             # Здесь на durable claim приходится ровно один запрос редактору.
