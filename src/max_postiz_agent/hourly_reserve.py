@@ -260,7 +260,8 @@ class ReserveServerCycle(ServerCycle):
         self.state.assert_running()
         for ready in self.cycle._load()["records"]:
             if ready.get("state") == "quality_ready" and ready.get("reserve_contract") == RESERVE_CONTRACT:
-                self.reserve.disqualify_semantic_ready(ready["id"], cycle=self.cycle)
+                if self.reserve.disqualify_semantic_ready(ready["id"], cycle=self.cycle):
+                    self._refilling = True
         if self.reserve.active_preparation():
             return self._phase("blocked", last_error={"code": "ARTICLE_RESERVE_PREPARATION_ACTIVE"})
         active, leased = self._inventory()

@@ -761,3 +761,34 @@ def test_sender_skips_owned_ready_candidate_before_closed_validation_then_produc
     assert value.controller._finish_candidate(claim, record) == "semantic_rejected"
     assert value.store.active_preparation() is None and len(calls) == 1 and not value.writes
     assert value.cycle._record(value.cycle._load(), record["id"])["state"] == "cancelled"
+
+
+def test_removing_known_bad_stock_refills_four_above_low_three_to_target_six(reserve_controller, monkeypatch):
+    from max_postiz_agent.server_models import EditorialControl
+    value = reserve_controller
+
+    def article(word):
+        return {**value.article, "url": value.article["url"].rstrip("/") + "/" + word + "/",
+                "original": value.article["original"] + " The " + word + " observation was recorded."}
+
+    for word in ("alpha", "beta", "gamma", "delta"):
+        claim = value.store.begin_preparation()
+        value.cycle.prepare(article(word), reserve_claim=claim)
+        value.store.finish_preparation(claim, "quality_ready")
+    _, bad, _ = accepted_mass_candidate(value, monkeypatch, close_claim=True)
+    monkeypatch.setattr(value.cycle, "_quality", value.quality)
+    with value.core.db.session.begin() as s:
+        c = s.get(EditorialControl, "main")
+        c.runtime = {**c.runtime, "preparation": {"next_run_at": 0, "refilling": False}}
+    fresh = [article(word) for word in ("epsilon", "zeta")]
+    value.controller.selector = lambda *_args, **kw: next((copy.deepcopy(a) for a in fresh
+        if not any(r["url"] == a["url"] for r in kw["ledger"]["records"])), None)
+    value.controller._refilling = False  # New process starts without a refill intent.
+    before_calls = len(value.model_calls)
+    result = value.controller.prepare_once()
+    records = value.cycle._load()["records"]
+    assert result["phase"] == "reserve_refilled" and result["completed"] == ["quality_ready", "quality_ready"]
+    assert sum(r["state"] == "quality_ready" for r in records) == 6
+    assert value.cycle._record({"records": records}, bad["id"])["state"] == "cancelled"
+    assert len(value.model_calls) == before_calls + 2 and not value.posts and not value.writes
+    assert value.state.read()["settings"]["reserve"]["low"] == 3
