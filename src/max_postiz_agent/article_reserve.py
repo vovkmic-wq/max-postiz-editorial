@@ -115,6 +115,16 @@ def _stamp(value):
     return type(value) in {int, float} and math.isfinite(value) and value >= 0
 
 
+def _postiz_due_matches(observed, signed):
+    """Postiz хранит миллисекунды; подписанная дата остаётся без округления."""
+    # Верхняя граница — 10000-01-01 UTC, вне поддерживаемого ISO datetime.
+    if not all(type(value) in {int, float} and 0 <= value < 253402300800
+               and math.isfinite(value) for value in (observed, signed)):
+        return False
+    # На больших Unix timestamps float может представить ровно 1 мс как <1 мс.
+    return abs(Decimal(str(observed)) - Decimal(str(signed))) < Decimal("0.001")
+
+
 def _hash(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
@@ -857,6 +867,8 @@ class ArticleReserveStore:
         config_hash = self.core.settings.hash
         require(isinstance(proof, dict) and _hash(proof.get("sha256"))
             and isinstance(proof.get("proof"), dict) and _stamp(proof["proof"].get("failed_at")))
+        # MAX 429 требует остановки: другой источник не разрешает новый GET канала.
+        require(proof["proof"].get("error", {}).get("code") != "BROWSER_CHANNEL_RATE_LIMITED")
         with self.core.db.session.begin() as session:
             control = self._control(session)
             if type(expected_revision) is not int or control.revision != expected_revision:
@@ -921,7 +933,8 @@ class ArticleReserveStore:
                 and metadata.get("record_id") == record["id"] and metadata.get("policy_hash") == record.get("policy_hash")
                 and metadata.get("reserve_contract") == RESERVE_CONTRACT
                 and metadata.get("reserve_binding_hash") == record.get("reserve_binding_hash")
-                and metadata.get("postiz_post_id") == link.post_id and metadata.get("postiz_due_at") == row.due_at
+                and metadata.get("postiz_post_id") == link.post_id
+                and _postiz_due_matches(metadata.get("postiz_due_at"), row.due_at)
                 and metadata.get("postiz_state") == "QUEUE" and variant.target_id == target.id
                 and target.platform == "max" and target.route == "max_browser" and target.enabled
                 and row.text_hash == record.get("reserve_prepared_hash")
