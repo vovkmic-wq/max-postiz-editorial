@@ -323,6 +323,23 @@ def test_completed_invalid_values_keep_raw_hash_but_cannot_poison_a_json_databas
         decoded(raw)
 
 
+def test_completed_invalid_object_copy_failure_preserves_only_the_exact_raw(monkeypatch):
+    from max_postiz_agent import article_quality as module
+    raw = json.dumps({**PASS, "extra": "simulate_deep_copy_recursion"})
+    original = module.copy.deepcopy
+
+    def bounded_copy(value, *args, **kwargs):
+        if isinstance(value, dict) and value.get("extra") == "simulate_deep_copy_recursion":
+            raise RecursionError("Untrusted object cannot be copied")
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(module.copy, "deepcopy", bounded_copy)
+    proof = completed_review_rejection(raw, RUBRIC, review_protocol_contract=CONTRACT)
+    assert proof["review_untrusted"] is None and proof["approval_permitted"] is False
+    assert proof["raw_review_sha256"] == hashlib.sha256(raw.encode()).hexdigest()
+    json.dumps(proof, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
 @pytest.mark.parametrize("contract", [None, REVIEW_PROTOCOL_CONTRACT, CONTRACT])
 def test_only_new_review_returned_copies_the_completed_transport_marker(project, contract):
     events = []

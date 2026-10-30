@@ -257,6 +257,7 @@ def completed_review_rejection(raw_review, rubric, *, review_protocol_contract=N
             # PostgreSQL JSON и UTF-8 должны принимать proof; raw остаётся целым
             # даже при NaN/Infinity или некорректных строках внутри ответа модели.
             json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            value = copy.deepcopy(value)
         except (AgentError, ValueError, TypeError, UnicodeError, RecursionError):
             value = None
         parser = review_parser_contract(raw_review, review_protocol_contract=review_protocol_contract)
@@ -264,7 +265,7 @@ def completed_review_rejection(raw_review, rubric, *, review_protocol_contract=N
                 "reason": "COMPLETED_REVIEW_PROTOCOL_REJECTED", "parser_error": parser_error,
                 "review_protocol_contract": marker.get("review_protocol_contract", REVIEW_PROTOCOL_CONTRACT),
                 "parser_contract": parser, "raw_review_sha256": parser["raw_review_sha256"],
-                "review_untrusted": copy.deepcopy(value), "approval_permitted": False,
+                "review_untrusted": value, "approval_permitted": False,
                 "quarantine_max_raw_utf8_bytes": MAX_COMPLETED_REVIEW_BYTES}
     except (AgentError, ValueError, TypeError, KeyError, UnicodeError, RecursionError) as exc:
         raise AgentError(error, 409) from exc
