@@ -686,6 +686,46 @@ def test_send_can_only_begin_after_durable_sending_journal(illustrated, image_pa
     assert image_page.get_by_role("listitem").count() == 0
 
 
+@pytest.mark.parametrize("change", ["pause", "body", "format"])
+def test_final_authorization_follows_all_waits_and_changed_authority_or_dom_stops_send(
+        illustrated, image_page, monkeypatch, change):
+    @contextmanager
+    def opened(*_args):
+        yield image_page
+
+    events = []
+    for name in ("_wait_composer_text", "_wait_title_proof"):
+        original = getattr(browser_worker, name)
+
+        def wait(*args, _original=original, _name=name, **kwargs):
+            assert "authorize" not in events, "Ожидание после последней авторизации запрещено"
+            events.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(browser_worker, name, wait)
+
+    def authorize():
+        assert events and events[-1] == "_wait_title_proof"
+        events.append("authorize")
+        if change == "pause":
+            raise AgentError("BROWSER_DISPATCH_NOT_APPROVED")
+        composer = image_page.get_by_role("textbox")
+        if change == "body":
+            composer.fill("Текст изменён во время проверки полномочий")
+        else:
+            composer.locator("b, strong").evaluate_all("nodes => nodes.forEach(node => node.replaceWith(...node.childNodes))")
+
+    monkeypatch.setattr(browser_worker, "session", opened)
+    result = browser_worker.publish(illustrated.settings, illustrated.payload, authorize_before_click=authorize)
+    assert result["state"] == "preclick_failed" and events[-1] == "authorize"
+    proof = browser_worker.read_preclick_failure(illustrated.settings, illustrated.payload["request_id"],
+        chat_id=illustrated.payload["chat_id"], text=CAPTION, attachment=illustrated.payload["attachment"])
+    assert proof["proof"]["send_started"] is False
+    assert proof["proof"]["error"]["code"] == {"pause": "BROWSER_DISPATCH_NOT_APPROVED",
+        "body": "BROWSER_COMPOSER_TEXT_NOT_READY", "format": "BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE"}[change]
+    assert "send" not in image_page.evaluate("events")
+
+
 @pytest.mark.parametrize("contract", ["article-illustrated-v1", "article-illustrated-v2"])
 def test_native_authorization_derives_flags_from_signed_dispatch_not_caller(hub, contract):
     from max_postiz_agent.db import now

@@ -772,22 +772,29 @@ def _perform_publish(settings, payload, path, state, *, authorize_before_click):
         title_proof = _bold_title(page, composer, payload["title_text"], text) if illustrated else None
         state["phase"] = "authorization"
         ensure_channel(page, settings, chat_id, navigate=False)
-        # Обрабатываем ветвь при условии: authorize_before_click.
-        if authorize_before_click:
-            authorize_before_click()
-        if fingerprint(payload) != state["content_hash"]:
-            raise AgentError("BROWSER_INTENT_CONTENT_CHANGED")
-        # После авторизации ещё раз проверяем точный текст и форматирование до фиксации отправки.
+        # Все ожидания завершаем до последней проверки полномочий отправителя.
         _wait_composer_text(page, composer, text)
         if illustrated:
             title_proof = _wait_title_proof(page, composer, payload["title_text"], text)
-        if not send.is_enabled() or page.get_by_role("button", name="Отменить загрузку", exact=True).count():
-            raise AgentError("BROWSER_ATTACHMENT_NOT_READY")
         saved = parse_json(path.read_text(encoding="utf-8"))
         if (saved.get("state") != "preparing" or saved.get("send_started") is not False
                 or saved.get("content_hash") != state["content_hash"]
                 or saved.get("started_at") != state["started_at"]):
             raise AgentError("BROWSER_JOURNAL_OWNERSHIP_LOST")
+        if authorize_before_click:
+            authorize_before_click()
+        if fingerprint(payload) != state["content_hash"]:
+            raise AgentError("BROWSER_INTENT_CONTENT_CHANGED")
+        # После авторизации только немедленные проверки: ждать или менять текст уже нельзя.
+        if (composer.inner_text() != text or not composer.evaluate(
+                "element => element.isConnected && element.isContentEditable && !element.closest('[aria-busy=true]')")):
+            raise AgentError("BROWSER_COMPOSER_TEXT_NOT_READY")
+        if illustrated:
+            title_proof = _text_formatting_proof(composer, payload["title_text"], text)
+            if title_proof.get("title_bold") is not True or title_proof.get("body_unbold") is not True:
+                raise AgentError("BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE")
+        if not send.is_enabled() or page.get_by_role("button", name="Отменить загрузку", exact=True).count():
+            raise AgentError("BROWSER_ATTACHMENT_NOT_READY")
         state.update(state="sending", send_started=True, phase="send_intent",
                      text=text, attachment=bool(upload),
                      attachment_type=payload.get("attachment", {}).get("type") if upload else None,
