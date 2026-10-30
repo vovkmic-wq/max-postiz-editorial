@@ -52,6 +52,8 @@ def main(argv=None):
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8090)
     serve.add_argument("--no-worker", action="store_true")
+    serve.add_argument("--dispatch-only", action="store_true",
+                       help="Only reconcile Postiz and send human-approved hourly MAX articles")
     sub.add_parser("doctor")
     sub.add_parser("tick")
     sub.add_parser("worker")
@@ -84,7 +86,8 @@ def main(argv=None):
         if args.command == "serve":
             import uvicorn
             from .hub_api import hub_app
-            uvicorn.run(hub_app(service, not args.no_worker), host=args.host, port=args.port, log_level="warning", access_log=False)
+            uvicorn.run(hub_app(service, not args.no_worker, dispatch_only=args.dispatch_only),
+                        host=args.host, port=args.port, log_level="warning", access_log=False)
         elif args.command == "worker":
             stop = threading.Event()
             while not stop.wait(5):

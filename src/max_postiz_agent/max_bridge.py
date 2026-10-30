@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit, unquote
@@ -14,7 +15,7 @@ from sqlalchemy import select, text, update
 
 from .config import AgentError, fingerprint
 from .db import Draft, DraftRevision, Story, now, uid
-from .hub_models import BridgePost, Dispatch, RemoteDraft, Target, Variant
+from .hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Target, TargetApproval, Variant
 
 PROVIDER = "max-browser"
 
@@ -85,7 +86,8 @@ class MaxBridge:
         data = self._open(token, "channel")
         return self.target(data["target"], data["destination"])
 
-    def normalize(self, remote):
+    @staticmethod
+    def normalize(remote):
         try:
             if "image" not in remote or "childrenPost" not in remote:
                 raise AgentError("BRIDGE_POSTIZ_SCHEMA_REQUIRED", 409)
@@ -181,6 +183,8 @@ class MaxBridge:
                 if published:
                     link.remote_state = remote["state"]
                     return v.id
+                if self._preclick_error_state(s, link, v, target, remote, body, media, due, remote_hash):
+                    return v.id
                 try:
                     self.core._invalidate(s, v)
                 except AgentError:
@@ -226,6 +230,13 @@ class MaxBridge:
                 link = BridgePost(post_id=remote["id"], integration_id=remote["integration"]["id"],
                                   group_id=remote["group"], target_id=target.id, variant_id=v.id)
                 s.add(link)
+            if v.metadata_json.get("origin") == "hourly_article_test":
+                title = next((line.strip() for line in body.splitlines() if line.strip()), "")
+                if not title:
+                    raise AgentError("BODY_REQUIRED", 409)
+                if len(title) > 500:
+                    raise AgentError("ARTICLE_TITLE_TOO_LONG", 409)
+                v.title = title
             link.remote_hash, link.remote_state, link.due_at = remote_hash, remote["state"], due
             link.group_id = remote["group"]
             link.active, link.error, link.updated_at = True, None, now()
@@ -235,13 +246,75 @@ class MaxBridge:
             self.core.db.audit(s, "postiz_bridge", "bridge_import", v.id, post_id=link.post_id)
             return v.id
 
-    def sync(self, force=False):
+    def _preclick_error_state(self, session, link, variant, target, remote, body, media, due, remote_hash):
+        """Postiz ERROR меняет только состояние при новом exact pre-click proof.
+
+        Обычный импорт меняет revision и отзывает approval. Здесь исходные QA,
+        snapshot и failed Attempt нужны native-закрытию; права на новый send нет.
+        """
+        if remote.get("state") != "ERROR":
+            return False
+        from .browser_publisher import read_preclick_failure
+        from .hub import ACTIVE
+
+        target = session.scalar(select(Target).where(Target.id == target.id).with_for_update())
+        dispatches = list(session.scalars(select(Dispatch).where(
+            Dispatch.variant_id == variant.id).with_for_update()))
+        if len(dispatches) != 1 or target is None:
+            return False
+        dispatch = dispatches[0]
+        approvals = list(session.scalars(select(TargetApproval).where(
+            TargetApproval.variant_id == variant.id).with_for_update()))
+        attempts = list(session.scalars(select(DispatchAttempt).where(DispatchAttempt.dispatch_id == dispatch.id)))
+        snapshot = dispatch.snapshot
+        metadata = snapshot.get("metadata", {}) if isinstance(snapshot, dict) else {}
+        previous_remote = {**remote, "state": "QUEUE"}
+        if (len(approvals) != 1 or len(attempts) != 1 or not isinstance(metadata, dict)
+                or dispatch.state != "failed" or dispatch.error != "BROWSER_PRECLICK_FAILED"
+                or dispatch.attempts != 1 or dispatch.owner is not None or dispatch.lease_until != 0
+                or dispatch.verified or dispatch.external_id is not None or dispatch.permalink is not None
+                or attempts[0].result != "failed" or attempts[0].error != "BROWSER_PRECLICK_FAILED"
+                or approvals[0].id != dispatch.approval_id or approvals[0].revoked
+                or approvals[0].actor != "hourly_article_policy" or approvals[0].revision != dispatch.revision
+                or approvals[0].scheduled_at != dispatch.due_at or approvals[0].snapshot_hash != dispatch.snapshot_hash
+                or snapshot != self.core.snapshot(variant, target)
+                or dispatch.snapshot_hash != fingerprint({"content": snapshot, "due_at": dispatch.due_at})
+                or variant.config_hash != self.core.settings.hash or variant.binding_hash != target.binding_hash
+                or target.platform != "max" or target.route != "max_browser" or not target.enabled
+                or metadata.get("origin") != "hourly_article_test" or metadata.get("approval_mode") != "automatic"
+                or metadata.get("reserve_contract") != "article-reserve-v1"
+                or metadata.get("postiz_state") != "QUEUE"
+                or metadata.get("postiz_hash") != self.normalize(previous_remote)[3]
+                or link.remote_state != "QUEUE" or link.remote_hash != metadata.get("postiz_hash")
+                or body != snapshot.get("body") or media != snapshot.get("media")
+                or abs(due - dispatch.due_at) >= .001 or abs(link.due_at - due) >= .001
+                or link.target_id != target.id or not link.active or link.error is not None
+                or link.mutation_owner is not None or link.mutation_until != 0
+                or remote.get("group") != link.group_id or remote.get("integration", {}).get("id") != link.integration_id
+                or target.options.get("postiz_integration_id") != link.integration_id
+                or remote.get("releaseId") not in (None, "") or remote.get("releaseURL") not in (None, "")
+                or session.scalar(select(Dispatch).join(Variant).where(Variant.target_id == target.id,
+                    Dispatch.id != dispatch.id, Dispatch.state.in_(ACTIVE) | Dispatch.owner.is_not(None)
+                    | (Dispatch.lease_until != 0) | Dispatch.lease_until.is_(None)))):
+            return False
+        try:
+            read_preclick_failure(self.core.settings, dispatch.id, snapshot=snapshot, chat_id=target.destination)
+        except AgentError:
+            return False
+        link.remote_state, link.remote_hash, link.updated_at = "ERROR", remote_hash, now()
+        self.core.db.audit(session, "postiz_bridge", "bridge_preclick_state_only", variant.id,
+            post_id=link.post_id, dispatch_id=dispatch.id, snapshot_hash=dispatch.snapshot_hash,
+            remote_hash=remote_hash, previous_state="QUEUE", state="ERROR")
+        return True
+
+    def sync(self, force=False, *, target_id=None):
         if not self.enabled or (not force and now() < self.next_poll):
             return 0
         self.next_poll = now() + 15
         with self.core.db.session() as s:
             targets = {t.options.get("postiz_integration_id"): t for t in s.scalars(select(Target))
-                       if t.enabled and t.route == "max_browser" and t.options.get("postiz_integration_id")}
+                       if t.enabled and t.route == "max_browser" and t.options.get("postiz_integration_id")
+                       and (target_id is None or t.id == target_id)}
         if not targets:
             return 0
         integrations = {i["id"]: i for i in self.core.postiz.integrations()}
@@ -265,6 +338,8 @@ class MaxBridge:
                         link.error = exc.code
         with self.core.db.session.begin() as s:
             for link in s.scalars(select(BridgePost)):
+                if target_id is not None and link.target_id != target_id:
+                    continue
                 if link.post_id not in seen and link.active:
                     v = self.core._variant(s, link.variant_id, True)
                     try:
@@ -309,12 +384,15 @@ class MaxBridge:
         if not self.enabled or not link.active or link.error or link.mutation_owner:
             raise AgentError("BRIDGE_SEND_BLOCKED", 409)
         remote = self.core.postiz.get_post(link.post_id)
-        _, images, due, current = self.normalize(remote)
+        body, images, due, current = self.normalize(remote)
         integration = next((i for i in self.core.postiz.integrations() if i["id"] == link.integration_id), None)
         if (not integration or integration.get("disabled") or integration.get("refreshNeeded")
                 or integration.get("identifier") != PROVIDER or integration.get("accountId") != target.destination):
             raise AgentError("BRIDGE_INTEGRATION_UNAVAILABLE", 409)
         if current != dispatch.snapshot["metadata"].get("postiz_hash") or remote["state"] != "QUEUE" or abs(due - dispatch.due_at) > 0.001:
+            raise AgentError("BRIDGE_REMOTE_CHANGED", 409)
+        if (dispatch.snapshot["metadata"].get("origin") == "hourly_article_test"
+                and body != dispatch.snapshot["body"]):
             raise AgentError("BRIDGE_REMOTE_CHANGED", 409)
         if self._media(images, target) != dispatch.snapshot["media"]:
             raise AgentError("BRIDGE_REMOTE_MEDIA_CHANGED", 409)
@@ -334,12 +412,17 @@ class MaxBridge:
         return self.status(token, integration_id, post_id)
 
     def status(self, token, integration_id, post_id):
+        from .hub import ACTIVE
         t = self.channel(token)
         with self.core.db.session() as s:
             link = s.get(BridgePost, post_id)
             if not link or link.target_id != t.id or link.integration_id != integration_id:
                 raise AgentError("BRIDGE_POST_NOT_FOUND", 404)
-            d = s.scalar(select(Dispatch).where(Dispatch.variant_id == link.variant_id).order_by(Dispatch.due_at.desc()))
+            # A rescheduled dispatch may have an earlier date than its cancelled
+            # predecessor. Poll the active attempt, then confirmed history.
+            d = s.scalar(select(Dispatch).where(Dispatch.variant_id == link.variant_id)
+                         .order_by(Dispatch.state.in_(ACTIVE).desc(),
+                                   (Dispatch.state == "published").desc(), Dispatch.due_at.desc()))
             if d and d.state == "published" and d.verified:
                 return {"state": "published", "external_id": d.external_id, "permalink": d.permalink}
             if d and d.state == "published":
@@ -348,24 +431,57 @@ class MaxBridge:
                 return {"state": "cancelled", "error": "BRIDGE_REMOTE_DELETED"}
             return {"state": d.state if d else "review_pending", "paused": t.paused, "error": link.error or (d.error if d else None)}
 
-    def mutation(self, identifiers, release=None):
+    def mutation(self, identifiers, release=None, *, expected_hash=None, expected_post_id=None):
+        compare = expected_hash is not None or expected_post_id is not None
+        if compare and (release is not None or not isinstance(expected_hash, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
+                or not isinstance(expected_post_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", expected_post_id)
+                or identifiers != [expected_post_id]):
+            raise AgentError("BRIDGE_MUTATION_CAS_INVALID", 409)
         if not release:
             self.sync(force=True)
         owner = release or uid()
         with self.core.db.session.begin() as s:
             links = list(s.scalars(select(BridgePost).where((BridgePost.post_id.in_(identifiers)) | (BridgePost.group_id.in_(identifiers))).order_by(BridgePost.variant_id)))
+            if compare and (len(links) != 1 or links[0].post_id != expected_post_id):
+                raise AgentError("BRIDGE_MUTATION_CAS_INVALID", 409)
             for link in links:
                 self.core._variant(s, link.variant_id, True)
+                # Another native mutation may have committed while this call
+                # waited for the variant lock. Do not reuse its earlier owner.
+                s.refresh(link)
                 active = s.scalar(select(Dispatch).where(Dispatch.variant_id == link.variant_id, Dispatch.state.in_({"sending", "unknown", "published"})).with_for_update())
                 if not release and active:
                     raise AgentError("BRIDGE_DELIVERY_LOCKED", 409)
                 if not release and link.mutation_owner and link.mutation_owner != owner:
+                    raise AgentError("BRIDGE_EDIT_IN_PROGRESS", 409)
+                if not release and compare and link.mutation_until != 0:
                     raise AgentError("BRIDGE_EDIT_IN_PROGRESS", 409)
                 if release:
                     if link.mutation_owner == owner:
                         link.mutation_owner, link.mutation_until = None, 0
                 else:
                     link.mutation_owner, link.mutation_until = owner, now() + 300
+        if compare:
+            try:
+                # The native guard owns this one committed lease. The fresh
+                # read is deliberately after it, closing GET -> overwrite races.
+                remote = self.core.postiz.get_post(expected_post_id)
+                if (remote.get("id") != expected_post_id or remote.get("state") != "DRAFT"
+                        or self.normalize(remote)[3] != expected_hash):
+                    raise AgentError("BRIDGE_REMOTE_CHANGED", 409)
+                with self.core.db.session() as s:
+                    link = s.get(BridgePost, expected_post_id)
+                    if not link or link.mutation_owner != owner:
+                        raise AgentError("BRIDGE_EDIT_IN_PROGRESS", 409)
+            except Exception:
+                # The controller has not run: only a read happened. Release our
+                # own lease; a changed/unknown other owner remains untouched.
+                self.mutation([expected_post_id], release=owner)
+                raise
+            return {"owner": owner, "cas_verified": True,
+                    "expected_hash": expected_hash, "expected_post_id": expected_post_id}
         return {"owner": owner}
 
     def unlock(self, post_id, confirm_no_request_inflight):

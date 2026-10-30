@@ -1,0 +1,31 @@
+[Unit]
+Description=MAX Postiz corrected MADLAD CPU translation gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/max-postiz-madlad
+ExecStart=/opt/max-postiz-madlad/venv/bin/python /opt/max-postiz-madlad/madlad_service.py --config /opt/max-postiz-madlad/config.local.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+UMask=0077
+MemoryMax=6500M
+CPUQuota=400%
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/dev-disk-by-uuid-8292d473-723d-465f-bb9e-dcd0fb375917/llm-translation/max-postiz-madlad/data
+RestrictAddressFamilies=AF_UNIX AF_INET
+CapabilityBoundingSet=
+IPAddressDeny=any
+IPAddressAllow=127.0.0.0/8
+IPAddressAllow=10.20.30.143/32
+
+[Install]
+WantedBy=multi-user.target

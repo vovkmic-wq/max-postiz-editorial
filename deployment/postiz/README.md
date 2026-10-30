@@ -1,5 +1,8 @@
 # Локальный Postiz
 
+**Область документа, 29 октября 2026:** Текущий профиль 0.11.5 развёрнут на Linux через deployment/linux; Python и custom image Postiz имеют разные версии. Описанный ниже Windows/Docker Desktop стенд сохранён как история и не запускается рядом с рабочей VM.
+[Текущий выпуск](../../docs/RELEASE_0.11.5.md), [эксплуатация](../../docs/VM_EDITORIAL.md), [навигатор](../../docs/README.md).
+
 Адрес редактора: http://localhost:4007. Temporal UI: http://localhost:8088.
 Порты привязаны к loopback. Состав стека: Postiz, PostgreSQL, Redis,
 Temporal, отдельная БД Temporal, Elasticsearch, Temporal UI и admin-tools.

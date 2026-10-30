@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+# Сначала проверяем миграцию; до этого нельзя менять apt, nginx или firewall.
+python3 "$(dirname -- "${BASH_SOURCE[0]}")/legacy_guard.py"
 export DEBIAN_FRONTEND=noninteractive
 apt-get install -y nginx ufw openjdk-21-jre-headless
 cat >/etc/nginx/sites-available/editorial <<'NGINX'

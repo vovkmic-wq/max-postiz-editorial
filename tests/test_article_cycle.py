@@ -8,10 +8,29 @@ from sqlalchemy import select
 from max_postiz_agent.article_cycle import HourlyArticleCycle
 from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.db import Audit, Draft, Material, Story, now
-from max_postiz_agent.hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Target, TargetApproval, Variant, VariantRevision
+from max_postiz_agent.hub_models import BridgePost, Dispatch, RemoteDraft, Target, TargetApproval, Variant, VariantRevision
 from max_postiz_agent.reddit import text_hash
 
 pytest_plugins = ["test_max_bridge"]
+
+
+def seed_legacy_dispatch(core, prepared):
+    """Historical persisted state for refusal/reconciliation tests, never an approval path."""
+    with core.db.session.begin() as session:
+        variant = session.get(Variant, prepared['variant_id'])
+        target = session.get(Target, variant.target_id)
+        due = now() + 180
+        snapshot = core.snapshot(variant, target)
+        hashed = fingerprint({'content': snapshot, 'due_at': due})
+        approval = TargetApproval(variant_id=variant.id, revision=variant.revision,
+            snapshot_hash=hashed, scheduled_at=due, actor='hourly_article_policy')
+        session.add(approval)
+        session.flush()
+        dispatch = Dispatch(variant_id=variant.id, approval_id=approval.id,
+            revision=variant.revision, snapshot_hash=hashed, snapshot=snapshot, due_at=due)
+        session.add(dispatch)
+        session.flush()
+        return dispatch.id
 
 
 class Quality:
@@ -34,7 +53,7 @@ def cycle(bridge, monkeypatch):
     policy = {"enabled": True, "target_id": "max", "source_id": "example_rss",
               "allowed_hosts": ["science.example.org"], "rights_evidence": "test_permission",
               "owner_instruction": "2026-10-17 hourly translated article tests",
-              "min_gap_seconds": 3600, "max_per_day": 24}
+              "min_gap_seconds": 3600, "max_per_day": 24, "max_source_age_hours": 8760}
     data = core.settings.root / "data"
     data.mkdir(exist_ok=True)
     (data / "hourly-article-policy.local.json").write_text(json.dumps(policy))
@@ -74,33 +93,39 @@ def test_prepare_preserves_real_source_and_never_schedules_or_approves(cycle):
         assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 0
 
 
-def test_exact_review_required_and_schedule_once_with_source_evidence(cycle):
+def test_hourly_policy_allows_archival_science_within_its_explicit_age_limit(cycle):
+    value, _, article, _, calls, stamp, _ = cycle
+    article['published_at'] = stamp[0] - 30 * 24 * 3600
+    assert value.prepare(article)['state'] == 'prepared'
+    assert not calls
+
+
+def test_hourly_policy_rejects_source_age_above_its_limit(cycle):
+    value, _, article, _, calls, stamp, policy = cycle
+    policy["max_source_age_hours"] = 24 * 30
+    article["published_at"] = stamp[0] - (24 * 30 + 1) * 3600
+    source, target = value._source_target(policy)
+    with pytest.raises(AgentError, match="STALE_SOURCE"):
+        value._article(article, policy, source, target)
+    assert not calls
+
+
+def test_automatic_approval_is_disabled_even_with_the_correct_hash(cycle):
     value, core, article, _, calls, _, _ = cycle
     prepared = value.prepare(article)
-    with pytest.raises(AgentError, match="ARTICLE_REVIEW_HASH_MISMATCH"):
-        value.publish(prepared["id"], "0" * 64)
-    assert calls == []
-    result = value.publish(prepared["id"], prepared["content_hash"])
-    assert result["state"] == "pending"
-    assert len(calls) == 1 and calls[0][3] == "schedule"
+    for hashed in ('0' * 64, prepared['content_hash']):
+        with pytest.raises(AgentError, match='HUMAN_REVIEW_CONFIRMATION_REQUIRED'):
+            value.publish(prepared['id'], hashed)
+    assert not calls
     with core.db.session() as session:
-        variant = session.get(Variant, prepared["variant_id"])
-        dispatch = session.get(Dispatch, result["dispatch_id"])
-        approval = session.get(TargetApproval, dispatch.approval_id)
-        assert variant.sources and variant.metadata_json["origin"] == "hourly_article_test"
-        assert dispatch.snapshot["sources"] == variant.sources
-        assert approval.actor == "hourly_article_policy"
-        assert approval.snapshot_hash == fingerprint({"content": core.snapshot(variant, session.get(Target, "max")), "due_at": result["due_at"]})
-    with pytest.raises(AgentError, match="ARTICLE_RECONCILIATION_REQUIRED"):
-        value.publish(prepared["id"], prepared["content_hash"])
-    assert len(calls) == 1
+        assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 0
 
 
 def test_late_prepared_slot_is_not_caught_up(cycle):
     value, _, article, _, calls, stamp, _ = cycle
     prepared = value.prepare(article)
     stamp[0] += 3600
-    with pytest.raises(AgentError, match="ARTICLE_SLOT_EXPIRED"):
+    with pytest.raises(AgentError, match="HUMAN_REVIEW_CONFIRMATION_REQUIRED"):
         value.publish(prepared["id"], prepared["content_hash"])
     assert not calls
 
@@ -120,78 +145,42 @@ def test_claimed_slot_and_duplicate_original_are_durable(cycle):
 
 
 def test_unknown_postiz_creation_requires_reconciliation(cycle, monkeypatch):
-    value, core, article, _, _, stamp, _ = cycle
-    prepared = value.prepare(article)
+    value, core, article, _, _, stamp, policy = cycle
+    policy['approval_mode'] = 'human'
+    (core.settings.root / 'data/hourly-article-policy.local.json').write_text(json.dumps(policy))
     attempts = []
-
     def uncertain(*args):
         attempts.append(args)
-        raise AgentError("POSTIZ_UNKNOWN", 503)
-
-    monkeypatch.setattr(core.postiz, "create", uncertain)
-    with pytest.raises(AgentError, match="POSTIZ_UNKNOWN"):
-        value.publish(prepared["id"], prepared["content_hash"])
+        raise AgentError('POSTIZ_UNKNOWN', 503)
+    monkeypatch.setattr(core.postiz, 'create', uncertain)
+    with pytest.raises(AgentError, match='POSTIZ_UNKNOWN'):
+        value.prepare(article)
     with core.db.session() as session:
-        assert session.get(RemoteDraft, prepared["variant_id"]).state == "unknown"
+        assert session.query(RemoteDraft).one().state == 'unknown'
         assert session.query(Dispatch).count() == 0
     stamp[0] += 3600
-    with pytest.raises(AgentError, match="ARTICLE_RECONCILIATION_REQUIRED"):
-        value.prepare({**article, "url": "https://science.example.org/article/second/"})
+    with pytest.raises(AgentError, match='ARTICLE_RECONCILIATION_REQUIRED'):
+        value.prepare({**article, 'url': 'https://science.example.org/second/'})
     assert len(attempts) == 1
 
 
-def test_remote_text_change_cannot_receive_delegated_approval(cycle, monkeypatch):
-    value, core, article, records, calls, _, _ = cycle
-    prepared = value.prepare(article)
+def test_remote_text_change_during_draft_creation_requires_reconciliation(cycle, monkeypatch):
+    value, core, article, records, calls, _, policy = cycle
+    policy['approval_mode'] = 'human'
+    (core.settings.root / 'data/hourly-article-policy.local.json').write_text(json.dumps(policy))
     original_create = core.postiz.create
-
     def edited(*args):
         ident = original_create(*args)
-        records[ident]["content"] += " Изменено в Postiz."
+        records[ident]['content'] += ' Изменено в Postiz.'
         return ident
-
-    monkeypatch.setattr(core.postiz, "create", edited)
-    with pytest.raises(AgentError, match="ARTICLE_REMOTE_CHANGED"):
-        value.publish(prepared["id"], prepared["content_hash"])
+    monkeypatch.setattr(core.postiz, 'create', edited)
+    with pytest.raises(AgentError, match='ARTICLE_REMOTE_CHANGED'):
+        value.prepare(article)
     with core.db.session() as session:
-        assert session.query(Dispatch).count() == 0
+        assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 0
     assert len(calls) == 1
 
 
-def test_status_requires_live_delivery_and_postiz_published_then_pauses(cycle):
-    value, core, article, records, _, stamp, _ = cycle
-    prepared = value.prepare(article)
-    planned = value.publish(prepared["id"], prepared["content_hash"])
-    with core.db.session.begin() as session:
-        dispatch = session.get(Dispatch, planned["dispatch_id"])
-        dispatch.state, dispatch.verified = "published", False
-    assert value.status()["state"] == "published_unverified"
-    assert value.status()["delivery_verified"] is False
-    with core.db.session.begin() as session:
-        session.get(Dispatch, planned["dispatch_id"]).verified = True
-        session.add(DispatchAttempt(dispatch_id=planned["dispatch_id"], result="published", created_at=planned["due_at"] + 5))
-    records[planned["postiz_id"]]["state"] = "QUEUE"
-    assert value.status()["state"] == "awaiting_postiz"
-    with core.db.session() as session:
-        assert not session.get(Target, "max").paused
-    records[planned["postiz_id"]]["state"] = "PUBLISHED"
-    assert value.status()["state"] == "published"
-    with core.db.session() as session:
-        assert session.get(Target, "max").paused
-    stamp[0] += 1801
-    # A new hour can prepare while the minimum interval is still running.
-    # A different valid translation keeps this a genuinely new article.
-    class NextQuality(Quality):
-        def prepare(self, *args):
-            result = super().prepare(*args)
-            result["translation"] += " Дополнительные научные сведения."
-            result["body"] += " Дополнительные научные сведения."
-            return result
-    value.quality_factory = NextQuality
-    following = value.prepare({**article, "url": "https://science.example.org/article/next/",
-                               "original": article["original"] + " New facts."})
-    scheduled = value.publish(following["id"], following["content_hash"])
-    assert scheduled["due_at"] >= planned["due_at"] + 5 + 3601
 
 
 @pytest.mark.parametrize("change", [{"url": "https://other.example.org/"}, {"published_at": 1}, {"url": "https://science.example.org/article/?token=private"}])
@@ -240,31 +229,20 @@ def test_generic_ingest_body_hash_prevents_new_headline_duplicate(cycle):
     assert value._load()["records"] == []
 
 
-def test_failed_approval_repauses_without_creating_dispatch(cycle, monkeypatch):
-    value, core, article, _, _, _, _ = cycle
-    prepared = value.prepare(article)
-
-    def blocked(*args, **kwargs):
-        raise AgentError("QUALITY_GATE_BLOCKED")
-
-    monkeypatch.setattr(core, "approve_variant", blocked)
-    with pytest.raises(AgentError, match="QUALITY_GATE_BLOCKED"):
-        value.publish(prepared["id"], prepared["content_hash"])
-    with core.db.session() as session:
-        assert session.get(Target, "max").paused
-        assert session.query(Dispatch).count() == 0
 
 
 def test_unknown_send_remains_nonterminal_and_cannot_publish_again(cycle):
-    value, core, article, _, calls, _, _ = cycle
+    value, core, article, _, _, stamp, _ = cycle
     prepared = value.prepare(article)
-    planned = value.publish(prepared["id"], prepared["content_hash"])
+    ident = seed_legacy_dispatch(core, prepared)
     with core.db.session.begin() as session:
-        session.get(Dispatch, planned["dispatch_id"]).state = "unknown"
-    assert value.status()["state"] == "unknown"
-    with pytest.raises(AgentError, match="ARTICLE_RECONCILIATION_REQUIRED"):
-        value.publish(prepared["id"], prepared["content_hash"])
-    assert len(calls) == 1
+        session.get(Dispatch, ident).state = 'unknown'
+    assert value.status(prepared['id'])['state'] == 'unknown'
+    with pytest.raises(AgentError, match='HUMAN_REVIEW_CONFIRMATION_REQUIRED'):
+        value.publish(prepared['id'], prepared['content_hash'])
+    stamp[0] += 3600
+    with pytest.raises(AgentError, match='ARTICLE_OUTSTANDING_DELIVERY'):
+        value.prepare({**article, 'url': 'https://science.example.org/other/'})
 
 
 def failed_preparation(value, article):
@@ -346,7 +324,7 @@ def test_retry_never_replays_any_post_draft_phase(cycle, phase):
     if phase == "remote":
         core.stage_remote(prepared["variant_id"])
     elif phase == "dispatch":
-        value.publish(prepared["id"], prepared["content_hash"])
+        seed_legacy_dispatch(core, prepared)
     ledger = value._load()
     record = ledger["records"][0]
     record["state"] = "needs_attention"
@@ -425,7 +403,7 @@ def test_cancel_refuses_any_generated_or_external_state(cycle, phase):
     if phase == "remote":
         core.stage_remote(prepared["variant_id"])
     elif phase == "dispatch":
-        value.publish(prepared["id"], prepared["content_hash"])
+        seed_legacy_dispatch(core, prepared)
     ledger = value._load()
     if phase != "prepared":
         ledger["records"][0]["state"] = "needs_attention"
@@ -485,7 +463,7 @@ def test_abandon_expired_prepared_retains_history_without_external_operations(cy
     value, core, article, records, calls, stamp, _ = cycle
     prepared = value.prepare(article)
     stamp[0] += 3600
-    with pytest.raises(AgentError, match="ARTICLE_SLOT_EXPIRED"):
+    with pytest.raises(AgentError, match="HUMAN_REVIEW_CONFIRMATION_REQUIRED"):
         value.publish(prepared["id"], prepared["content_hash"])
     abandoned = value.abandon_prepared(prepared["id"], "Expired after an operator review")
     assert abandoned["state"] == "cancelled" and abandoned["slot"] == prepared["slot"]
@@ -525,7 +503,7 @@ def test_abandon_refuses_any_existing_external_state(cycle, external):
     value, core, article, _, _, _, _ = cycle
     prepared = value.prepare(article)
     if external == "dispatch":
-        value.publish(prepared["id"], prepared["content_hash"])
+        seed_legacy_dispatch(core, prepared)
     elif external == "remote":
         core.stage_remote(prepared["variant_id"])
     elif external in {"bridge", "mutation"}:
@@ -542,14 +520,15 @@ def test_abandon_refuses_any_existing_external_state(cycle, external):
 
 @pytest.mark.parametrize("changed", ["media", "sources", "target", "config", "binding", "metadata", "revision"])
 def test_delegated_approval_rejects_any_unreviewed_content_bearing_change(cycle, monkeypatch, changed):
-    value, core, article, _, calls, _, _ = cycle
-    prepared = value.prepare(article)
+    value, core, article, _, calls, _, policy = cycle
+    policy["approval_mode"] = "human"
+    (core.settings.root / "data/hourly-article-policy.local.json").write_text(json.dumps(policy))
     sync = core.bridge.sync
 
     def changed_sync(*args, **kwargs):
         result = sync(*args, **kwargs)
         with core.db.session.begin() as session:
-            variant = session.get(Variant, prepared["variant_id"])
+            variant = session.scalar(select(Variant))
             if changed == "media":
                 variant.media = [{"path": "data/injected.png", "sha256": "0" * 64, "mime": "image/png"}]
             elif changed == "sources":
@@ -568,19 +547,12 @@ def test_delegated_approval_rejects_any_unreviewed_content_bearing_change(cycle,
 
     monkeypatch.setattr(core.bridge, "sync", changed_sync)
     with pytest.raises(AgentError, match="ARTICLE_REMOTE_CHANGED"):
-        value.publish(prepared["id"], prepared["content_hash"])
+        value.prepare(article)
     assert len(calls) == 1
     with core.db.session() as session:
         assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 0
 
 
-def test_explicit_due_time_requires_full_two_minute_staging_window(cycle):
-    value, _, article, _, calls, stamp, _ = cycle
-    prepared = value.prepare(article)
-    with pytest.raises(AgentError, match="ARTICLE_SCHEDULE_INVALID"):
-        value.publish(prepared["id"], prepared["content_hash"], due_at=stamp[0] + 119)
-    assert not calls
-    assert value.publish(prepared["id"], prepared["content_hash"], due_at=stamp[0] + 120)["state"] == "pending"
 
 
 class CandidateQuality(Quality):
@@ -613,9 +585,10 @@ def test_editorial_correction_rechecks_and_preserves_identity_with_coherent_revi
         assert session.query(VariantRevision).count() == 2
         assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 0
         assert session.scalar(select(Audit).where(Audit.action == "hourly_article_revised_prepared"))
-    with pytest.raises(AgentError, match="ARTICLE_REVIEW_HASH_MISMATCH"):
+    with pytest.raises(AgentError, match="HUMAN_REVIEW_CONFIRMATION_REQUIRED"):
         value.publish(revised["id"], prepared["content_hash"])
-    assert value.publish(revised["id"], revised["content_hash"])["state"] == "pending"
+    with pytest.raises(AgentError, match="HUMAN_REVIEW_CONFIRMATION_REQUIRED"):
+        value.publish(revised["id"], revised["content_hash"])
 
 
 def test_rejected_editorial_correction_keeps_original_but_blocks_publication_until_rechecked(cycle):
@@ -631,10 +604,13 @@ def test_rejected_editorial_correction_keeps_original_but_blocks_publication_unt
     rejected = value.status(prepared["id"])
     assert rejected["body"] == prepared["body"] and rejected["content_hash"] == prepared["content_hash"]
     assert rejected["correction_blocked"] and rejected["correction_attempts"][-1]["state"] == "rejected"
-    with pytest.raises(AgentError, match="ARTICLE_RECONCILIATION_REQUIRED"):
+    with pytest.raises(AgentError, match="HUMAN_REVIEW_CONFIRMATION_REQUIRED"):
         value.publish(prepared["id"], prepared["content_hash"])
     value.quality_factory = CandidateQuality
-    revised = value.revise_prepared(prepared["id"], correction)
+    with pytest.raises(AgentError, match="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"):
+        value.revise_prepared(prepared["id"], correction)
+    revised = value.revise_prepared(prepared["id"], {**correction,
+        "body": "Исследователи изучили необычную атмосферу далёкой звезды и обнаружили звёздный ветер."})
     assert revised["correction_blocked"] is False and len(revised["correction_attempts"]) == 2
     assert not calls
 
@@ -652,7 +628,7 @@ def test_editorial_correction_refuses_existing_external_state_before_check(cycle
     if external == "remote":
         core.stage_remote(prepared["variant_id"])
     elif external == "dispatch":
-        value.publish(prepared["id"], prepared["content_hash"])
+        seed_legacy_dispatch(core, prepared)
     else:
         with core.db.session.begin() as session:
             session.add(BridgePost(post_id="external-edit", integration_id="integration-max", group_id="group-other",
@@ -757,8 +733,240 @@ def test_operator_candidate_never_retries_generated_or_external_records(cycle, p
     if phase == "remote":
         core.stage_remote(prepared["variant_id"])
     elif phase == "dispatch":
-        value.publish(prepared["id"], prepared["content_hash"])
+        seed_legacy_dispatch(core, prepared)
     count = len(calls)
     with pytest.raises(AgentError, match="ARTICLE_RETRY_NOT_SAFE|ARTICLE_OUTSTANDING_DELIVERY"):
         value.prepare(article, retry_record=prepared["id"], candidate={"title": "Правка", "body": "Русский текст."})
     assert len(calls) == count
+
+
+def candidate_failure(value, article, candidate, operation, error):
+    record = failed_preparation(value, article) if operation == "prepare" else value.prepare(article)
+
+    class Rejected(CandidateQuality):
+        def check_candidate(self, *args):
+            raise AgentError(error)
+
+    value.quality_factory = Rejected
+    with pytest.raises(AgentError, match=error):
+        candidate_operation(value, article, record, candidate, operation)
+    return value._load()["records"][0]
+
+
+def candidate_operation(value, article, record, candidate, operation):
+    if operation == "prepare":
+        return value.prepare(article, retry_record=record["id"], candidate=candidate)
+    return value.revise_prepared(record["id"], candidate)
+
+
+@pytest.mark.parametrize("operation", ["prepare", "revise"])
+@pytest.mark.parametrize("initial_padding", [False, True])
+def test_substantive_candidate_refusal_is_durable_and_whitespace_cannot_resample_it(cycle, operation, initial_padding):
+    value, core, article, records, calls, _, _ = cycle
+    candidate = {"title": "Звёздный ветер", "body": "Учёные исследовали необычную атмосферу далёкой звезды."}
+    supplied = {k: " \n" + v + "\n " for k, v in candidate.items()} if initial_padding else candidate
+    failed = candidate_failure(value, article, supplied, operation, "ARTICLE_QUALITY_REJECTED")
+    attempts_key = "preparation_attempts" if operation == "prepare" else "correction_attempts"
+    before_attempts = failed[attempts_key]
+    assert before_attempts[-1]["candidate_hash"] == fingerprint(candidate)
+    assert before_attempts[-1]["candidate_raw_hash"] == fingerprint(supplied)
+    checked = []
+
+    def factory():
+        checked.append(True)
+        return CandidateQuality()
+
+    # A new process-equivalent object reads refusal history from the private ledger.
+    restarted = HourlyArticleCycle(core, factory)
+    retry = candidate if initial_padding else {k: " " + v + " " for k, v in candidate.items()}
+    with pytest.raises(AgentError, match="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"):
+        candidate_operation(restarted, article, failed, retry, operation)
+    after = restarted._load()["records"][0]
+    assert after[attempts_key] == before_attempts and after["state"] == failed["state"]
+    assert after["preparation_actions"][-1]["action"] == "rejected_candidate_replay_blocked"
+    assert after["preparation_actions"][-1]["candidate_normalized_hash"] == fingerprint(candidate)
+    assert not checked and not calls and not records
+    with core.db.session() as session:
+        event = session.scalar(select(Audit).where(Audit.action == "hourly_article_candidate_replay_blocked"))
+        assert event.details["candidate_normalized_hash"] == fingerprint(candidate)
+        assert session.query(Dispatch).count() == session.query(TargetApproval).count() == 0
+        assert session.query(Variant).count() == (0 if operation == "prepare" else 1)
+
+
+@pytest.mark.parametrize("operation", ["prepare", "revise"])
+@pytest.mark.parametrize("first_markdown", [False, True])
+def test_canonical_markdown_and_plaintext_candidate_refusal_cannot_resample(cycle, operation, first_markdown):
+    from max_postiz_agent.article_quality import normalize_article_links
+    value, core, article, records, calls, _, _ = cycle
+    markdown = {"title": "Звёздный ветер", "body":
+        "Учёные исследовали [атмосферу](https://science.example.org/atmosphere/) далёкой звезды."}
+    plain = {key: normalize_article_links(text) for key, text in markdown.items()}
+    assert markdown != plain
+    supplied, equivalent = (markdown, plain) if first_markdown else (plain, markdown)
+    failed = candidate_failure(value, article, supplied, operation, "ARTICLE_QUALITY_REJECTED")
+    key = "preparation_attempts" if operation == "prepare" else "correction_attempts"
+    assert failed[key][-1]["candidate_hash"] == fingerprint(plain)
+    assert failed[key][-1]["candidate_raw_hash"] == fingerprint(supplied)
+
+    def forbidden_factory():
+        pytest.fail("An equivalent checked plaintext must not resample the reviewer")
+
+    restarted = HourlyArticleCycle(core, forbidden_factory)
+    with pytest.raises(AgentError, match="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"):
+        candidate_operation(restarted, article, failed, equivalent, operation)
+    assert restarted._load()["records"][0][key] == failed[key]
+    assert not records and not calls
+
+
+def legacy_markdown_refusal(cycle):
+    value, _, article, _, _, _, _ = cycle
+    markdown = {"title": "Звёздный ветер", "body":
+        "Учёные исследовали [атмосферу](https://science.example.org/atmosphere/) далёкой звезды."}
+    candidate_failure(value, article, markdown, "prepare", "ARTICLE_QUALITY_REJECTED")
+    ledger = value._load()
+    record = ledger["records"][0]
+    attempt = record["preparation_attempts"][-1]
+    attempt.pop("candidate_normalization")
+    attempt.pop("candidate_replay_hash")
+    attempt.update(candidate_hash=fingerprint(markdown), candidate_raw_hash=fingerprint(markdown))
+    value._save(ledger)
+    trace = value.core.settings.root / record["quality_trace"]
+    event = {"record_id": record["id"], "at": attempt["started_at"], "phase": "candidate_started",
+             "candidate": markdown, "source_untrusted": {"title": article["title"],
+             "body": article["original"], "url": article["url"]}}
+    trace.write_text(json.dumps(event, ensure_ascii=False) + "\n", encoding="utf-8")
+    return record, markdown, trace, event
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_legacy_raw_markdown_refusal_uses_trace_for_canonical_comparison(cycle, changed):
+    from max_postiz_agent.article_quality import normalize_article_links
+    value, core, article, records, calls, _, _ = cycle
+    failed, markdown, _, _ = legacy_markdown_refusal(cycle)
+    candidate = {key: normalize_article_links(text) for key, text in markdown.items()}
+    if changed:
+        candidate["body"] += " Обнаружен звёздный ветер."
+        result = HourlyArticleCycle(core, CandidateQuality).prepare(article,
+            retry_record=failed["id"], candidate=candidate)
+        assert result["state"] == "prepared"
+        assert result["preparation_attempts"][-2]["candidate_hash"] == fingerprint(markdown)
+    else:
+        def forbidden_factory():
+            pytest.fail("Historical canonical refusal must not resample")
+        with pytest.raises(AgentError, match="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"):
+            HourlyArticleCycle(core, forbidden_factory).prepare(article,
+                retry_record=failed["id"], candidate=candidate)
+    assert not records and not calls
+
+
+@pytest.mark.parametrize("corruption", ["missing", "source", "candidate", "malformed"])
+def test_unverifiable_legacy_candidate_refusal_fails_before_inference(cycle, corruption):
+    from max_postiz_agent.article_quality import normalize_article_links
+    value, core, article, records, calls, _, _ = cycle
+    failed, markdown, trace, event = legacy_markdown_refusal(cycle)
+    if corruption == "missing":
+        trace.unlink()
+    elif corruption == "malformed":
+        trace.write_text("not json", encoding="utf-8")
+    else:
+        if corruption == "source":
+            event["source_untrusted"]["body"] += " A different English source."
+        else:
+            event["candidate"]["body"] += " Другой русский текст."
+        trace.write_text(json.dumps(event, ensure_ascii=False) + "\n", encoding="utf-8")
+    candidate = {key: normalize_article_links(text) for key, text in markdown.items()}
+
+    def forbidden_factory():
+        pytest.fail("Missing historical evidence must not permit new inference")
+
+    with pytest.raises(AgentError, match="ARTICLE_REJECTED_CANDIDATE_TRACE_REQUIRED"):
+        HourlyArticleCycle(core, forbidden_factory).prepare(article, retry_record=failed["id"], candidate=candidate)
+    assert value._load()["records"][0]["preparation_attempts"] == failed["preparation_attempts"]
+    assert not records and not calls
+
+
+@pytest.mark.parametrize("operation", ["prepare", "revise"])
+@pytest.mark.parametrize("error", ["OPENCODE_GENERATION_FAILED", "ARTICLE_SPELLING_UNAVAILABLE", "ARTICLE_TRACE_FAILED"])
+def test_infrastructure_failure_does_not_blacklist_the_same_candidate(cycle, operation, error):
+    value, core, article, records, calls, _, _ = cycle
+    candidate = {"title": "Звёздный ветер", "body": "Учёные исследовали необычную атмосферу далёкой звезды."}
+    failed = candidate_failure(value, article, candidate, operation, error)
+    restarted = HourlyArticleCycle(core, CandidateQuality)
+    result = candidate_operation(restarted, article, failed, candidate, operation)
+    assert result["state"] == "prepared" and not result.get("correction_blocked")
+    attempts_key = "preparation_attempts" if operation == "prepare" else "correction_attempts"
+    assert result[attempts_key][-2]["error"] == error
+    assert result[attempts_key][-1]["candidate_hash"] == fingerprint(candidate)
+    assert not any(x["action"] == "rejected_candidate_replay_blocked" for x in result.get("preparation_actions", []))
+    assert not calls and not records
+
+
+def test_preparation_refusal_also_blocks_later_revision_after_a_different_candidate_passed(cycle):
+    value, core, article, _, calls, _, _ = cycle
+    candidate = {"title": "Звёздный ветер", "body": "Учёные исследовали необычную атмосферу далёкой звезды."}
+    failed = candidate_failure(value, article, candidate, "prepare", "ARTICLE_QUALITY_REJECTED")
+    restarted = HourlyArticleCycle(core, CandidateQuality)
+    corrected = {**candidate, "body": "Учёные изучили необычную атмосферу далёкой звезды и обнаружили звёздный ветер."}
+    prepared = restarted.prepare(article, retry_record=failed["id"], candidate=corrected)
+    with pytest.raises(AgentError, match="ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"):
+        HourlyArticleCycle(core, CandidateQuality).revise_prepared(prepared["id"], candidate)
+    with core.db.session() as session:
+        assert session.get(Variant, prepared["variant_id"]).body == prepared["body"]
+        assert session.query(VariantRevision).count() == 1
+    assert not calls
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_legacy_refusal_hash_is_respected_and_corrupt_hash_fails_closed(cycle, malformed):
+    value, core, article, _, calls, _, _ = cycle
+    candidate = {"title": "Звёздный ветер", "body": "Учёные исследовали необычную атмосферу далёкой звезды."}
+    failed = candidate_failure(value, article, candidate, "prepare", "ARTICLE_QUALITY_REJECTED")
+    ledger = value._load()
+    attempt = ledger["records"][0]["preparation_attempts"][-1]
+    attempt.pop("candidate_raw_hash")
+    if malformed:
+        attempt["candidate_hash"] = "not-a-valid-content-hash"
+    value._save(ledger)
+    checked = []
+
+    def factory():
+        checked.append(True)
+        return CandidateQuality()
+
+    error = "ARTICLE_LEDGER_INVALID" if malformed else "ARTICLE_CANDIDATE_PREVIOUSLY_REJECTED"
+    with pytest.raises(AgentError, match=error):
+        HourlyArticleCycle(core, factory).prepare(article, retry_record=failed["id"], candidate=candidate)
+    assert not checked and not calls
+
+
+@pytest.mark.parametrize("origin", ["automatic", "candidate", "candidate_then_infrastructure"])
+def test_quality_refusal_requires_an_exact_candidate_instead_of_blind_translation_retry(cycle, origin):
+    value, core, article, _, calls, _, _ = cycle
+    candidate = {"title": "Звёздный ветер", "body": "Учёные исследовали необычную атмосферу далёкой звезды."}
+    if origin.startswith("candidate"):
+        failed = candidate_failure(value, article, candidate, "prepare", "ARTICLE_QUALITY_REJECTED")
+        if origin == "candidate_then_infrastructure":
+            class Unavailable(CandidateQuality):
+                def check_candidate(self, *args):
+                    raise AgentError("ARTICLE_SPELLING_UNAVAILABLE")
+
+            value.quality_factory = Unavailable
+            changed = {**candidate, "body": candidate["body"] + " Обнаружен звёздный ветер."}
+            with pytest.raises(AgentError, match="ARTICLE_SPELLING_UNAVAILABLE"):
+                value.prepare(article, retry_record=failed["id"], candidate=changed)
+            failed = value._load()["records"][0]
+            assert failed["error"] == "ARTICLE_SPELLING_UNAVAILABLE"
+    else:
+        class Rejected(Quality):
+            def prepare(self, *args):
+                raise AgentError("ARTICLE_QUALITY_REJECTED")
+
+        value.quality_factory = Rejected
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            value.prepare(article)
+        failed = value._load()["records"][0]
+    restarted = HourlyArticleCycle(core, CandidateQuality)
+    with pytest.raises(AgentError, match="ARTICLE_CORRECTION_CANDIDATE_REQUIRED"):
+        restarted.prepare(article, retry_record=failed["id"])
+    assert restarted._load()["records"][0]["preparation_attempts"] == failed["preparation_attempts"]
+    assert not calls

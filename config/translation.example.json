@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "model": "hy-mt2-7b-q8",
+  "segment_chars": 1400,
+  "base_url": "http://127.0.0.1:8094"
+}

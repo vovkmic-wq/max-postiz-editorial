@@ -4,17 +4,134 @@ async function api(path,body){const r=await fetch(path,{method:body===undefined?
 function status(value,error=false){el('status').textContent=value;el('status').className=error?'error':'';}
 function node(tag,text){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;}
 function button(parent,label,fn){const b=node('button',label);b.onclick=async()=>{b.disabled=true;try{await fn();status('Готово');await refresh();}catch(e){status(e.message,true);}finally{b.disabled=false;}};parent.append(b);return b;}
+
+function automaticArticleStatus(card,v,target,state,details){
+ const banner=node('section');banner.className='automatic-policy';banner.setAttribute('aria-label','Автоматический маршрут');
+ banner.append(node('h4','Автоматическая публикация по политике'),node('p','Эта карточка показывает состояние подготовки и доставки. Согласование человеком здесь не требуется. Наличие черновика или машинной проверки само по себе не подтверждает публикацию.'));
+ banner.append(node('p',`Состояние: ${details?.status||'details_unavailable'} · машинная проверка: ${details?.machine_review_status||'unconfirmed'}`));
+ const paused=details?.target_paused??target?.paused;
+ banner.append(node('p',paused?'Адресат на паузе. Это не подтверждение готовности к отправке.':'Адресат активен. Отправка зависит от политики, даты, проверок и интервала.'));
+ const meta=v.metadata_json||{};
+ banner.append(node('p',`Postiz: ${meta.postiz_state||'состояние не подтверждено'}`));
+ if(Number.isFinite(meta.postiz_due_at))banner.append(node('p','Дата Postiz: '+new Date(meta.postiz_due_at*1000).toLocaleString('ru-RU',{timeZone:'Europe/Moscow'})+' (Москва)'));
+ else banner.append(node('p','Дата отправки в Postiz ещё не подтверждена.'));
+ banner.append(node('p',`Рубрика: ${details?.review_rubric||meta.review_rubric||'не подтверждена'}`));
+ if(details?.automatic_machine_review_valid!==true){const blocked=node('p','Нет подтверждённых машинных доказательств для автоматической отправки.');blocked.className='error';blocked.setAttribute('role','alert');banner.append(blocked);}
+ const issues=Array.isArray(details?.machine_review_issues)?details.machine_review_issues:[];
+ if(issues.length){const list=node('ul');list.className='error';list.setAttribute('aria-label','Замечания машинной проверки');for(const issue of issues)if(typeof issue==='string')list.append(node('li',issue));banner.append(list);}
+ const warnings=Array.isArray(details?.machine_review_warnings)?details.machine_review_warnings:[];
+ if(warnings.length){const list=node('ul');list.setAttribute('aria-label','Неблокирующие замечания');for(const warning of warnings)if(typeof warning==='string')list.append(node('li',warning));banner.append(node('h4','Неблокирующие замечания'),list);}
+ const evidence=details?.machine_review_evidence;
+ if(evidence&&typeof evidence==='object'&&!Array.isArray(evidence)){const proof=node('details');proof.className='machine-evidence';proof.append(node('summary','Исходные доказательства машинной проверки'),node('pre',JSON.stringify(evidence,null,2)));banner.append(proof);}
+ if(state.postiz_public_origin){const link=node('a','Открыть Postiz: редактор и календарь');link.href=state.postiz_public_origin+'/';link.target='_blank';link.rel='noopener noreferrer';banner.append(link);}
+ card.append(banner);
+}
+
+async function renderVariant(v,state){
+ const card=node('article');card.className='card';
+ const meta={...v.metadata_json},target=state.targets.find(t=>t.id===v.target_id),platform=target?.platform;
+ const hourly=meta.origin==='hourly_article_test',editable=['owner','editor'].includes(state.role);
+ const automatic=hourly&&meta.approval_mode==='automatic';
+ const postizTextCanonical=hourly&&Boolean(meta.postiz_post_id);
+ const terminal=['published','abandoned'].includes(v.state);
+ card.append(node('h3',`${v.target_id}: ${v.title}`),node('p',`Версия ${v.revision} · ${v.state}`));
+ let details=null;
+ if(hourly){
+  try{details=await api(`/api/hub/variants/${v.id}/article-review`);}
+  catch(error){details={machine_review_current:false,status:'details_unavailable'};card.append(node('p',error.message));}
+  card.append(node('p',`Адресат: ${v.target_id} · ${target?.platform||'платформа недоступна'} · канал ${target?.destination||'недоступен — обновите карточку'}`));
+  if(!automatic){card.append(node('p','DRAFT в Postiz → дата и QUEUE в календаре Postiz → финальное «Согласовать» в Hub. После правки в Postiz нажмите «Получить правки Postiz» и повторите проверку. Человек сравнивает оригинал и перевод; машинная проверка не заменяет его решение.'));
+   if(postizTextCanonical)card.append(node('p','Редактируйте текст в Postiz, затем получите правки и повторите Ministral + LanguageTool. В Hub текст показан только для сравнения и согласования.'));}
+ }
+ const comparison=node('div');comparison.className=hourly?'article-comparison':'';card.append(comparison);
+ if(hourly){
+  const source=node('section');source.className='article-source';source.append(node('h4','Оригинал (English)'),node('h5',details.source_title||'Оригинал недоступен'),node('pre',details.source_body||''));
+  try{const url=new URL(details.source_url);if(['http:','https:'].includes(url.protocol)){const link=node('a','Открыть источник');link.href=url.href;link.target='_blank';link.rel='noopener noreferrer';source.append(link);}}catch{}
+  comparison.append(source);
+ }
+ const editor=node('div');editor.className='article-editor';comparison.append(editor);
+ if(hourly)editor.append(node('h4','Перевод и правка (Русский)'));
+ const title=node('input');title.value=v.title;title.readOnly=postizTextCanonical;title.setAttribute('aria-label','Заголовок');editor.append(title);
+ const area=node('textarea');area.value=v.body;area.readOnly=postizTextCanonical;area.setAttribute('aria-label','Текст публикации');editor.append(area);
+ if(automatic){title.readOnly=true;area.readOnly=true;automaticArticleStatus(card,v,target,state,details);return card;}
+ let media=[...v.media],updateReviewControls=()=>{};
+ const tags=node('input'),community=node('input');
+ if(platform==='pikabu'){tags.value=(meta.tags||[]).join(', ');tags.setAttribute('aria-label','Теги через запятую');community.value=meta.community||'';community.placeholder='Сообщество (необязательно)';editor.append(tags,community);}
+ const dirty=()=>area.value!==v.body||title.value!==v.title||JSON.stringify(media)!==JSON.stringify(v.media)||(platform==='pikabu'&&(tags.value!==(meta.tags||[]).join(', ')||community.value!==(meta.community||'')));
+ const files=node('p','Вложения: '+media.length),upload=node('input');upload.type='file';upload.accept='image/png,image/jpeg,image/webp,video/mp4';upload.setAttribute('aria-label','Добавить вложение');editor.append(files);
+ if(hourly)editor.append(node('p','Почасовой сценарий NASA использует только текст, без вложений.'));else editor.append(upload);
+ upload.onchange=async()=>{if(!upload.files[0])return;try{const form=new FormData();form.append('file',upload.files[0]);const r=await fetch('/api/hub/media',{method:'POST',body:form,credentials:'same-origin'});const item=await r.json();if(!r.ok)throw Error(item.code||'Файл не принят');media.push(item);files.textContent='Вложения: '+media.length;updateReviewControls();status('Вложение добавлено. Сохраните новую версию.');}catch(error){status(error.message,true);}};
+ const clear=node('button','Убрать вложения');clear.onclick=()=>{media=[];files.textContent='Вложения: 0';updateReviewControls();};if(!hourly||media.length)editor.append(clear);
+ const save=button(editor,'Сохранить новую версию',()=>api(`/api/hub/variants/${v.id}/revise`,{revision:v.revision,body:area.value,title:title.value,media,...(platform==='pikabu'?{metadata:{tags:tags.value.split(',').map(t=>t.trim()).filter(Boolean),community:community.value}}:{})}));save.disabled=!editable||terminal||postizTextCanonical;
+ if(!hourly)button(editor,'Адаптировать локальной LLM',()=>api(`/api/hub/variants/${v.id}/adapt`,{}));
+ const date=node('input');date.type='datetime-local';date.setAttribute('aria-label','Дата и время в часовом поясе компьютера');
+ if(meta.postiz_post_id){
+  if(Number.isFinite(meta.postiz_due_at)){const when=new Date(meta.postiz_due_at*1000);date.step='0.001';date.value=new Date(when.getTime()-when.getTimezoneOffset()*60000).toISOString().slice(0,23);}
+  date.readOnly=true;card.append(node('p',`Postiz: ${meta.postiz_state}. Дата задаётся в календаре Postiz.`));
+  if(meta.origin==='postiz_max_bridge'&&!v.sources.length&&state.role==='owner')button(card,'Подтвердить авторский текст',()=>api(`/api/hub/variants/${v.id}/attest-original`,{revision:v.revision,content_hash:v.content_hash}));
+ }else if(hourly){date.readOnly=true;card.append(node('p','Сначала создайте DRAFT, затем выберите дату в Postiz и получите правки.'));}
+ card.append(date);
+ let confirmation=null,machineState=null,recheck=null,exceptionConfirmation=null,exceptionNotes=null;
+ const machineStatus=details?.machine_review_status||(details?.machine_review_current?'passed':'unconfirmed');
+ const machineCurrent=details?.machine_review_current===true,machinePassed=machineCurrent&&machineStatus==='passed';
+ const machineRejected=machineCurrent&&machineStatus==='rejected';
+ const exceptionEligible=machineRejected&&details?.machine_exception_eligible===true;
+ const notesComplete=()=>{if(!exceptionNotes)return false;const text=exceptionNotes.value.trim(),words=text.toLocaleLowerCase('ru-RU').match(/\p{L}+/gu)||[];return text.length>=40&&text.length<=4000&&words.length>=6&&new Set(words).size>=4;};
+ if(hourly){
+  machineState=node('p');machineState.setAttribute('role','status');card.append(machineState);
+  card.append(node('p',`Статус машинной проверки: ${machineStatus}`));
+  if(!machinePassed){const messages={rejected:exceptionEligible?'Ministral отклонил перевод. Отказ сохранён без изменения; человек может принять отдельное решение только после разбора каждого замечания.':'Машинный отказ не допускает исключение: нужны актуальные доказательства, пройденные обязательные проверки и полный результат LanguageTool.',unverified:'Ответ Ministral не подтверждён. Исключение недоступно; отправка заблокирована.',infrastructure_error:'Машинная проверка не завершена из-за ошибки инфраструктуры. Исключение недоступно; отправка заблокирована.',failed:'Машинная проверка завершилась ошибкой. Исключение недоступно; отправка заблокирована.',checking:'Машинная проверка ещё выполняется. Отправка заблокирована.'};const blocked=node('p',messages[machineStatus]||'Актуальная машинная проверка отсутствует. Исключение недоступно; отправка заблокирована.');blocked.className='error';blocked.setAttribute('role','alert');card.append(blocked);}
+  const reviewIssues=Array.isArray(details.machine_review_issues)?details.machine_review_issues.filter(issue=>typeof issue==='string'):[];
+  if(reviewIssues.length){const issues=node('ul');issues.className='error';issues.setAttribute('aria-label','Замечания машинной проверки');for(const issue of reviewIssues)issues.append(node('li',issue));card.append(issues);}
+  const evidence=details.machine_review_evidence;
+  if(evidence&&typeof evidence==='object'&&!Array.isArray(evidence)){
+   const evidencePanel=node('details');evidencePanel.className='machine-evidence';evidencePanel.open=machineStatus==='rejected';evidencePanel.append(node('summary','Исходный результат Ministral и полная проверка LanguageTool'));
+   evidencePanel.append(node('h4','Исходный ответ Ministral — без изменения'),node('pre',typeof evidence.review_raw==='string'?evidence.review_raw:JSON.stringify(evidence.review_raw??null,null,2)));
+   evidencePanel.append(node('h4','Результат Ministral в структурированном виде'),node('pre',JSON.stringify(evidence.review??null,null,2)));
+   const spelling=node('pre',JSON.stringify({spelling_matches:evidence.spelling_matches??null,spelling_adjudicated:evidence.spelling_adjudicated??null,spelling_unresolved:evidence.spelling_unresolved??null},null,2));spelling.setAttribute('aria-label','Полный результат LanguageTool');evidencePanel.append(node('h4','LanguageTool: все замечания и их разбор'),spelling);
+   const proof=node('pre',JSON.stringify(evidence,null,2));proof.setAttribute('aria-label','Полные доказательства машинной проверки');evidencePanel.append(node('h4','Полная запись проверки'),proof);card.append(evidencePanel);
+  }
+  recheck=button(card,'Повторно проверить перевод: Ministral + LanguageTool',()=>{if(dirty())throw Error('Сначала сохраните изменения');if(machineRejected)throw Error('Неизменённый отклонённый текст повторно не проверяется. Исправьте его в Postiz и получите новую версию.');return api(`/api/hub/variants/${v.id}/recheck-article`,{revision:v.revision,content_hash:v.content_hash});});
+  if(exceptionEligible){
+   const exception=node('section');exception.className='machine-exception';exception.append(node('h4','Отдельное решение человека при отказе Ministral'),node('p','Разберите каждое исходное замечание по английскому оригиналу. Объясните, почему допускаете публикацию этой версии; отказ Ministral останется в истории. Одного «согласен» недостаточно: не менее 40 символов, 6 слов и 4 различных слов.'));
+   exceptionNotes=node('textarea');exceptionNotes.setAttribute('aria-label','Разбор человеком замечаний Ministral');exceptionNotes.maxLength=4000;exceptionNotes.autocomplete='off';exceptionNotes.value='';exception.append(exceptionNotes);
+   const exceptionLabel=node('label');exceptionLabel.className='machine-exception-confirmation';exceptionConfirmation=node('input');exceptionConfirmation.type='checkbox';exceptionConfirmation.checked=false;exceptionConfirmation.autocomplete='off';exceptionLabel.append(exceptionConfirmation,document.createTextNode(' Я лично разобрал(а) все исходные замечания Ministral и принимаю решение об исключении для точной версии, адресата и даты.'));exception.append(exceptionLabel);card.append(exception);
+  }
+  const label=node('label');label.className='human-review';confirmation=node('input');confirmation.type='checkbox';confirmation.checked=false;confirmation.autocomplete='off';
+  label.append(confirmation,document.createTextNode(' Я лично сравнил(а) полный английский оригинал и русский текст этой версии, проверил(а) адресата и дату и согласую публикацию.'));card.append(label);
+ }
+ const approval=button(card,'Согласовать и поставить в план',()=>{
+  if(dirty())throw Error('Сначала сохраните изменения');if(!date.value)throw Error('Выберите дату и время');
+  if(hourly&&(!(machinePassed||exceptionEligible)||!confirmation.checked))throw Error('Нужны актуальная машинная проверка и личное согласование');
+  if(hourly&&exceptionEligible&&(!exceptionConfirmation.checked||!notesComplete()))throw Error('Нужны отдельное подтверждение исключения и подробный разбор замечаний');
+  if(hourly&&meta.postiz_state!=='QUEUE')throw Error('Выберите дату в календаре Postiz и получите состояние QUEUE');
+  return api(`/api/hub/variants/${v.id}/approve`,{revision:v.revision,content_hash:v.content_hash,due_at:new Date(date.value).getTime()/1000,...(hourly?{human_review_confirmed:confirmation.checked,...(exceptionEligible?{machine_exception_confirmed:exceptionConfirmation.checked,machine_review_notes:exceptionNotes.value.trim()}:{})}:{})});
+ });
+ if(hourly){
+  updateReviewControls=()=>{
+   const changed=dirty();if(changed){confirmation.checked=false;if(exceptionConfirmation)exceptionConfirmation.checked=false;if(exceptionNotes)exceptionNotes.value='';}
+   confirmation.disabled=!editable||terminal||changed||!(machinePassed||exceptionEligible);
+   recheck.disabled=!editable||terminal||changed||machineRejected;
+   if(exceptionConfirmation){exceptionConfirmation.disabled=!editable||terminal||changed;exceptionNotes.disabled=exceptionConfirmation.disabled;}
+   machineState.textContent=changed?'Правки ещё не сохранены. После сохранения повторите машинную проверку.':machinePassed?'Ministral + LanguageTool: проверка относится к текущему тексту. Требуется решение человека.':exceptionEligible?'Отказ Ministral относится к текущему тексту. Требуются разбор замечаний, отдельное решение об исключении и личное согласование.':postizTextCanonical?'Машинная проверка устарела, отсутствует или заблокирована. Получите правки Postiz и выполните повторную проверку.':'Машинная проверка устарела, отсутствует или заблокирована. Сохраните текст и выполните повторную проверку.';
+   machineState.className=machinePassed&&!changed?'badge':'error';
+   approval.disabled=confirmation.disabled||!confirmation.checked||meta.postiz_state!=='QUEUE'||(exceptionEligible&&(!exceptionConfirmation.checked||!notesComplete()));
+  };
+  for(const input of [title,area,tags,community])input.addEventListener('input',updateReviewControls);
+  confirmation.addEventListener('change',updateReviewControls);if(exceptionConfirmation){exceptionConfirmation.addEventListener('change',updateReviewControls);exceptionNotes.addEventListener('input',updateReviewControls);}updateReviewControls();
+ }else approval.disabled=!editable||terminal;
+ if(target?.route==='postiz'||(target?.route==='max_browser'&&target.options?.postiz_integration_id)){
+  if(!meta.postiz_post_id){const stage=button(card,'Создать DRAFT в Postiz',()=>api(`/api/hub/variants/${v.id}/postiz`,{}));stage.disabled=!editable||terminal;}
+  const sync=button(card,'Получить правки Postiz',()=>api(target.route==='max_browser'?'/api/hub/max-bridge/sync':`/api/hub/variants/${v.id}/sync`,{}));sync.disabled=!editable;
+  if(state.postiz_public_origin){const link=node('a','Открыть Postiz: редактор и календарь');link.href=state.postiz_public_origin+'/';link.target='_blank';link.rel='noopener noreferrer';card.append(link);}
+ }
+ return card;
+}
+
 async function refresh(){const state=await api('/api/hub/state');await refreshReddit(state);el('login').hidden=true;el('main').hidden=false;el('runtime').textContent=`База: ${state.database} · Модель: ${state.model} (режим ${state.model_mode}) · Postiz: ${state.postiz_configured?'настроен':'ожидает подключения'}`;
 el('tasks').replaceChildren();if(!state.tasks.length)el('tasks').append(node('p','Задачи задаются в настройках редакции.'));for(const task of state.tasks){const c=node('article');c.append(node('h3',task.id),node('p',`${task.enabled?'Включена':'Отключена'} · ${task.error||'без ошибок'} · попыток: ${task.attempts}`));if(task.enabled&&task.error)button(c,'Повторить после устранения причины',()=>api(`/api/hub/tasks/${task.id}/resume`,{}));el('tasks').append(c);}
 el('targets').replaceChildren();for(const t of state.targets){const c=node('div',`${t.id} · ${t.platform} · ${t.route} · ${!t.enabled?'отключён':t.paused?'на паузе':'активен'}`);if(t.enabled)button(c,t.paused?'Снять паузу':'Пауза',()=>api(`/api/hub/targets/${t.id}/pause`,{paused:!t.paused}));el('targets').append(c);}
-el('variants').replaceChildren();if(!state.variants.length)el('variants').append(node('p','Черновики появятся после сбора материалов и обработки моделью.'));for(const v of state.variants){const c=node('article');c.className='card';c.append(node('h3',`${v.target_id}: ${v.title}`),node('p',`Версия ${v.revision} · ${v.state}`));const title=node('input');title.value=v.title;title.setAttribute('aria-label','Заголовок');c.append(title);
-const area=node('textarea');area.value=v.body;area.setAttribute('aria-label','Текст публикации');c.append(area);
-let meta={...v.metadata_json},media=[...v.media];const platform=state.targets.find(t=>t.id===v.target_id)?.platform;
-const tags=node('input'),community=node('input');if(platform==='pikabu'){tags.value=(meta.tags||[]).join(', ');tags.setAttribute('aria-label','Теги через запятую');community.value=meta.community||'';community.placeholder='Сообщество (необязательно)';c.append(tags,community);}
-const files=node('p','Вложения: '+media.length);const upload=node('input');upload.type='file';upload.accept='image/png,image/jpeg,image/webp,video/mp4';upload.setAttribute('aria-label','Добавить вложение');c.append(files,upload);
-upload.onchange=async()=>{if(!upload.files[0])return;try{const form=new FormData();form.append('file',upload.files[0]);const r=await fetch('/api/hub/media',{method:'POST',body:form,credentials:'same-origin'});const item=await r.json();if(!r.ok)throw Error(item.code||'Файл не принят');media.push(item);files.textContent='Вложения: '+media.length;status('Вложение добавлено. Сохраните новую версию.');}catch(e){status(e.message,true);}};
-const clear=node('button','Убрать вложения');clear.onclick=()=>{media=[];files.textContent='Вложения: 0';};c.append(clear);
-button(c,'Сохранить новую версию',()=>api(`/api/hub/variants/${v.id}/revise`,{revision:v.revision,body:area.value,title:title.value,media,...(platform==='pikabu'?{metadata:{tags:tags.value.split(',').map(t=>t.trim()).filter(Boolean),community:community.value}}:{})}));button(c,'Адаптировать локальной LLM',()=>api(`/api/hub/variants/${v.id}/adapt`,{}));const date=node('input');date.type='datetime-local';date.setAttribute('aria-label','Дата и время в часовом поясе компьютера');if(meta.postiz_post_id){const when=new Date(meta.postiz_due_at*1000);date.step='0.001';date.value=new Date(when.getTime()-when.getTimezoneOffset()*60000).toISOString().slice(0,23);date.readOnly=true;c.append(node('p',`Postiz: ${meta.postiz_state}. Дата задаётся в календаре Postiz.`));if(meta.origin==='postiz_max_bridge'&&!v.sources.length&&state.role==='owner')button(c,'Подтвердить авторский текст',()=>api(`/api/hub/variants/${v.id}/attest-original`,{revision:v.revision,content_hash:v.content_hash}));}c.append(date);button(c,'Согласовать и поставить в план',()=>{if(area.value!==v.body||title.value!==v.title||JSON.stringify(media)!==JSON.stringify(v.media)||(platform==='pikabu'&&(tags.value!==(meta.tags||[]).join(', ')||community.value!==(meta.community||''))))throw Error('Сначала сохраните изменения');if(!date.value)throw Error('Выберите дату и время');return api(`/api/hub/variants/${v.id}/approve`,{revision:v.revision,content_hash:v.content_hash,due_at:new Date(date.value).getTime()/1000});});const target=state.targets.find(t=>t.id===v.target_id);if(target?.route==='postiz'||(target?.route==='max_browser'&&target.options?.postiz_integration_id)){button(c,'Открыть черновик в Postiz',()=>api(`/api/hub/variants/${v.id}/postiz`,{}));button(c,'Получить правки Postiz',()=>api(target.route==='max_browser'?'/api/hub/max-bridge/sync':`/api/hub/variants/${v.id}/sync`,{}));}el('variants').append(c);}
+const cards=await Promise.all(state.variants.map(v=>renderVariant(v,state)));el('variants').replaceChildren(...cards);if(!cards.length)el('variants').append(node('p','Черновики появятся после сбора материалов и обработки моделью.'));
 el('dispatches').replaceChildren();for(const d of state.dispatches){const c=node('article');c.className='card';c.append(node('h3',`${d.snapshot.target_id} · ${d.state}`),node('p',new Date(d.due_at*1000).toLocaleString('ru-RU',{timeZone:'Europe/Moscow'})+' (Москва)'),node('p',d.error||''));if(d.permalink){const a=node('a','Публикация');a.href=d.permalink;a.rel='noopener';a.target='_blank';c.append(a);}if(d.state==='awaiting_manual'){for(const name of ['post.txt','post.html','post.json']){const a=node('a',name+' ');a.href=`/api/hub/dispatches/${d.id}/export/${name}`;c.append(a);}const u=node('input');u.placeholder='https://pikabu.ru/story/...';c.append(u);button(c,'Подтвердить ручную публикацию',()=>api(`/api/hub/dispatches/${d.id}/attest`,{revision:d.revision,snapshot_hash:d.snapshot_hash,url:u.value}));}if(['unknown','scheduled'].includes(d.state))button(c,'Сверить результат',()=>api(`/api/hub/dispatches/${d.id}/reconcile`,{}));if(['pending','scheduled','awaiting_manual','retry_wait'].includes(d.state))button(c,'Отменить',()=>api(`/api/hub/dispatches/${d.id}/cancel`,{}));el('dispatches').append(c);}}
 el('signin').onclick=async()=>{try{const r=await fetch('/api/v1/session/login',{method:'POST',headers:{'Authorization':'Bearer '+el('key').value},credentials:'same-origin'});if(!r.ok)throw Error('AUTH_INVALID');el('key').value='';await refresh();status('Вход выполнен');}catch(e){status(e.message,true);}};
 el('refresh').onclick=()=>refresh().catch(e=>status(e.message,true));el('tick').onclick=async()=>{try{await api('/api/hub/tick',{});await refresh();}catch(e){status(e.message,true);}};

@@ -7,7 +7,7 @@ if (-not (Test-Path -LiteralPath $sshKey) -or -not (Test-Path -LiteralPath $know
     throw 'Private SSH key or pinned known-hosts file is missing from ignored data/.'
 }
 
-$remoteCommand = 'python3 /opt/max-postiz/deployment/linux/check-stack.py'
+$remoteCommand = '/opt/max-postiz/.venv/bin/python /opt/max-postiz/deployment/linux/check-stack.py'
 if ($Deep) { $remoteCommand += ' --deep' }
 Push-Location $projectRoot
 try {

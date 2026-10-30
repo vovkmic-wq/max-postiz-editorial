@@ -8,6 +8,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 
 def command(*args: str, timeout: int = 15) -> tuple[bool, str]:
@@ -38,6 +39,50 @@ def tcp(host: str, port: int) -> tuple[bool, str]:
         return False, type(exc).__name__
 
 
+def editorial_health() -> tuple[bool, str]:
+    """HTTP 200 у временного API-only не доказывает работу автономного процесса."""
+    ok, detail, raw = http("http://127.0.0.1:8092/health")
+    if not ok:
+        return False, detail
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return False, "EDITORIAL_HEALTH_INVALID"
+    if (not isinstance(value, dict) or value.get("status") != "ready"
+            or value.get("interface") != "postiz_only"
+            or value.get("worker_mode") != "autonomous"):
+        return False, "EDITORIAL_AUTONOMOUS_REQUIRED"
+    return True, "ready postiz_only autonomous"
+
+
+def postiz_api(root: Path) -> tuple[bool, str]:
+    """Exercise the configured authenticated read API without constructing the Hub/DB."""
+    safe_errors = {
+        "POSTIZ_NOT_CONFIGURED", "POSTIZ_PUBLIC_ORIGIN_INVALID", "POSTIZ_BASE_URL_INVALID",
+        "POSTIZ_HTTPS_REQUIRED", "POSTIZ_UNAVAILABLE", "POSTIZ_ACCESS_DENIED",
+        "POSTIZ_RATE_LIMIT", "POSTIZ_REJECTED", "POSTIZ_RESPONSE_INVALID",
+    }
+    try:
+        # Import lazily so a wrong interpreter or absent app is a failed readiness check.
+        from max_postiz_agent.cli import load_env
+        from max_postiz_agent.postiz import PostizClient
+
+        config = json.loads((root / "config/publishing.json").read_text(encoding="utf-8-sig"))
+        if not isinstance(config, dict) or not isinstance(config.get("postiz"), dict):
+            raise ValueError("Publishing configuration is missing Postiz options")
+        load_env(root)
+        client = PostizClient(config["postiz"])
+        try:
+            count = len(client.posts())
+        finally:
+            client.close()
+        return True, f"authenticated GET /posts posts={count}"
+    except Exception as exc:
+        # Never stringify exceptions: their text can contain credentials or private bodies.
+        code = getattr(exc, "code", None)
+        return False, code if isinstance(code, str) and code in safe_errors else type(exc).__name__
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deep", action="store_true",
@@ -49,16 +94,23 @@ def main() -> int:
         report[name] = {"ok": ok, "detail": detail}
 
     for unit in (
-        "docker.service", "nginx.service", "max-postiz-hub.service",
+        "docker.service", "nginx.service", "max-postiz-editorial.service",
         "max-postiz-opencode.service", "max-postiz-spelling.service",
         "max-postiz-display.service", "max-postiz-vnc.service",
-        "max-postiz-novnc.service",
+        "max-postiz-novnc.service", "max-postiz-translation.service",
     ):
         enabled, enabled_value = command("systemctl", "is-enabled", unit)
         active, active_value = command("systemctl", "is-active", unit)
         record(f"service:{unit}", enabled and enabled_value == "enabled"
                and active and active_value == "active",
                f"enabled={enabled_value or '?'} active={active_value or '?'}")
+
+    # Старый Hub не должен самозапуститься рядом с единственным новым worker.
+    _, old_enabled = command("systemctl", "is-enabled", "max-postiz-hub.service")
+    _, old_active = command("systemctl", "is-active", "max-postiz-hub.service")
+    record("retired:max-postiz-hub.service",
+           old_enabled in {"disabled", "masked", "not-found"} and old_active in {"inactive", "unknown"},
+           f"enabled={old_enabled or '?'} active={old_active or '?'}")
 
     expected_containers = (
         "max-postiz-hub-postgres-1", "max-postiz-postiz-postgres-1",
@@ -79,15 +131,21 @@ def main() -> int:
             record(f"container:{name}", False, "Docker state unavailable")
 
     for name, url in (
-        ("hub", "http://10.20.30.45:8090/hub"),
         ("postiz", "http://10.20.30.45:4007/auth/login"),
         ("opencode", "http://127.0.0.1:4108/global/health"),
         ("spelling", "http://127.0.0.1:8010/v2/languages"),
         ("model_router", "http://10.20.30.95:8083/health"),
         ("ministral_backend", "http://10.20.30.143:8086/health"),
+        ("translation", "http://127.0.0.1:8094/health"),
     ):
         ok, detail, _ = http(url)
         record(f"http:{name}", ok, detail)
+
+    ok, detail = editorial_health()
+    record("http:editorial", ok, detail)
+
+    ok, detail = postiz_api(Path(__file__).resolve().parents[2])
+    record("api:postiz_posts", ok, detail)
 
     ok, detail, body = http("http://10.20.30.95:8083/v1/models")
     try:

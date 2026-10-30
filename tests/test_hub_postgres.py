@@ -90,7 +90,8 @@ def test_real_postgres_migration_and_no_double_send(pg_hub):
         results = list(pool.map(lambda s: s.publish_due(), [hub, other]))
     assert sum(results) == 1 and len(calls) == 1
     with hub.db.engine.connect() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0006"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0008"
+        assert conn.execute(text("SELECT COUNT(*) FROM editorial_control")).scalar_one() == 0
         assert conn.execute(text("SELECT COUNT(*) FROM hub_dispatch_attempts")).scalar_one() == 1
     other.postiz.close()
     other_db.engine.dispose()
@@ -117,7 +118,8 @@ def test_postgres_backup_snapshot_restores_and_search(pg_hub, project):
     admin = create_engine(os.environ["TEST_DATABASE_URL"])
     with admin.begin() as conn:
         conn.execute(text('CREATE SCHEMA "' + schema + '"'))
-    restored_url = os.environ["TEST_DATABASE_URL"] + "?" + urlencode({"options": "-csearch_path=" + schema})
+    base_url = os.environ["TEST_DATABASE_URL"]
+    restored_url = base_url + ("&" if "?" in base_url else "?") + urlencode({"options": "-csearch_path=" + schema})
     db = Database(hub.settings, url=restored_url)
     try:
         db.initialize()

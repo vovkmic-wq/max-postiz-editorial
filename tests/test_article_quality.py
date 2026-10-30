@@ -5,9 +5,14 @@ import pytest
 
 from max_postiz_agent.article_quality import (
     MAGELLANIC_EVIDENCE,
+    SPACETIME_EVIDENCE,
+    SPACETIME_SOURCE_CONTEXT,
+    SPACETIME_SOURCE_TERM,
+    FRESH_SPACETIME_SPELLING_CONTRACT,
     ArticleQuality,
     adjudicate_scientific_spelling,
     canonical_article_url,
+    spacetime_spelling_evidence,
 )
 from max_postiz_agent.config import AgentError
 
@@ -139,7 +144,7 @@ def test_independent_rejection_cannot_be_ignored(approval):
             check.prepare(TITLE, ORIGINAL, URL)
     finally:
         check.close()
-    assert len(translator.prompts) == len(reviewer.prompts) == 3
+    assert len(translator.prompts) == 3 and len(reviewer.prompts) == 1
 
 
 def test_spelling_issues_block_even_unanimous_models():
@@ -382,6 +387,172 @@ def test_scientific_adjudication_preserves_raw_trace_and_other_findings_still_bl
         check.close()
 
 
+SPACETIME_ORIGINAL = ("These systems are called extreme mass ratio inspirals. The ergosphere is a region "
+                      "around a rotating black hole where space-time is dragged along with the black hole as it turns.")
+SPACETIME_TITLE = "Вращение чёрной дыры"
+SPACETIME_BODY = ("Эргосфера — область вокруг вращающейся чёрной дыры, в которой пространство-время "
+                  "уносится вместе с чёрной дырой по мере её вращения.")
+
+
+def spacetime_match(text):
+    start = text.index("пространство-")
+    return {"offset": len(text[:start].encode("utf-16-le")) // 2, "length": len("пространство-время"),
+        "message": "Unknown scientific term.", "type": {"typeName": "UnknownWord"},
+        "rule": {"id": "MORFOLOGIK_RULE_RU_RU", "issueType": "misspelling", "category": {"id": "TYPOS"}}}
+
+
+def test_spacetime_exception_requires_exact_source_context_and_preserves_raw_finding():
+    text = SPACETIME_TITLE + "\n\n" + SPACETIME_BODY
+    match = spacetime_match(text)
+    evidence = spacetime_spelling_evidence(SPACETIME_ORIGINAL, text, match)
+    assert evidence == {"match": match, "word": "пространство-время",
+        "phrase": "в которой пространство-время уносится вместе с чёрной дырой по мере её вращения",
+        "source_term": SPACETIME_SOURCE_TERM, "source_context": SPACETIME_SOURCE_CONTEXT,
+        "evidence_url": SPACETIME_EVIDENCE, "reason": "SOURCE_BOUND_VERIFIED_SCIENTIFIC_TERM"}
+    evidence["match"]["rule"]["category"]["id"] = "changed-copy"
+    assert match["rule"]["category"]["id"] == "TYPOS"
+    accepted, unresolved = adjudicate_scientific_spelling(SPACETIME_ORIGINAL, text, [match], allow_spacetime=True)
+    assert unresolved == [] and accepted[0]["match"] == match
+
+
+def test_spacetime_exception_uses_utf16_and_never_a_python_index_fallback():
+    text = "🌌 " + SPACETIME_BODY
+    match = spacetime_match(text)
+    assert spacetime_spelling_evidence(SPACETIME_ORIGINAL, text, match)
+    assert spacetime_spelling_evidence(SPACETIME_ORIGINAL, text,
+        {**match, "offset": text.index("пространство-время")}) is None
+
+
+@pytest.mark.parametrize("original", [
+    "Scientists study space-time near black holes.",
+    SPACETIME_ORIGINAL.replace("extreme mass ratio inspirals", "extreme mass ratio orbits"),
+    SPACETIME_ORIGINAL.replace("where space-time is dragged along", "where matter is dragged along"),
+    SPACETIME_ORIGINAL.replace("as it turns.", "as it grows."),
+    SPACETIME_ORIGINAL.replace("extreme mass ratio inspirals", "nonextreme mass ratio inspirals"),
+    SPACETIME_ORIGINAL.replace("where space-time", "elsewhere space-time"),
+    SPACETIME_ORIGINAL.replace("as it turns.", "as it turns.suffix"),
+    SPACETIME_SOURCE_CONTEXT,
+    SPACETIME_SOURCE_TERM,
+])
+def test_spacetime_exception_rejects_missing_changed_or_embedded_source_context(original):
+    assert spacetime_spelling_evidence(original, SPACETIME_BODY, spacetime_match(SPACETIME_BODY)) is None
+
+
+@pytest.mark.parametrize("text", [
+    "Учёные изучают пространство-время.",
+    SPACETIME_BODY.replace("в которой", "нев которой"),
+    SPACETIME_BODY.replace("пространство-время", "непространство-время"),
+    SPACETIME_BODY.replace("пространство-время", "пространство-времяподобное"),
+    SPACETIME_BODY.replace("пространство-время", "пространство-временной"),
+    SPACETIME_BODY.replace("уносится", "не уносится"),
+    SPACETIME_BODY.replace("чёрной дырой", "чёрной звездой"),
+    SPACETIME_BODY.replace("по мере её вращения", "по мере её роста"),
+    SPACETIME_BODY.replace("по мере её вращения", "по мере её вращенияподобного"),
+])
+def test_spacetime_exception_rejects_wrong_token_context_and_boundaries(text):
+    assert spacetime_spelling_evidence(SPACETIME_ORIGINAL, text, spacetime_match(text)) is None
+
+
+@pytest.mark.parametrize("change", [
+    {"offset": 0}, {"offset": -1}, {"offset": True}, {"offset": 60.0}, {"offset": "60"},
+    {"length": 17}, {"length": 19}, {"length": True}, {"length": 18.0}, {"length": "18"},
+    {"type": {"typeName": "Other"}}, {"type": None},
+    {"rule": {"id": "OTHER", "issueType": "misspelling", "category": {"id": "TYPOS"}}},
+    {"rule": {"id": "MORFOLOGIK_RULE_RU_RU", "issueType": "grammar", "category": {"id": "TYPOS"}}},
+    {"rule": {"id": "MORFOLOGIK_RULE_RU_RU", "issueType": "misspelling", "category": {"id": "GRAMMAR"}}},
+    {"rule": {"id": "MORFOLOGIK_RULE_RU_RU", "issueType": "misspelling"}},
+    {"rule": None},
+])
+def test_spacetime_exception_rejects_wrong_positions_types_and_grammar_rules(change):
+    match = {**spacetime_match(SPACETIME_BODY), **change}
+    accepted, unresolved = adjudicate_scientific_spelling(SPACETIME_ORIGINAL, SPACETIME_BODY, [match], allow_spacetime=True)
+    assert accepted == [] and unresolved == [match]
+
+
+@pytest.mark.parametrize("route", ["prepare", "candidate"])
+def test_spacetime_adjudication_keeps_trace_and_other_grammar_errors_blocking(route):
+    text = SPACETIME_TITLE + "\n\n" + SPACETIME_BODY
+    match = spacetime_match(text)
+    events = []
+    def checker(matches):
+        return ArticleQuality(Model({"title": SPACETIME_TITLE, "body": SPACETIME_BODY}), Model({**APPROVAL, "warnings": []}),
+            trace=events.append, review_rubric="meaning-first-v1", transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, json={"matches": matches})))
+
+    check = checker([match])
+    try:
+        if route == "prepare":
+            prepared = check.prepare("Extreme mass ratio inspirals", SPACETIME_ORIGINAL,
+                                      "https://svs.gsfc.nasa.gov/5586/")
+        else:
+            prepared = check.check_candidate(SPACETIME_TITLE, SPACETIME_BODY,
+                "Extreme mass ratio inspirals", SPACETIME_ORIGINAL, "https://svs.gsfc.nasa.gov/5586/")
+    finally:
+        check.close()
+    assert prepared["machine_review_status"] == "passed"
+    proof = prepared["machine_review_evidence"]
+    assert proof["fresh_spelling_contract"] == FRESH_SPACETIME_SPELLING_CONTRACT
+    assert proof["spelling_matches"] == [match] and proof["spelling_unresolved"] == []
+    assert proof["spelling_adjudicated"][0]["evidence_url"] == SPACETIME_EVIDENCE
+    assert next(event for event in events if event["phase"] == "spelling_returned")["matches"] == [match]
+    grammar = {"offset": 0, "length": 5, "message": "Actual gender agreement error.",
+               "type": {"typeName": "Other"},
+               "rule": {"id": "Unify_Adj_NN_gender", "issueType": "uncategorized", "category": {"id": "GRAMMAR"}}}
+    check = checker([match, grammar])
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.check_candidate(SPACETIME_TITLE, SPACETIME_BODY,
+                "Extreme mass ratio inspirals", SPACETIME_ORIGINAL, "https://svs.gsfc.nasa.gov/5586/")
+    finally:
+        check.close()
+
+
+def test_spacetime_is_not_enabled_by_default_or_by_a_truthy_non_boolean_flag():
+    match = spacetime_match(SPACETIME_BODY)
+    for flag in (False, None, 1, "true"):
+        assert adjudicate_scientific_spelling(SPACETIME_ORIGINAL, SPACETIME_BODY, [match],
+                                             allow_spacetime=flag) == ([], [match])
+    assert adjudicate_scientific_spelling(SPACETIME_ORIGINAL, SPACETIME_BODY, [match]) == ([], [match])
+
+
+def test_legacy_human_rubric_keeps_spacetime_finding_blocking():
+    match = spacetime_match(SPACETIME_TITLE + "\n\n" + SPACETIME_BODY)
+    check = quality(matches=[match])
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.check_candidate(SPACETIME_TITLE, SPACETIME_BODY, "Extreme mass ratio inspirals",
+                SPACETIME_ORIGINAL, "https://svs.gsfc.nasa.gov/5586/")
+    finally:
+        check.close()
+
+
+@pytest.mark.parametrize("route", ["protocol", "mur"])
+def test_saved_review_recoveries_cannot_reclassify_new_spacetime_finding(route):
+    source = SPACETIME_ORIGINAL + " Scientists also use the Multi-scale Ultra-high Resolution (MUR) Sea Surface Temperature Analysis."
+    body = SPACETIME_BODY + " Учёные также используют данные многомасштабного анализа температуры поверхности моря."
+    text = SPACETIME_TITLE + "\n\n" + body
+    match = spacetime_match(text)
+    translator, reviewer, events, requests = Model("No inference"), Model("No inference"), [], []
+
+    def spelling(request):
+        requests.append(request)
+        return httpx.Response(200, json={"matches": [match]})
+
+    check = ArticleQuality(translator, reviewer, review_rubric="meaning-first-v1",
+                           trace=events.append, transport=httpx.MockTransport(spelling))
+    raw = json.dumps({**APPROVAL, "warnings": ["Optional advice."] * 4})
+    try:
+        method = check.recover_review_protocol if route == "protocol" else check.recover_scientific_spelling
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            method(SPACETIME_TITLE, body, "Extreme mass ratio inspirals", source,
+                "https://svs.gsfc.nasa.gov/5586/", raw_review=raw, expected_review_prompt_hash=check.review_prompt_hash)
+    finally:
+        check.close()
+    assert len(requests) == 1 and not translator.prompts and not reviewer.prompts
+    decision = next(event for event in events if event["phase"] == "spelling_adjudicated")
+    assert decision["adjudicated"] == [] and decision["unresolved"] == [match]
+
+
 def test_exact_editorial_candidate_is_checked_without_translator_call():
     events = []
     translator, reviewer = Model("Must never be called"), Model(APPROVAL)
@@ -475,3 +646,205 @@ def test_numeric_format_feedback_repairs_time_notation_without_relaxing_gate():
     assert "Do not convert units, times or number formats" in feedback["advice"]
     assert translator.prompts[1]["previous_translation"] == converted
     assert "11:59 вечера" in result["translation"] and "23:59" not in result["translation"]
+
+
+@pytest.mark.parametrize("keep_identifier_dot", [False, True])
+def test_decimal_feedback_repairs_every_occurrence_instead_of_adding_a_correct_copy(keep_identifier_dot):
+    original = ("Scientists measured particles smaller than 2.5 micrometers, called PM2.5. "
+                "They studied the observations before sharing the results of their measurements.")
+    preserved = {"title": "Учёные исследуют мелкие частицы",
+        "body": "Учёные измерили частицы размером менее 2.5 микрометра, называемые PM2.5. "
+                "Они изучили наблюдения, прежде чем сообщить результаты измерений."}
+    localized = {**preserved, "body": preserved["body"].replace("2.5", "2,5",
+                                                                1 if keep_identifier_dot else -1)}
+    translator, reviewer = Model(localized, preserved), Model(APPROVAL)
+    check = quality(translator, reviewer)
+    try:
+        result = check.prepare("Scientists study fine particles", original, URL)
+    finally:
+        check.close()
+    assert len(translator.prompts) == 2 and len(reviewer.prompts) == 1
+    assert translator.prompts[0]["numeric_tokens_must_match_exactly"] == ["2.5"]
+    feedback = translator.prompts[1]["repair_feedback"]
+    assert feedback["original_numbers"] == ["2.5"]
+    assert feedback["unexpected_numbers"] == ["2,5"]
+    assert feedback["missing_numbers"] == ([] if keep_identifier_dot else ["2.5"])
+    assert feedback["notation_repairs"] == [{"observed": "2,5", "required": "2.5"}]
+    assert "character-for-character" in feedback["advice"]
+    assert "Do not merely add" in feedback["advice"]
+    assert "source decimal separator" in translator.prompts[0]["instruction"]
+    assert translator.prompts[1]["previous_translation"] == localized
+    assert "2,5" not in result["translation"]
+
+
+def test_equal_decimal_value_with_changed_notation_still_exhausts_the_strict_gate():
+    original = ORIGINAL.replace("3 hours", "2.5 hours")
+    translator = Model({**TRANSLATION, "body": TRANSLATION["body"].replace("3 часа", "2,5 часа")})
+    reviewer = Model(APPROVAL)
+    check = quality(translator, reviewer)
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.prepare(TITLE, original, URL)
+    finally:
+        check.close()
+    assert len(translator.prompts) == 3 and not reviewer.prompts
+
+
+def test_object_findings_keep_negative_verdict_and_spelling_evidence_without_resampling_review():
+    issue = "Отрицание из исходного текста не сохранено. " * 6
+    rejection = {"approved": False, "topic": "science", "issues": [{"issue": issue}]}
+    typo = {"message": "Опечатка в проверяемом тексте", "offset": 5, "length": 4}
+    translator, reviewer = Model(TRANSLATION), Model(rejection, APPROVAL)
+    events, spelling_calls = [], []
+
+    def spelling(request):
+        spelling_calls.append(request)
+        return httpx.Response(200, json={"matches": [typo]})
+
+    check = ArticleQuality(translator, reviewer, trace=events.append,
+                           transport=httpx.MockTransport(spelling))
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.prepare(TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+    assert len(translator.prompts) == 3 and len(reviewer.prompts) == len(spelling_calls) == 1
+    normalization = next(event for event in events if event["phase"] == "review_normalized")
+    assert normalization["raw_review"] == rejection
+    assert normalization["review"] == {"approved": False, "topic": "science", "issues": [issue]}
+    feedback = translator.prompts[1]["repair_feedback"]
+    assert feedback["review_approved"] is False and feedback["review_issues"] == [issue]
+    assert feedback["spelling_matches"] == [typo]
+    assert translator.prompts[2]["repair_feedback"] == feedback
+    assert sum(event["phase"] == "candidate_repeated" for event in events) == 2
+    assert not any(event["phase"] in {"review_invalid", "accepted"} for event in events)
+
+
+def test_new_translation_after_object_rejection_requires_its_own_independent_review():
+    rejected = {**TRANSLATION, "body": TRANSLATION["body"].replace("изучили свет", "изучили и интересовались светом")}
+    issue = "У согласованных глаголов разные требования к дополнению; исправьте управление."
+    translator = Model(rejected, TRANSLATION)
+    reviewer = Model({"approved": False, "topic": "science", "issues": [{"issue": issue}]}, APPROVAL)
+    check = quality(translator, reviewer)
+    try:
+        result = check.prepare(TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+    assert len(translator.prompts) == len(reviewer.prompts) == 2
+    assert translator.prompts[1]["repair_feedback"]["review_issues"] == [issue]
+    assert translator.prompts[1]["repair_feedback"]["review_approved"] is False
+    assert reviewer.prompts[0]["translation_untrusted"] != reviewer.prompts[1]["translation_untrusted"]
+    assert reviewer.prompts[1]["translation_untrusted"] == result["translation"]
+
+
+@pytest.mark.parametrize("approved", [False, True])
+def test_exact_candidate_object_findings_are_rejected_after_spelling_without_translator(approved):
+    issue = "В переводе изменено исходное утверждение."
+    translator = Model("Must not run")
+    reviewer = Model({"approved": approved, "topic": "science", "issues": [{"issue": issue}]}, APPROVAL)
+    events = []
+    check = quality(translator, reviewer, trace=events.append)
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.check_candidate(TRANSLATION["title"], TRANSLATION["body"], TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+    assert not translator.prompts and len(reviewer.prompts) == 1
+    assert any(event["phase"] == "spelling_returned" for event in events)
+    assert events[-1]["feedback"]["review_approved"] is approved
+    assert events[-1]["feedback"]["review_issues"] == [issue]
+
+
+@pytest.mark.parametrize("issues", [
+    [{"issue": "Ошибка", "fix": "Подмена"}], [{"message": "Ошибка"}],
+    [{"issue": []}], [{"issue": ""}], [{"issue": True}], [["Ошибка"]],
+    [{"issue": "Ошибка"}] * 4, [{"issue": "x" * 1025}],
+])
+def test_unknown_or_oversized_issue_shapes_never_become_empty_approved_findings(issues):
+    translator, reviewer = Model(TRANSLATION), Model({**APPROVAL, "issues": issues})
+    events = []
+    check = quality(translator, reviewer, trace=events.append)
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.check_candidate(TRANSLATION["title"], TRANSLATION["body"], TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+    assert not translator.prompts and len(reviewer.prompts) == 1
+    assert any(event["phase"] == "review_invalid" for event in events)
+    assert not any(event["phase"] == "accepted" for event in events)
+
+
+def test_unrecognized_negative_review_cannot_be_replaced_by_another_verdict_for_same_text():
+    rejection = {"approved": False, "topic": "science", "issues": [{"message": "Ошибка смысла"}]}
+    translator, reviewer = Model(TRANSLATION), Model(rejection, APPROVAL)
+    check = quality(translator, reviewer)
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_QUALITY_REJECTED"):
+            check.prepare(TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+    assert len(translator.prompts) == 3 and len(reviewer.prompts) == 1
+    assert translator.prompts[1]["repair_feedback"]["review_untrusted"] == rejection
+
+
+def test_trace_failure_during_issue_normalization_fails_closed_before_spelling():
+    def unavailable_trace(event):
+        if event["phase"] == "review_normalized":
+            raise OSError("Private trace cannot be written")
+
+    reviewer = Model({"approved": False, "topic": "science", "issues": [{"issue": "Ошибка"}]})
+    check = quality(reviewer=reviewer, trace=unavailable_trace)
+    try:
+        with pytest.raises(AgentError, match="ARTICLE_TRACE_FAILED"):
+            check.check_candidate(TRANSLATION["title"], TRANSLATION["body"], TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+
+
+def test_article_prompts_reach_native_opencode_sessions_without_generic_editor_schema(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from max_postiz_agent.adapters import OpenCode
+
+    for key in ("ARTICLE_TEST_OC_MODEL", "ARTICLE_TEST_OC_SECRET"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("ARTICLE_TEST_OC_BASE", "http://127.0.0.1:4108")
+    sessions, generated = {}, []
+
+    def native(request):
+        if request.method == "POST" and request.url.path == "/api/session":
+            payload = json.loads(request.content)
+            assert payload["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}]
+            ident = "ses_article_" + str(len(sessions) + 1)
+            sessions[ident] = payload["model"]["id"]
+            return httpx.Response(200, json={"data": {"id": ident}})
+        if request.url.path.endswith("/generate"):
+            payload = json.loads(request.content)
+            assert set(payload) == {"prompt"}
+            assert "For this service task use this exact JSON shape" not in payload["prompt"]
+            context = json.loads(payload["prompt"])
+            model = sessions[request.url.path.split("/")[-2]]
+            generated.append((model, context))
+            response = TRANSLATION if model == "qwen35-9b" else APPROVAL
+            return httpx.Response(200, json={"data": {"text": json.dumps(response, ensure_ascii=False)}})
+        return httpx.Response(200, json={})
+
+    def editor(model):
+        options = {"adapter_mode": "live", "base_url_env": "ARTICLE_TEST_OC_BASE",
+                   "model_id_env": "ARTICLE_TEST_OC_MODEL", "auth_secret_env": "ARTICLE_TEST_OC_SECRET",
+                   "model_id": "proxmox/" + model, "task_timeout_seconds": 5,
+                   "generate_transport": "session", "runtime_dir": "data/opencode-runtime"}
+        return OpenCode(SimpleNamespace(root=tmp_path, app={"opencode": options}), httpx.MockTransport(native))
+
+    translator, reviewer = editor("qwen35-9b"), editor("qwen25-coder-7b")
+    check = quality(translator, reviewer)
+    try:
+        result = check.prepare(TITLE, ORIGINAL, URL)
+    finally:
+        check.close()
+        translator.client.close()
+        reviewer.client.close()
+    assert [model for model, _ in generated] == ["qwen35-9b", "qwen25-coder-7b"]
+    assert generated[0][1]["numeric_tokens_must_match_exactly"] == ["3"]
+    assert generated[1][1]["translation_untrusted"] == result["translation"]
+    assert '"issues":["' in generated[1][1]["instruction"]

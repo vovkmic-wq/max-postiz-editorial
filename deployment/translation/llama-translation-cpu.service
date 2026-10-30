@@ -1,0 +1,33 @@
+[Unit]
+Description=Dedicated MAX/Postiz translation model on CPU
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/translation-lab
+EnvironmentFile=/etc/default/llama-translation
+Environment=TRANSLATION_EXTRA_ARGS=
+# CPU-only: the existing independent reviewer retains the K2200.
+Environment=CUDA_VISIBLE_DEVICES=-1
+ExecStart=/opt/llama.cpp/build-cuda-k2200/bin/llama-server --model ${TRANSLATION_MODEL_PATH} --alias ${TRANSLATION_MODEL_ID} --host 10.20.30.143 --port 8089 --device none --n-gpu-layers 0 --ctx-size 4096 --threads 4 --threads-batch 4 --batch-size 128 --ubatch-size 128 --parallel 1 --sleep-idle-seconds 15 --jinja $TRANSLATION_EXTRA_ARGS
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+TimeoutStopSec=30
+MemoryMax=9G
+CPUQuota=400%
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+CapabilityBoundingSet=
+IPAddressDeny=any
+IPAddressAllow=127.0.0.0/8
+IPAddressAllow=10.20.30.45/32
+IPAddressAllow=10.20.30.143/32
+
+[Install]
+WantedBy=multi-user.target

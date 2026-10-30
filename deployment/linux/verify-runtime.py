@@ -6,11 +6,13 @@ from pathlib import Path
 import httpx
 from sqlalchemy import text
 
+from legacy_guard import refuse_legacy
 from max_postiz_agent.cli import load_env
 from max_postiz_agent.config import Settings
 from max_postiz_agent.db import Database
 
 root = Path('/opt/max-postiz')
+refuse_legacy(root)
 load_env(root)
 db = Database(Settings.load(root))
 with db.engine.connect() as conn:

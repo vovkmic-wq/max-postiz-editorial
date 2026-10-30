@@ -1,0 +1,22 @@
+[Unit]
+Description=MAX/Postiz private MADLAD connection
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=editorial
+Group=editorial
+ExecStart=/usr/bin/socat TCP-LISTEN:18099,bind=127.0.0.1,reuseaddr,fork EXEC:/opt/max-postiz/deployment/linux/madlad-ssh-stdio.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

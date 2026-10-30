@@ -1,0 +1,131 @@
+--- a/candle-transformers/src/models/quantized_t5.rs
++++ b/candle-transformers/src/models/quantized_t5.rs
+@@ -256,6 +256,32 @@
+     }
+ }
+ 
++
++// Формула T5Attention._relative_position_bucket из эталонного Transformers.
++// Режим явно зависит от типа слоя, а не от включённого KV cache.
++fn relative_position_bucket(query: u32, key: u32, num_buckets: u32,
++                            max_distance: u32, bidirectional: bool) -> u32 {
++    let mut direction = 0;
++    let mut buckets = num_buckets;
++    let distance = if bidirectional {
++        buckets /= 2;
++        if key > query { direction = buckets; }
++        query.abs_diff(key)
++    } else {
++        query.saturating_sub(key)
++    };
++    let max_exact = buckets / 2;
++    let bucket = if distance < max_exact {
++        distance
++    } else {
++        let logarithmic = ((distance as f32 / max_exact as f32).ln()
++            / (max_distance as f32 / max_exact as f32).ln()
++            * (buckets - max_exact) as f32) as u32;
++        (max_exact + logarithmic).min(buckets - 1)
++    };
++    direction + bucket
++}
++
+ #[derive(Debug, Clone)]
+ struct T5Attention {
+     q: QMatMul,
+@@ -269,6 +295,7 @@
+     relative_attention_max_distance: usize,
+     inner_dim: usize,
+     use_cache: bool,
++    bidirectional: bool,
+     kv_cache: Option<(Tensor, Tensor)>,
+     span: tracing::Span,
+     span_cache: tracing::Span,
+@@ -310,6 +337,7 @@
+             relative_attention_max_distance: cfg.relative_attention_max_distance,
+             inner_dim,
+             use_cache: cfg.use_cache && decoder,
++            bidirectional: !decoder,
+             kv_cache: None,
+             span: tracing::span!(tracing::Level::TRACE, "attention"),
+             span_cache: tracing::span!(tracing::Level::TRACE, "attention-cache"),
+@@ -383,43 +411,20 @@
+             None => match &self.relative_attention_bias {
+                 None => (scores, None),
+                 Some(relative_attention_bias) => {
+-                    // This only handles the bidirectional case.
++                    // Энкодер использует два направления, декодер — только прошлое.
++                    // Смешение режимов меняет learned relative-position buckets T5.
+                     let kv_len = k.dim(2)?;
+                     let (q_start, q_end) = match self.use_cache {
+                         true => ((kv_len - q_len) as u32, kv_len as u32),
+                         false => (0_u32, kv_len as u32),
+                     };
+-                    let num_buckets = self.relative_attention_num_buckets as u32 / 2;
+-                    let max_exact = num_buckets / 2;
+                     let relative_position = (q_start..q_end)
+                         .map(|i| {
+                             (0..kv_len as u32)
+-                                .map(|j| {
+-                                    if i < j {
+-                                        if j - i < max_exact {
+-                                            j - i + num_buckets
+-                                        } else {
+-                                            let b = f32::log(
+-                                                (j - i) as f32 / max_exact as f32,
+-                                                self.relative_attention_max_distance as f32
+-                                                    / max_exact as f32,
+-                                            ) * (num_buckets - max_exact) as f32;
+-                                            u32::min(
+-                                                max_exact + num_buckets + b as u32,
+-                                                self.relative_attention_num_buckets as u32 - 1,
+-                                            )
+-                                        }
+-                                    } else if i - j < max_exact {
+-                                        i - j
+-                                    } else {
+-                                        let b = f32::log(
+-                                            (i - j) as f32 / max_exact as f32,
+-                                            self.relative_attention_max_distance as f32
+-                                                / max_exact as f32,
+-                                        ) * (num_buckets - max_exact) as f32;
+-                                        max_exact + b as u32
+-                                    }
+-                                })
++                                .map(|j| relative_position_bucket(i, j,
++                                    self.relative_attention_num_buckets as u32,
++                                    self.relative_attention_max_distance as u32,
++                                    self.bidirectional))
+                                 .collect::<Vec<u32>>()
+                         })
+                         .collect::<Vec<Vec<_>>>();
+@@ -797,3 +802,29 @@
+         self.decoder.clear_kv_cache();
+     }
+ }
++
++#[cfg(test)]
++mod max_postiz_bucket_contract {
++    use super::relative_position_bucket;
++    #[test]
++    fn decoder_matches_frozen_transformers_reference() {
++        let expected: [u32; 513] = [31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 26, 26, 26, 26, 26, 26, 26, 26, 25, 25, 25, 25, 25, 25, 25, 24, 24, 24, 24, 24, 24, 23, 23, 23, 23, 23, 23, 22, 22, 22, 22, 22, 21, 21, 21, 21, 20, 20, 20, 20, 19, 19, 19, 18, 18, 18, 17, 17, 16, 16, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
++        for (index, value) in expected.into_iter().enumerate() {
++            let relative = index as i32 - 256;
++            assert_eq!(relative_position_bucket(300, (300 + relative) as u32, 32, 128, false), value, "relative={}", relative);
++        }
++    }
++    #[test]
++    fn encoder_matches_frozen_transformers_reference() {
++        let expected: [u32; 513] = [15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11, 11, 11, 11, 10, 10, 10, 10, 10, 10, 10, 9, 9, 9, 9, 8, 8, 8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 17, 18, 19, 20, 21, 22, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 27, 27, 27, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31];
++        for (index, value) in expected.into_iter().enumerate() {
++            let relative = index as i32 - 256;
++            assert_eq!(relative_position_bucket(300, (300 + relative) as u32, 32, 128, true), value, "relative={}", relative);
++        }
++    }
++    #[test]
++    fn decoder_must_not_use_encoder_bucket_at_distance_16() {
++        assert_eq!(relative_position_bucket(16, 0, 32, 128, false), 16);
++        assert_eq!(relative_position_bucket(16, 0, 32, 128, true), 10);
++    }
++}

@@ -4,7 +4,10 @@ import secrets
 from pathlib import Path
 from urllib.parse import quote
 
+from legacy_guard import refuse_legacy
+
 root = Path('/opt/max-postiz')
+refuse_legacy(root)
 origin = 'http://10.20.30.45:4007'
 marker = root / 'data/linux-runtime-configured'
 if marker.exists():

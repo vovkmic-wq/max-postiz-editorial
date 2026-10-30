@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "model": "argos-en-ru-1.9",
+  "engine": "argostranslate",
+  "engine_version": "1.11.0",
+  "package_version": "1.9",
+  "source_lang": "en",
+  "target_lang": "ru",
+  "index_url": "https://raw.githubusercontent.com/argosopentech/argospm-index/main/index.json",
+  "sentence_detector": {
+    "engine": "minisbd",
+    "engine_version": "0.9.5",
+    "filename": "en.onnx",
+    "url": "https://github.com/LibreTranslate/MiniSBD/releases/download/v0.0.1/en.onnx",
+    "size": 188043,
+    "sha256": "6fa9f3a3b201687bd43e329b2b0736789efc97b37883b5b759b31988dca9f353",
+    "checksum_provenance": "Locally computed after download; not a publisher-provided checksum."
+  },
+  "archive": {
+    "filename": "translate-en_ru-1_9.argosmodel",
+    "url": "https://argos-net.com/v1/translate-en_ru-1_9.argosmodel",
+    "size": 195746693,
+    "sha256": "591d743ae103752b88ffc38785c50421320f4eff93c8967e0d3d2e14d4e27811",
+    "checksum_provenance": "Locally computed after download and successful ZIP integrity test; not a publisher-provided checksum."
+  }
+}

@@ -128,14 +128,14 @@ def test_changed_video_is_not_uploaded(project):
         }}, "intent")
 
 
-# Проверяем сценарий: profile or login failure is retriable only before click.
-def test_profile_or_login_failure_is_retriable_only_before_click(project, monkeypatch):
+# Код дочернего процесса без устойчивого доказательства не разрешает замену или повтор.
+def test_profile_or_login_failure_without_proof_stays_unknown(project, monkeypatch):
     publisher = BrowserMax(browser_config(project))
     # Операция failed: данного модуля.
     def failed(*args, **kwargs):
         raise AgentError("BROWSER_LOGIN_OR_CHANNEL_REQUIRED")
     monkeypatch.setattr(publisher, "call", failed)
-    assert publisher.publish("-123", "Тест", request_id="intent").state == "retry_wait"
+    assert publisher.publish("-123", "Тест", request_id="intent").state == "unknown"
     # Операция unknown: данного модуля.
     def unknown(*args, **kwargs):
         raise AgentError("BROWSER_OPERATION_UNCONFIRMED")

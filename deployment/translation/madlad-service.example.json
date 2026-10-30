@@ -1,0 +1,29 @@
+{
+  "schema_version": "madlad-service-v1",
+  "model": "madlad400-3b-q4k-causal-v2",
+  "artifacts": {
+    "worker": {
+      "path": "/srv/dev-disk-by-uuid-8292d473-723d-465f-bb9e-dcd0fb375917/llm-translation/max-postiz-madlad/artifacts/worker",
+      "sha256": "7b3fd9c77e130992a9b233c30b26a0245b9bb4386a5ecc7250f244d90d4e97cd"
+    },
+    "model": {
+      "path": "/srv/dev-disk-by-uuid-8292d473-723d-465f-bb9e-dcd0fb375917/llm-translation/max-postiz-madlad/artifacts/model-q4k.gguf",
+      "sha256": "ea6e5531a3e95213c7f0635988d119e078a655c09306e47851e15d4c0c3f9c37"
+    },
+    "tokenizer": {
+      "path": "/srv/dev-disk-by-uuid-8292d473-723d-465f-bb9e-dcd0fb375917/llm-translation/max-postiz-madlad/artifacts/tokenizer.json",
+      "sha256": "a2799ccc696b752ba00c34f58726bfe253a04921ceb6cfc620400f560474790b"
+    },
+    "config": {
+      "path": "/srv/dev-disk-by-uuid-8292d473-723d-465f-bb9e-dcd0fb375917/llm-translation/max-postiz-madlad/artifacts/config.json",
+      "sha256": "cad399cab799b99409a6ec2d90d72552257c2bb752861261d2016691e0643e7c"
+    }
+  },
+  "state_dir": "/srv/dev-disk-by-uuid-8292d473-723d-465f-bb9e-dcd0fb375917/llm-translation/max-postiz-madlad/data",
+  "resources": {
+    "min_available_mb": 6144,
+    "peer_wait_seconds": 180,
+    "request_timeout_seconds": 570,
+    "poll_seconds": 1
+  }
+}

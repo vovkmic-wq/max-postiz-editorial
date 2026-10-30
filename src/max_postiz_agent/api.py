@@ -34,8 +34,9 @@ from .db import (
 
 
 # Создаём HTTP-приложение, защиту маршрутов и обработчики жизненного цикла.
-def create_app(service, run_worker=False, legacy_image_worker=True):
+def create_app(service, run_worker=False, legacy_image_worker=True, *, worker_tick=None):
     stop = threading.Event()
+    worker_action = service.tick if worker_tick is None else worker_tick
 
     # Обрабатываем очередь, пока сервер не получил сигнал остановки.
     def work():
@@ -47,7 +48,7 @@ def create_app(service, run_worker=False, legacy_image_worker=True):
             try:
                 # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
                 with lock(service.settings.root, "run"):
-                    service.tick()
+                    worker_action()
             # Обрабатываем AgentError и выбираем допустимый исход.
             except AgentError as exc:
                 # Обрабатываем ветвь при условии: exc.code != 'IMAGE_SCHEDULE_BUSY'.

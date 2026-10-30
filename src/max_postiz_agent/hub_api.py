@@ -3,7 +3,7 @@ from pathlib import Path
 
 from fastapi import Depends, File, Header, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
@@ -12,7 +12,7 @@ from .api import create_app
 from .config import AgentError, fingerprint
 from .db import serialize
 from .hub_models import Dispatch, DispatchAttempt, RecurringTask, Target, Variant, VariantRevision
-from .panel_auth import authenticate
+from .panel_auth import COOKIE, authenticate
 
 
 class Input(BaseModel):
@@ -31,6 +31,9 @@ class ApprovalInput(Input):
     revision: int = Field(ge=1)
     content_hash: str = Field(min_length=64, max_length=64)
     due_at: float = Field(ge=0, allow_inf_nan=False)
+    human_review_confirmed: StrictBool = False
+    machine_exception_confirmed: StrictBool = False
+    machine_review_notes: StrictStr = Field(default="", max_length=4000)
 
 
 class PauseInput(Input):
@@ -68,6 +71,8 @@ class BridgePostInput(Input):
 class BridgeMutationInput(Input):
     identifiers: list[str] = Field(max_length=100)
     owner: str | None = Field(default=None, max_length=36)
+    expected_hash: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    expected_post_id: StrictStr | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class BridgeUnlockInput(Input):
@@ -97,8 +102,10 @@ class RedditMailInput(Input):
     enabled: StrictBool
 
 
-def hub_app(service, run_worker=False):
-    app = create_app(service, run_worker=run_worker, legacy_image_worker=False)
+def hub_app(service, run_worker=False, *, dispatch_only=False):
+    worker_action = service.dispatch_tick if dispatch_only else service.tick
+    app = create_app(service, run_worker=run_worker, legacy_image_worker=False, worker_tick=worker_action)
+    app.state.worker_mode = "hourly_dispatch_only" if dispatch_only else "full"
     # The old scheduler creates a base MAX Service and would bypass target approvals.
     app.router.routes = [route for route in app.router.routes
                          if getattr(route, "path", "") != "/api/v1/images/schedule/{action}"]
@@ -199,12 +206,17 @@ def hub_app(service, run_worker=False):
 
     @app.post("/api/max-bridge/mutation/start")
     def bridge_mutation_start(value: BridgeMutationInput, access=Depends(bridge_auth)):
-        return service.bridge.mutation(value.identifiers)
+        if value.owner is not None and (value.expected_hash is not None or value.expected_post_id is not None):
+            raise AgentError("BRIDGE_MUTATION_CAS_INVALID", 409)
+        return service.bridge.mutation(value.identifiers, expected_hash=value.expected_hash,
+                                       expected_post_id=value.expected_post_id)
 
     @app.post("/api/max-bridge/mutation/finish")
     def bridge_mutation_finish(value: BridgeMutationInput, access=Depends(bridge_auth)):
         if not value.owner:
             raise AgentError("BRIDGE_MUTATION_OWNER_REQUIRED")
+        if value.expected_hash is not None or value.expected_post_id is not None:
+            raise AgentError("BRIDGE_MUTATION_CAS_INVALID", 409)
         return service.bridge.mutation(value.identifiers, value.owner)
 
     @app.post("/api/hub/max-bridge/sync")
@@ -234,9 +246,11 @@ def hub_app(service, run_worker=False):
                 variants.append(value)
             return {"targets": [serialize(t) for t in s.scalars(select(Target))], "variants": variants,
                     "role": role,
+                    "worker_mode": app.state.worker_mode, "worker_enabled": bool(run_worker),
                     "tasks": [serialize(t) for t in s.scalars(select(RecurringTask))],
                     "dispatches": [serialize(d) for d in s.scalars(select(Dispatch).order_by(Dispatch.due_at.desc()).limit(200))],
                     "postiz_configured": bool(service.postiz.base and service.postiz.key),
+                    "postiz_public_origin": getattr(service.postiz, "public_origin", ""),
                     "max_bridge": {"enabled": service.bridge.enabled, "error": service.bridge.last_error},
                     "model": service.editor.model, "model_mode": service.editor.mode,
                     "database": service.db.engine.dialect.name}
@@ -259,8 +273,47 @@ def hub_app(service, run_worker=False):
         return service.revise_variant(ident, value.revision, value.body, value.title, value.media, role, value.metadata)
 
     @app.post("/api/hub/variants/{ident}/approve")
-    def approve(ident: str, value: ApprovalInput, role=Depends(editor)):
-        return {"dispatch_id": service.approve_variant(ident, value.revision, value.content_hash, value.due_at, role)}
+    def approve(ident: str, value: ApprovalInput, request: Request,
+                authorization: str | None = Header(default=None), role=Depends(editor)):
+        details = service.hourly_review_details(ident)
+        if details.get("automatic_policy") is True:
+            raise AgentError("ARTICLE_AUTOMATIC_POLICY_REQUIRED", 409)
+        hourly = details.get("hourly_article", False)
+        human_confirmed = False
+        exception = {}
+        if hourly:
+            # An API credential is sufficient for editing, never for attesting a
+            # human review. Only the panel's same-origin signed session may do it.
+            if authorization or not request.cookies.get(COOKIE):
+                raise AgentError("HUMAN_REVIEW_SESSION_REQUIRED", 403)
+            if request.headers.get("origin", "").rstrip("/") != f"{request.url.scheme}://{request.url.netloc}":
+                raise AgentError("AUTH_ORIGIN_FORBIDDEN", 403)
+            if not value.human_review_confirmed:
+                raise AgentError("HUMAN_REVIEW_CONFIRMATION_REQUIRED", 409)
+            human_confirmed = True
+            machine_status = details.get("machine_review_status")
+            if (machine_status not in {"passed", "rejected"}
+                    or details.get("machine_review_current") is not True):
+                raise AgentError("ARTICLE_MACHINE_RECHECK_REQUIRED", 409)
+            if machine_status == "rejected":
+                if details.get("machine_exception_eligible") is not True:
+                    raise AgentError("ARTICLE_MACHINE_RECHECK_REQUIRED", 409)
+                if not value.machine_exception_confirmed or not value.machine_review_notes.strip():
+                    raise AgentError("ARTICLE_MACHINE_EXCEPTION_CONFIRMATION_REQUIRED", 409)
+            elif value.machine_exception_confirmed or value.machine_review_notes.strip():
+                raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOT_ALLOWED", 409)
+            exception = {"machine_exception_confirmed": value.machine_exception_confirmed,
+                         "machine_review_notes": value.machine_review_notes.strip()}
+        return {"dispatch_id": service.approve_variant(ident, value.revision, value.content_hash,
+                    value.due_at, role, human_confirmed=human_confirmed, **exception)}
+
+    @app.get("/api/hub/variants/{ident}/article-review")
+    def article_review(ident: str, role=Depends(auth)):
+        return service.hourly_review_details(ident)
+
+    @app.post("/api/hub/variants/{ident}/recheck-article")
+    def recheck_article(ident: str, value: OriginalInput, role=Depends(editor)):
+        return service.recheck_hourly_variant(ident, value.revision, value.content_hash)
 
     @app.post("/api/hub/variants/{ident}/adapt")
     def adapt(ident: str, role=Depends(editor)):
@@ -343,7 +396,7 @@ def hub_app(service, run_worker=False):
 
     @app.post("/api/hub/tick")
     def tick(role=Depends(owner)):
-        return {"published": service.tick()}
+        return {"published": worker_action()}
 
     @app.post("/api/hub/sources/{ident}/resume")
     def resume_source(ident: str, role=Depends(owner)):
