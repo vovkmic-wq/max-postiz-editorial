@@ -4,6 +4,8 @@
 import argparse
 import hashlib
 import json
+import math
+import os
 import re
 import shutil
 import sys
@@ -13,11 +15,14 @@ from urllib.parse import urlsplit
 
 from .article_attribution import illustrated_presentation
 from .browser_runtime import COMPOSER, ensure_channel, matching_posts, session
-from .config import AgentError, Settings, fingerprint, inside
+from .config import AgentError, Settings, fingerprint, inside, parse_json
 
 ILLUSTRATED_CONTRACT = "article-illustrated-v1"
 _PRESENTATION_FIELDS = ("presentation_contract", "illustration_proof_hash", "illustration_dimensions",
                         "title_text", "title_format")
+PRECLICK_CONTRACT = "browser-preclick-failure-v1"
+_PRECLICK_PHASES = {"session", "channel", "composer", "attachment_snapshot", "attachment_upload",
+                    "composer_fill", "composer_ready", "title_format", "authorization", "send_intent"}
 
 
 class _MatchedPosts:
@@ -131,6 +136,7 @@ def authorize_dispatch(settings, db, payload):
             # Repeat the authoritative Postiz check immediately before the browser click.
             core.bridge.guard_send(dispatch, target)
             _bind_presentation(settings, payload, dispatch.snapshot)
+            payload["dispatch_snapshot_hash"] = fingerprint(dispatch.snapshot)
             return True
         finally:
             core.close()
@@ -151,6 +157,7 @@ def authorize(settings, payload):
             return
         for field in _PRESENTATION_FIELDS:
             payload.pop(field, None)
+        payload.pop("dispatch_snapshot_hash", None)
         # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
         with db.session() as session_db:
             intent = session_db.get(Intent, payload["request_id"])
@@ -187,10 +194,146 @@ def authorize(settings, payload):
 
 
 # Сохраняем журнал операции перед следующим внешним действием.
-def save(path, data):
+def save(path, data, *, exclusive=False):
+    """Сбрасываем файл и каталог на диск до следующего внешнего действия."""
     temporary = path.with_suffix(".new")
-    temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    # Оставшийся частичный файл означает прерванную запись и не считается доказательством.
+    with temporary.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(data, ensure_ascii=False))
+        stream.flush()
+        os.fsync(stream.fileno())
+    if os.name == "nt":
+        import ctypes
+
+        # Windows не даёт fsync каталога через os.open; используем переименование со сбросом на диск.
+        flags = 0x8 | (0 if exclusive else 0x1)  # MOVEFILE_WRITE_THROUGH / REPLACE_EXISTING
+        if not ctypes.windll.kernel32.MoveFileExW(str(temporary), str(path), flags):
+            raise ctypes.WinError()
+    else:
+        if exclusive:
+            os.link(temporary, path)
+            temporary.unlink()
+        else:
+            temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+def _base_payload(settings, request_id, chat_id, text, attachment):
+    return {"action": "publish", "config_hash": settings.hash, "request_id": request_id,
+            "chat_id": chat_id, "text": text, "attachment": attachment}
+
+
+def _request_record(settings, payload):
+    base = _base_payload(settings, payload["request_id"], payload["chat_id"],
+                         payload["text"], payload.get("attachment"))
+    return {"request_id": payload["request_id"], "chat_id": payload["chat_id"],
+            "config_hash": settings.hash, "base_payload": base, "base_payload_hash": fingerprint(base),
+            "request_payload": json.loads(json.dumps(payload)), "content_hash": fingerprint(payload),
+            "body_sha256": hashlib.sha256(payload["text"].encode("utf-8")).hexdigest(),
+            "request_attachment": payload.get("attachment"),
+            "presentation": {field: payload[field] for field in _PRESENTATION_FIELDS if field in payload},
+            "snapshot_hash": payload.get("dispatch_snapshot_hash")}
+
+
+def _snapshot_request(settings, request_id, snapshot, chat_id):
+    if (snapshot.get("platform") != "max" or snapshot.get("route") != "max_browser"
+            or snapshot.get("destination") != chat_id or snapshot.get("config_hash") != settings.hash):
+        raise AgentError("BROWSER_PRECLICK_PROOF_INVALID")
+    media = snapshot["media"]
+    if not isinstance(media, list) or len(media) > 1:
+        raise AgentError("BROWSER_PRECLICK_PROOF_INVALID")
+    attachment = None
+    if media:
+        kind = {"video/mp4": "browser-video", "image/png": "browser-image",
+                "image/jpeg": "browser-image"}.get(media[0]["mime"])
+        if not kind:
+            raise AgentError("BROWSER_PRECLICK_PROOF_INVALID")
+        attachment = {"type": kind, "payload": {"path": media[0]["path"], "sha256": media[0]["sha256"]}}
+    expected = _base_payload(settings, request_id, chat_id, snapshot["body"], attachment)
+    metadata = snapshot.get("metadata", {})
+    contract = metadata.get("presentation_contract")
+    presentation = {}
+    if contract is not None:
+        illustration = metadata.get("illustration")
+        if (not illustrated_presentation(contract) or not isinstance(illustration, dict)
+                or illustration.get("contract") != contract
+                or metadata.get("illustration_proof_hash") != fingerprint(illustration)
+                or not media or attachment["type"] != "browser-image"):
+            raise AgentError("BROWSER_PRECLICK_PROOF_INVALID")
+        presentation = {"presentation_contract": contract,
+            "illustration_proof_hash": metadata["illustration_proof_hash"],
+            "illustration_dimensions": [illustration["width"], illustration["height"]],
+            "title_text": snapshot["title"], "title_format": "bold"}
+    return expected, presentation
+
+
+def read_preclick_failure(settings, request_id, *, snapshot=None, chat_id=None, text=None, attachment=None):
+    """Только читаем: завершённый точный журнал доказывает, что отправка ещё не начиналась."""
+    try:
+        if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id):
+            raise ValueError("request")
+        relative = "data/browser-publications/" + request_id + ".json"
+        journal = settings.root / relative
+        if journal.is_symlink() or not journal.is_file() or journal.stat().st_size > 8_388_608:
+            raise ValueError("journal file")
+        path = inside(settings.root, relative)
+        if path.with_suffix(".new").exists():
+            raise ValueError("interrupted write")
+        raw = path.read_bytes()
+        proof = parse_json(raw.decode("utf-8"))
+        if (proof.get("contract") != PRECLICK_CONTRACT or proof.get("state") != "preclick_failed"
+                or proof.get("send_started") is not False or proof.get("request_id") != request_id
+                or proof.get("config_hash") != settings.hash or proof.get("phase") not in _PRECLICK_PHASES
+                or not isinstance(proof.get("error"), dict)
+                or not isinstance(proof["error"].get("code"), str) or not proof["error"]["code"]
+                or not isinstance(proof["error"].get("message"), str)
+                or not isinstance(proof["error"].get("type"), str)
+                or type(proof.get("failed_at")) not in {int, float} or not math.isfinite(proof["failed_at"])
+                or any(proof.get(field) is not None for field in
+                       ("delivery", "external_id", "permalink", "receipt", "clicked_at", "sent_at", "confirmed_at"))):
+            raise ValueError("terminal record")
+        if snapshot is not None:
+            if chat_id is None:
+                chat_id = snapshot["destination"]
+            expected, presentation = _snapshot_request(settings, request_id, snapshot, chat_id)
+            if (proof.get("snapshot_hash") != fingerprint(snapshot)
+                    or proof.get("presentation") != presentation):
+                raise ValueError("snapshot")
+        else:
+            if chat_id is None or not isinstance(text, str):
+                raise ValueError("expected request")
+            expected = _base_payload(settings, request_id, chat_id, text, attachment)
+        payload = proof["request_payload"]
+        allowed = {"action", "config_hash", "request_id", "chat_id", "text", "attachment",
+                   "dispatch_snapshot_hash", *_PRESENTATION_FIELDS}
+        if (not isinstance(payload, dict) or set(payload) - allowed
+                or proof.get("chat_id") != chat_id or proof.get("base_payload") != expected
+                or proof.get("base_payload_hash") != fingerprint(expected)
+                or proof.get("body_sha256") != hashlib.sha256(expected["text"].encode("utf-8")).hexdigest()
+                or proof.get("request_attachment") != expected["attachment"]
+                or proof.get("content_hash") != fingerprint(payload)
+                or any(payload.get(field) != value for field, value in expected.items()
+                       if field not in {"action", "config_hash"})
+                or payload.get("config_hash", settings.hash) != settings.hash
+                or payload.get("action", "publish") != "publish"
+                or proof.get("snapshot_hash") != payload.get("dispatch_snapshot_hash")
+                or proof.get("presentation") != {field: payload[field] for field in _PRESENTATION_FIELDS if field in payload}):
+            raise ValueError("request binding")
+        return {"proof": proof, "sha256": hashlib.sha256(raw).hexdigest()}
+    except (AgentError, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise AgentError("BROWSER_PRECLICK_PROOF_INVALID") from exc
+
+
+def _preclick_result(settings, payload):
+    proof = read_preclick_failure(settings, payload["request_id"], chat_id=payload["chat_id"],
+        text=payload["text"], attachment=payload.get("attachment"))
+    if proof["proof"]["content_hash"] != fingerprint(payload):
+        raise AgentError("BROWSER_INTENT_CONTENT_CHANGED")
+    return {"state": "preclick_failed", "proof_sha256": proof["sha256"]}
 
 
 # Строим путь журнала по проверенному идентификатору попытки.
@@ -402,11 +545,48 @@ def _text_formatting_proof(element, title, text):
     }""", {"title": title, "text": text})
 
 
+def _wait_composer_text(page, composer, text, *, timeout_seconds=5):
+    """Ждём точный доступный текст на последовательных перерисовках, ничего не меняя."""
+    deadline = time.monotonic() + timeout_seconds
+    exact_observations = 0
+    while time.monotonic() < deadline:
+        ready = composer.evaluate("element => element.isConnected && element.isContentEditable && !element.closest('[aria-busy=true]')")
+        exact_observations = exact_observations + 1 if ready and composer.inner_text() == text else 0
+        if exact_observations >= 2:
+            return
+        page.wait_for_timeout(100)
+    raise AgentError("BROWSER_COMPOSER_TEXT_NOT_READY")
+
+
+def _wait_composer_ready(page, composer, text, *, timeout_seconds=30):
+    """Ждём завершение загрузки и готовность точного текста, не отправляем и не меняем его."""
+    send = page.get_by_role("button", name="Отправить сообщение", exact=True)
+    send.wait_for(state="visible", timeout=timeout_seconds * 1000)
+    deadline = time.monotonic() + timeout_seconds
+    pending_upload = page.get_by_role("button", name="Отменить загрузку", exact=True)
+    while (not send.is_enabled() or pending_upload.count()) and time.monotonic() < deadline:
+        page.wait_for_timeout(200)
+    if not send.is_enabled() or pending_upload.count():
+        raise AgentError("BROWSER_ATTACHMENT_NOT_READY")
+    _wait_composer_text(page, composer, text)
+    return send
+
+
+def _wait_title_proof(page, composer, title, text, *, require_bold=True, timeout_seconds=5):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        proof = _text_formatting_proof(composer, title, text)
+        if (composer.inner_text() == text and proof.get("body_unbold") is True
+                and (not require_bold or proof.get("title_bold") is True)):
+            return proof
+        page.wait_for_timeout(100)
+    raise AgentError("BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE")
+
+
 def _bold_title(page, composer, title, text):
     """Выделяем весь логический заголовок и применяем один нативный Ctrl+B."""
-    if composer.inner_text() != text:
-        raise AgentError("BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE")
-    before = _text_formatting_proof(composer, title, text)
+    _wait_composer_text(page, composer, text)
+    before = _wait_title_proof(page, composer, title, text, require_bold=False)
     if before.get("title_bold") and before.get("body_unbold"):
         return before
     if not before.get("body_unbold"):
@@ -431,11 +611,7 @@ def _bold_title(page, composer, title, text):
         raise AgentError("BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE")
     page.keyboard.press("Control+b")
     page.keyboard.press("ArrowRight")
-    proof = _text_formatting_proof(composer, title, text)
-    if (composer.inner_text() != text or proof.get("title_bold") is not True
-            or proof.get("body_unbold") is not True):
-        raise AgentError("BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE")
-    return proof
+    return _wait_title_proof(page, composer, title, text)
 
 
 def _loaded_receipt(page, state):
@@ -478,6 +654,9 @@ def reconcile(settings, chat_id, request_id):
     # Обрабатываем ветвь при условии: state.get('state') == 'confirmed'.
     if state.get("state") == "confirmed":
         return state["delivery"]
+    if state.get("state") in {"preparing", "preclick_failed"}:
+        # Журналы новой подготовки или отказа до нажатия не подтверждают доставку.
+        return {"state": "unknown"}
     # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
     with session(settings) as page:
         ensure_channel(page, settings, chat_id)
@@ -522,10 +701,48 @@ def publish(settings, payload, *, authorize_before_click=None):
         # Обрабатываем ветвь при условии: state['content_hash'] != content_hash.
         if state["content_hash"] != content_hash:
             raise AgentError("BROWSER_INTENT_CONTENT_CHANGED")
+        if state.get("state") == "preclick_failed":
+            return _preclick_result(settings, payload)
         return state["delivery"] if state.get("state") == "confirmed" else {"state": "unknown"}
-    # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
+    if path.with_suffix(".new").exists():
+        return {"state": "unknown"}
+    state = {**_request_record(settings, payload), "contract": "browser-send-journal-v1",
+             "state": "preparing", "send_started": False, "phase": "session", "started_at": time.time()}
+    try:
+        save(path, state, exclusive=True)
+    except OSError:
+        # Запрос уже занят другим процессом или частичным журналом; повторно браузер не открываем.
+        return {"state": "unknown"}
+    try:
+        return _perform_publish(settings, payload, path, state,
+                                authorize_before_click=authorize_before_click)
+    except Exception as exc:
+        if state["send_started"]:
+            return {"state": "unknown"}
+        try:
+            # Только наш полный журнал подготовки может подтвердить отказ до нажатия отправки.
+            saved = parse_json(path.read_text(encoding="utf-8"))
+            if (saved.get("state") != "preparing" or saved.get("send_started") is not False
+                    or saved.get("content_hash") != content_hash
+                    or saved.get("started_at") != state["started_at"]):
+                return {"state": "unknown"}
+            state.update(contract=PRECLICK_CONTRACT, state="preclick_failed", failed_at=time.time(),
+                error={"code": exc.code if isinstance(exc, AgentError) else "BROWSER_OPERATION_FAILED",
+                       "type": type(exc).__name__, "message": str(exc)})
+            save(path, state)
+            return _preclick_result(settings, payload)
+        except Exception:
+            # Потерянная или частичная запись не доказывает отсутствие внешнего действия.
+            return {"state": "unknown"}
+
+
+def _perform_publish(settings, payload, path, state, *, authorize_before_click):
+    request_id, chat_id, text = payload["request_id"], payload["chat_id"], payload["text"]
+    illustrated = illustrated_presentation(payload.get("presentation_contract"))
     with session(settings) as page:
+        state["phase"] = "channel"
         ensure_channel(page, settings, chat_id)
+        state["phase"] = "composer"
         composer = page.locator(COMPOSER)
         # Обрабатываем ветвь при условии: composer.inner_text().strip().
         if composer.inner_text().strip():
@@ -535,36 +752,46 @@ def publish(settings, payload, *, authorize_before_click=None):
         if page.get_by_role("button", name="Отменить загрузку", exact=True).count():
             raise AgentError("BROWSER_COMPOSER_NOT_EMPTY")
         before = _matched_posts(page, text, illustrated=illustrated).count()
+        state["phase"] = "attachment_snapshot"
         upload = snapshot_attachment(settings, payload.get("attachment"), request_id)
         if illustrated and _image_dimensions(upload) != payload["illustration_dimensions"]:
             raise AgentError("BROWSER_ARTICLE_IMAGE_QUALITY_INVALID")
         # Обрабатываем ветвь при условии: upload.
         if upload:
+            state["phase"] = "attachment_upload"
             page.get_by_role("button", name="Загрузить файл", exact=True).click()
             # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
             with page.expect_file_chooser() as chooser:
                 page.get_by_text("Фото или видео", exact=True).click()
             chooser.value.set_files(str(upload))
+        state["phase"] = "composer_fill"
         composer.fill(text)
+        state["phase"] = "composer_ready"
+        send = _wait_composer_ready(page, composer, text)
+        state["phase"] = "title_format"
         title_proof = _bold_title(page, composer, payload["title_text"], text) if illustrated else None
-        send = page.get_by_role("button", name="Отправить сообщение", exact=True)
-        send.wait_for(state="visible")
-        upload_deadline = time.monotonic() + 30
-        # Продолжаем цикл, пока выполняется условие: not send.is_enabled() and time.monotonic() < upload_deadline.
-        while not send.is_enabled() and time.monotonic() < upload_deadline:
-            page.wait_for_timeout(200)
-        # Обрабатываем ветвь при условии: not send.is_enabled().
-        if not send.is_enabled():
-            raise AgentError("BROWSER_ATTACHMENT_NOT_READY")
+        state["phase"] = "authorization"
         ensure_channel(page, settings, chat_id, navigate=False)
         # Обрабатываем ветвь при условии: authorize_before_click.
         if authorize_before_click:
             authorize_before_click()
-        state = {"state": "sending", "request_id": request_id, "chat_id": chat_id,
-                 "text": text, "attachment": bool(upload),
-                 "attachment_type": payload.get("attachment", {}).get("type") if upload else None,
-                 "before_count": before,
-                 "content_hash": content_hash, "started_at": time.time()}
+        if fingerprint(payload) != state["content_hash"]:
+            raise AgentError("BROWSER_INTENT_CONTENT_CHANGED")
+        # После авторизации ещё раз проверяем точный текст и форматирование до фиксации отправки.
+        _wait_composer_text(page, composer, text)
+        if illustrated:
+            title_proof = _wait_title_proof(page, composer, payload["title_text"], text)
+        if not send.is_enabled() or page.get_by_role("button", name="Отменить загрузку", exact=True).count():
+            raise AgentError("BROWSER_ATTACHMENT_NOT_READY")
+        saved = parse_json(path.read_text(encoding="utf-8"))
+        if (saved.get("state") != "preparing" or saved.get("send_started") is not False
+                or saved.get("content_hash") != state["content_hash"]
+                or saved.get("started_at") != state["started_at"]):
+            raise AgentError("BROWSER_JOURNAL_OWNERSHIP_LOST")
+        state.update(state="sending", send_started=True, phase="send_intent",
+                     text=text, attachment=bool(upload),
+                     attachment_type=payload.get("attachment", {}).get("type") if upload else None,
+                     before_count=before)
         if illustrated:
             state.update({field: payload[field] for field in _PRESENTATION_FIELDS})
             state["illustration_image_sha256"] = payload["attachment"]["payload"]["sha256"]
@@ -573,7 +800,9 @@ def publish(settings, payload, *, authorize_before_click=None):
         save(path, state)
         # Выполняем операцию с отдельной обработкой возможных ошибок.
         try:
+            state["phase"] = "send_click"
             send.click()
+            state["phase"] = "receipt_observation"
             deadline = time.monotonic() + settings.app["max"]["browser"].get("operation_timeout_seconds", 120)
             # Продолжаем цикл, пока выполняется условие: time.monotonic() < deadline.
             while time.monotonic() < deadline:
@@ -586,6 +815,7 @@ def publish(settings, payload, *, authorize_before_click=None):
                     if _matched_posts(page, text, illustrated=illustrated).count() != before + 1:
                         continue
                     page.screenshot(path=str(path.with_suffix(".before-reload.png")))
+                    state["phase"] = "receipt_reload"
                     page.reload(wait_until="domcontentloaded")
                     ensure_channel(page, settings, chat_id, navigate=False)
                     found = _loaded_receipt(page, state)
@@ -599,8 +829,10 @@ def publish(settings, payload, *, authorize_before_click=None):
                     break
                 page.wait_for_timeout(500)
         # Обрабатываем Exception и выбираем допустимый исход.
-        except Exception:
+        except Exception as exc:
             state["error"] = "BROWSER_SEND_UNCONFIRMED"
+            state["error_detail"] = {"code": exc.code if isinstance(exc, AgentError) else "BROWSER_OPERATION_FAILED",
+                                     "type": type(exc).__name__, "message": str(exc)}
         # Обрабатываем ветвь при условии: not state.get('error').
         if not state.get("error"):
             state["error"] = "BROWSER_POST_NOT_OBSERVED"

@@ -75,6 +75,21 @@ class ReserveServerCycle(ServerCycle):
             self.reserve.update(slot["id"], "published", token=slot["token"],
                 dispatch_id=result["dispatch_id"])
             return self._observed_phase("published", record, result)
+        if result.get("state") == "failed" and result.get("error") == "BROWSER_PRECLICK_FAILED":
+            # Только новый durable proof допускает отдельное закрытие без send.
+            # Старые failed/unknown и отказы без журнала остаются заблокированы.
+            revision = self.state.read()["revision"]
+            remote = self.core.postiz.get_post(result.get("postiz_id") or record.get("postiz_id"))
+            try:
+                self.reserve.release_preclick_failed_no_send(slot["id"], token=slot["token"],
+                    remote=remote, expected_revision=revision)
+            except AgentError as exc:
+                if exc.code != "ARTICLE_RESERVE_PRECLICK_NOT_SAFE":
+                    raise
+                return self._phase("blocked", record_id=record["id"],
+                    last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
+            return self._phase("reconciling", record_id=record["id"], slot_id=slot["id"],
+                slot_state="missed", last_error=None)
         if result.get("state") == "cancelled":
             # ERROR до единственной попытки MAX — известная отмена, а не
             # неизвестная доставка. Свежий GET и текущий fence позволяют

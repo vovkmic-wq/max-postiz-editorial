@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from .adapters import Delivery
+from .browser_worker import read_preclick_failure
 from .config import AgentError, fingerprint, inside
 
 
@@ -77,16 +78,20 @@ class BrowserMax:
         try:
             value = self.call("publish", chat_id=chat_id, text=text,
                               attachment=attachment, request_id=request_id)
-            return Delivery(value["state"], value.get("external_id"), value.get("permalink"))
-        # Обрабатываем AgentError и выбираем допустимый исход.
-        except AgentError as exc:
-            # Only known pre-click failures can wait and retry; transport failures stay unknown.
-            # Обрабатываем ветвь при условии: exc.code in {'BROWSER_PROFILE_BUSY', 'BROWSER_LOGIN_OR_CHANNEL_REQUIRED', 'BROWSER_COMPOSER_NOT_EMPTY', 'BR….
-            if exc.code in {"BROWSER_PROFILE_BUSY", "BROWSER_LOGIN_OR_CHANNEL_REQUIRED",
-                            "BROWSER_COMPOSER_NOT_EMPTY", "BROWSER_ATTACHMENT_NOT_READY",
-                            "BROWSER_START_FAILED", "BROWSER_DEPENDENCY_REQUIRED"}:
-                return Delivery("retry_wait", retry_after=60)
+        except AgentError:
+            # Сам по себе код ошибки не доказывает, было ли внешнее нажатие отправки.
             return Delivery("unknown")
+        if value.get("state") == "preclick_failed":
+            try:
+                proof = read_preclick_failure(self.settings, request_id, chat_id=chat_id,
+                    text=text, attachment=attachment)
+                if value.get("proof_sha256") != proof["sha256"]:
+                    return Delivery("unknown")
+            except AgentError:
+                return Delivery("unknown")
+            # Hub сохраняет завершённый отказ; это не поручение повторить отправку.
+            raise AgentError("BROWSER_PRECLICK_FAILED")
+        return Delivery(value["state"], value.get("external_id"), value.get("permalink"))
 
     # Сверяем сохранённую попытку без повторного нажатия отправки.
     def reconcile(self, chat_id, request_id):

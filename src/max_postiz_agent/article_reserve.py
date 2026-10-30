@@ -816,6 +816,180 @@ class ArticleReserveStore:
                 dispatch_attempts=0, source_remains_used=True)
             return _slot_view(row)
 
+    def release_preclick_failed_no_send(self, slot_id, *, token, remote, expected_revision):
+        """Закрыть будущий доказанный отказ ДО клика, не повторяя старый источник.
+
+        Единственная failed-попытка и её raw journal остаются в истории. Свежий
+        GET Postiz и проверка bytes выполняются до SQL locks; неизвестный исход
+        или журнал прежнего протокола этим методом не снимаются.
+        """
+        from .article_images import validate_article_image
+        from .browser_publisher import read_preclick_failure
+        from .db import Draft
+        from .max_bridge import MaxBridge
+
+        code = "ARTICLE_RESERVE_PRECLICK_NOT_SAFE"
+
+        def require(value):
+            if not value:
+                raise AgentError(code, 409)
+
+        require(isinstance(remote, dict) and remote.get("state") == "ERROR")
+        body, media, observed_due, remote_hash = MaxBridge.normalize(remote)
+        with self.core.db.session() as probe:
+            assigned = probe.get(PublicationSlot, slot_id)
+            require(assigned is not None and assigned.dispatch_id is not None)
+            previous_record = copy.deepcopy(self._record(probe, assigned.record_id))
+            previous_dispatch = probe.get(Dispatch, assigned.dispatch_id)
+            previous_target = probe.get(Target, assigned.target_id)
+            require(previous_dispatch is not None and previous_target is not None)
+            previous_snapshot = copy.deepcopy(previous_dispatch.snapshot)
+            request_id, destination = previous_dispatch.id, previous_target.destination
+        # Даже текстовый исторический формат должен доказать отсутствие медиа.
+        expected_media = validate_article_image(self.core, previous_record)
+        observed_media = self.core.bridge._media(media, previous_target)
+        require(observed_media == expected_media)
+        try:
+            proof = read_preclick_failure(self.core.settings, request_id,
+                snapshot=previous_snapshot, chat_id=destination)
+        except AgentError as exc:
+            raise AgentError(code, 409) from exc
+        config_hash = self.core.settings.hash
+        require(isinstance(proof, dict) and _hash(proof.get("sha256"))
+            and isinstance(proof.get("proof"), dict) and _stamp(proof["proof"].get("failed_at")))
+        with self.core.db.session.begin() as session:
+            control = self._control(session)
+            if type(expected_revision) is not int or control.revision != expected_revision:
+                raise AgentError("EDITORIAL_REVISION_CONFLICT", 409)
+            candidate = session.get(PublicationSlot, slot_id)
+            require(candidate is not None)
+            identity = (candidate.record_id, candidate.binding.get("variant_id"),
+                        candidate.target_id, candidate.dispatch_id)
+            # Тот же порядок, что у отправителя, approval и native mutation.
+            # Control → Variant → Target → Dispatch → Approval → Bridge → Slot → Ledger.
+            variant = session.scalar(select(Variant).where(Variant.id == identity[1]).with_for_update())
+            target = session.scalar(select(Target).where(Target.id == identity[2]).with_for_update())
+            dispatch = session.scalar(select(Dispatch).where(Dispatch.id == identity[3]).with_for_update())
+            approval = session.scalar(select(TargetApproval).where(
+                TargetApproval.id == dispatch.approval_id).with_for_update()) if dispatch else None
+            links = list(session.scalars(select(BridgePost).where(
+                BridgePost.variant_id == identity[1]).with_for_update()))
+            link = links[0] if len(links) == 1 else None
+            row = session.scalar(select(PublicationSlot).where(PublicationSlot.id == slot_id)
+                .with_for_update().execution_options(populate_existing=True))
+            ledger = session.scalar(select(EditorialLedger).where(
+                EditorialLedger.id == LEDGER_ID).with_for_update())
+            payload = copy.deepcopy(ledger.payload) if ledger else {}
+            records = [r for r in payload.get("records", []) if r.get("id") == identity[0]]
+            record = records[0] if len(records) == 1 else {}
+            require(all(value is not None for value in (row, variant, target, dispatch, approval, link, ledger))
+                and record == previous_record and bool(record))
+            snapshot = dispatch.snapshot
+            metadata = snapshot.get("metadata", {}) if isinstance(snapshot, dict) else {}
+            require(isinstance(snapshot, dict) and isinstance(metadata, dict))
+            draft = session.get(Draft, variant.draft_id)
+            require(
+                row.token == token and row.state in {"pending", "blocked_unknown"}
+                and (row.record_id, row.binding.get("variant_id"), row.target_id, row.dispatch_id) == identity
+                and row.active_target == row.target_id and row.delivered_at is None
+                and _stamp(row.due_at) and row.due_at <= now()
+                and row.binding == {key: record.get(key) for key in _IDENTITY}
+                and record.get("reserve_contract") == RESERVE_CONTRACT and record.get("state") == "failed"
+                and record.get("dispatch_state") == "failed" and record.get("error") == "BROWSER_PRECLICK_FAILED"
+                and record.get("dispatch_id") == dispatch.id == request_id
+                and record.get("variant_id") == variant.id and record.get("target_id") == target.id
+                and record.get("postiz_id") == link.post_id and record.get("due_at") == row.due_at
+                and record.get("published_at") is None and record.get("delivery_verified") is False
+                and not record.get("model_result_unknown") and not record.get("no_send_disposition")
+                and dispatch.variant_id == variant.id and dispatch.state == "failed"
+                and dispatch.error == "BROWSER_PRECLICK_FAILED" and dispatch.attempts == 1
+                and dispatch.owner is None and dispatch.lease_until == 0 and dispatch.verified is False
+                and dispatch.external_id is None and dispatch.permalink is None
+                and dispatch.due_at == row.due_at and dispatch.revision == variant.revision
+                and snapshot == previous_snapshot == self.core.snapshot(variant, target)
+                and dispatch.snapshot_hash == fingerprint({"content": snapshot, "due_at": row.due_at})
+                and snapshot.get("destination") == target.destination == destination
+                and snapshot.get("platform") == "max" and snapshot.get("route") == "max_browser"
+                and self.core.settings.hash == config_hash == variant.config_hash
+                and variant.binding_hash == target.binding_hash
+                and draft is not None and draft.revision == variant.source_revision
+                and draft.config_id == variant.config_hash
+                and approval.variant_id == variant.id and approval.revision == dispatch.revision
+                and approval.revoked is False and approval.actor == "hourly_article_policy"
+                and approval.scheduled_at == row.due_at and approval.snapshot_hash == dispatch.snapshot_hash
+                and metadata.get("origin") == "hourly_article_test" and metadata.get("approval_mode") == "automatic"
+                and metadata.get("record_id") == record["id"] and metadata.get("policy_hash") == record.get("policy_hash")
+                and metadata.get("reserve_contract") == RESERVE_CONTRACT
+                and metadata.get("reserve_binding_hash") == record.get("reserve_binding_hash")
+                and metadata.get("postiz_post_id") == link.post_id and metadata.get("postiz_due_at") == row.due_at
+                and metadata.get("postiz_state") == "QUEUE" and variant.target_id == target.id
+                and target.platform == "max" and target.route == "max_browser" and target.enabled
+                and row.text_hash == record.get("reserve_prepared_hash")
+                and metadata.get("machine_review_evidence_hash") == row.evidence_hash
+                and variant.media == expected_media == observed_media
+                and link.target_id == target.id and link.active and link.error is None
+                and link.remote_state == "ERROR" and link.remote_hash == remote_hash
+                and _stamp(link.due_at) and abs(link.due_at - row.due_at) < .001
+                and link.mutation_owner is None and link.mutation_until == 0
+                and remote.get("id") == link.post_id and body == snapshot.get("body")
+                and _stamp(observed_due) and abs(observed_due - row.due_at) < .001
+                and remote.get("group") == link.group_id
+                and remote.get("integration", {}).get("id") == link.integration_id
+                and target.options.get("postiz_integration_id") == link.integration_id
+                and remote.get("releaseId") in (None, "") and remote.get("releaseURL") in (None, "")
+            )
+            previous_remote = copy.deepcopy(remote)
+            previous_remote["state"] = "QUEUE"
+            require(MaxBridge.normalize(previous_remote)[3] == metadata.get("postiz_hash"))
+            attempts = list(session.scalars(select(DispatchAttempt).where(DispatchAttempt.dispatch_id == dispatch.id)))
+            require(len(attempts) == 1 and attempts[0].result == "failed"
+                and attempts[0].error == "BROWSER_PRECLICK_FAILED"
+                and _stamp(attempts[0].created_at) and row.due_at <= attempts[0].created_at <= now())
+            require(not session.scalar(select(Dispatch).join(Variant).where(
+                    Variant.target_id == target.id, Dispatch.id != dispatch.id,
+                    Dispatch.state.in_(ACTIVE) | Dispatch.owner.is_not(None)
+                    | (Dispatch.lease_until != 0) | Dispatch.lease_until.is_(None)))
+                and not session.scalar(select(Dispatch).where(Dispatch.variant_id == variant.id, Dispatch.id != dispatch.id))
+                and not session.scalar(select(TargetApproval).where(
+                    TargetApproval.variant_id == variant.id, TargetApproval.id != approval.id))
+                and not session.scalar(select(RemoteDraft).join(Variant).where(
+                    Variant.target_id == target.id, RemoteDraft.state.in_({"creating", "unknown"})))
+                and not session.scalar(select(BridgePost).where(BridgePost.target_id == target.id,
+                    BridgePost.mutation_owner.is_not(None) | (BridgePost.mutation_until != 0)
+                    | BridgePost.mutation_until.is_(None)))
+                and not session.scalar(select(PublicationSlot).where(
+                    PublicationSlot.active_target == target.id, PublicationSlot.id != row.id))
+                and not session.scalar(select(EditorialPreparationClaim).where(
+                    EditorialPreparationClaim.active_key.is_not(None))))
+            # Существующий closed claim не восстанавливаем и не освобождаем заново.
+            preparation = self._preparation(session, record.get("reserve_claim"), record["id"], active=False)
+            require(preparation.state == "quality_ready" and preparation.error is None)
+            validate_article_image(self.core, record, variant)
+            # Только локальное чтение: повторная exact SHA-сверка закрывает смену
+            # journal/config/image между медленной внешней проверкой и commit.
+            try:
+                require(read_preclick_failure(self.core.settings, dispatch.id,
+                    snapshot=snapshot, chat_id=target.destination) == proof)
+            except AgentError as exc:
+                raise AgentError(code, 409) from exc
+            stamp = now()
+            disposition = {"contract": "reserve-preclick-no-send-v1", "closed_at": stamp,
+                "dispatch_id": dispatch.id, "attempt_id": attempts[0].id,
+                "variant_id": variant.id, "revision": dispatch.revision, "target_id": target.id,
+                "due_at": row.due_at, "browser_proof_contract": proof["proof"]["contract"],
+                "snapshot_hash": dispatch.snapshot_hash, "browser_proof_sha256": proof["sha256"],
+                "remote_proof_hash": fingerprint(remote), "source_remains_used": True}
+            dispatch.state, approval.revoked, target.paused = "cancelled", True, True
+            # Variant/Draft/machine evidence/raw и исходная failed Attempt неизменны.
+            record.update(state="cancelled", dispatch_state="cancelled", no_send_disposition=disposition)
+            ledger.payload, ledger.revision, ledger.updated_at = payload, ledger.revision + 1, stamp
+            row.state, row.active_target, row.error, row.updated_at = "missed", None, "KNOWN_PRECLICK_NO_SEND", stamp
+            self.core.db.audit(session, "article_reserve", "reserve_preclick_no_send_missed", row.id,
+                record_id=record["id"], postiz_id=link.post_id,
+                previous_revision=row.control_revision, control_revision=control.revision,
+                dispatch_attempts=dispatch.attempts, original_error=dispatch.error, **disposition)
+            return _slot_view(row)
+
     def update(self, slot_id, state, *, token, dispatch_id=None, delivered_at=None, error=None, session=None):
         if state not in _TRANSITIONS or delivered_at is not None and not _stamp(delivered_at):
             raise AgentError("ARTICLE_RESERVE_SLOT_STATE_INVALID", 409)

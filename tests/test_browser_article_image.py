@@ -595,12 +595,95 @@ def test_native_formatting_failure_stops_before_send_and_durable_sending_intent(
     monkeypatch.setattr(browser_worker, "session", opened)
     keys = []
     monkeypatch.setattr(image_page.keyboard, "press", lambda key: keys.append(key))
-    with pytest.raises(AgentError, match="BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE"):
-        browser_worker.publish(illustrated.settings, illustrated.payload)
+    result = browser_worker.publish(illustrated.settings, illustrated.payload)
+    assert result["state"] == "preclick_failed"
     assert keys == ["Control+b", "ArrowRight"]
     assert image_page.get_by_role("listitem").count() == 0
     assert "send" not in image_page.evaluate("events")
-    assert not browser_worker.ledger_path(illustrated.settings, illustrated.payload["request_id"]).exists()
+    proof = browser_worker.read_preclick_failure(illustrated.settings,
+        illustrated.payload["request_id"], chat_id=illustrated.payload["chat_id"],
+        text=illustrated.payload["text"], attachment=illustrated.payload["attachment"])
+    assert proof["sha256"] == result["proof_sha256"]
+    assert proof["proof"]["send_started"] is False
+    assert proof["proof"]["error"]["code"] == "BROWSER_ARTICLE_TITLE_FORMAT_UNAVAILABLE"
+
+
+def test_upload_editor_rerender_finishes_before_single_native_bold_toggle(illustrated, image_page, monkeypatch):
+    image_page.add_init_script("""document.addEventListener('DOMContentLoaded', () => {
+      const input=document.querySelector('input[type=file]'), original=input.onchange;
+      input.onchange=()=>{
+        original(); const send=document.querySelector('[aria-label="Отправить сообщение"]');
+        // MAX может включить отправку до завершения перерисовки редактора после загрузки.
+        send.disabled=false; const cancel=document.createElement('button');
+        cancel.setAttribute('aria-label','Отменить загрузку');document.body.append(cancel);
+        setTimeout(()=>{const editor=document.querySelector('[contenteditable]');
+          for(const node of editor.querySelectorAll('b,strong')) node.replaceWith(...node.childNodes);
+          send.disabled=false;cancel.remove();logEvent('upload-ready');},350);
+      };
+      document.addEventListener('keydown', event=>{if(event.ctrlKey&&event.key.toLowerCase()==='b')logEvent('bold-toggle')});
+    })""")
+
+    @contextmanager
+    def opened(*_args):
+        yield image_page
+
+    monkeypatch.setattr(browser_worker, "session", opened)
+    result = browser_worker.publish(illustrated.settings, illustrated.payload)
+    assert result["state"] == "confirmed"
+    events = image_page.evaluate("events")
+    assert events.index("upload-ready") < events.index("bold-toggle") < events.index("send")
+    assert events.count("bold-toggle") == 1 and events.count("send") == 1
+
+
+def test_native_bold_proof_waits_for_delayed_dom_without_retoggling(image_page):
+    image_page.goto("https://web.max.ru/-123", wait_until="domcontentloaded")
+    composer = image_page.get_by_role("textbox")
+    composer.fill(CAPTION)
+    image_page.evaluate("""() => {
+      window.boldInvocations=0;
+      document.addEventListener('keydown', event=>{
+        if(!event.ctrlKey||event.key.toLowerCase()!=='b')return;
+        event.preventDefault();window.boldInvocations++;
+        const range=window.getSelection().getRangeAt(0).cloneRange();
+        setTimeout(()=>{const selection=window.getSelection();selection.removeAllRanges();
+          selection.addRange(range);document.execCommand('bold');},350);
+      });
+    }""")
+    proof = browser_worker._bold_title(image_page, composer, TITLE, CAPTION)
+    assert proof["title_bold"] is True and proof["body_unbold"] is True
+    assert image_page.evaluate("boldInvocations") == 1
+    assert image_page.get_by_role("listitem").count() == 0
+
+
+def test_send_can_only_begin_after_durable_sending_journal(illustrated, image_page, monkeypatch):
+    @contextmanager
+    def opened(*_args):
+        yield image_page
+
+    calls = []
+    role = image_page.get_by_role
+
+    def get_by_role(role_name, **kwargs):
+        locator = role(role_name, **kwargs)
+        if kwargs.get("name") == "Отправить сообщение":
+            def interrupted_click(*_args, **_kwargs):
+                path = browser_worker.ledger_path(illustrated.settings, illustrated.payload["request_id"])
+                state = json.loads(path.read_text(encoding="utf-8"))
+                assert state["state"] == "sending" and state["send_started"] is True
+                assert not path.with_suffix(".new").exists()
+                calls.append(state)
+                raise RuntimeError("unknown click outcome")
+            monkeypatch.setattr(locator, "click", interrupted_click)
+        return locator
+
+    monkeypatch.setattr(browser_worker, "session", opened)
+    monkeypatch.setattr(image_page, "get_by_role", get_by_role)
+    assert browser_worker.publish(illustrated.settings, illustrated.payload) == {"state": "unknown"}
+    assert len(calls) == 1
+    with pytest.raises(AgentError, match="BROWSER_PRECLICK_PROOF_INVALID"):
+        browser_worker.read_preclick_failure(illustrated.settings, illustrated.payload["request_id"],
+            chat_id=illustrated.payload["chat_id"], text=CAPTION, attachment=illustrated.payload["attachment"])
+    assert image_page.get_by_role("listitem").count() == 0
 
 
 @pytest.mark.parametrize("contract", ["article-illustrated-v1", "article-illustrated-v2"])

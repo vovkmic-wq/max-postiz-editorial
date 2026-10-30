@@ -15,7 +15,7 @@ from sqlalchemy import select, text, update
 
 from .config import AgentError, fingerprint
 from .db import Draft, DraftRevision, Story, now, uid
-from .hub_models import BridgePost, Dispatch, RemoteDraft, Target, Variant
+from .hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Target, TargetApproval, Variant
 
 PROVIDER = "max-browser"
 
@@ -183,6 +183,8 @@ class MaxBridge:
                 if published:
                     link.remote_state = remote["state"]
                     return v.id
+                if self._preclick_error_state(s, link, v, target, remote, body, media, due, remote_hash):
+                    return v.id
                 try:
                     self.core._invalidate(s, v)
                 except AgentError:
@@ -243,6 +245,67 @@ class MaxBridge:
             self.core._history(s, v, target, "postiz_bridge")
             self.core.db.audit(s, "postiz_bridge", "bridge_import", v.id, post_id=link.post_id)
             return v.id
+
+    def _preclick_error_state(self, session, link, variant, target, remote, body, media, due, remote_hash):
+        """Postiz ERROR меняет только состояние при новом exact pre-click proof.
+
+        Обычный импорт меняет revision и отзывает approval. Здесь исходные QA,
+        snapshot и failed Attempt нужны native-закрытию; права на новый send нет.
+        """
+        if remote.get("state") != "ERROR":
+            return False
+        from .browser_publisher import read_preclick_failure
+        from .hub import ACTIVE
+
+        target = session.scalar(select(Target).where(Target.id == target.id).with_for_update())
+        dispatches = list(session.scalars(select(Dispatch).where(
+            Dispatch.variant_id == variant.id).with_for_update()))
+        if len(dispatches) != 1 or target is None:
+            return False
+        dispatch = dispatches[0]
+        approvals = list(session.scalars(select(TargetApproval).where(
+            TargetApproval.variant_id == variant.id).with_for_update()))
+        attempts = list(session.scalars(select(DispatchAttempt).where(DispatchAttempt.dispatch_id == dispatch.id)))
+        snapshot = dispatch.snapshot
+        metadata = snapshot.get("metadata", {}) if isinstance(snapshot, dict) else {}
+        previous_remote = {**remote, "state": "QUEUE"}
+        if (len(approvals) != 1 or len(attempts) != 1 or not isinstance(metadata, dict)
+                or dispatch.state != "failed" or dispatch.error != "BROWSER_PRECLICK_FAILED"
+                or dispatch.attempts != 1 or dispatch.owner is not None or dispatch.lease_until != 0
+                or dispatch.verified or dispatch.external_id is not None or dispatch.permalink is not None
+                or attempts[0].result != "failed" or attempts[0].error != "BROWSER_PRECLICK_FAILED"
+                or approvals[0].id != dispatch.approval_id or approvals[0].revoked
+                or approvals[0].actor != "hourly_article_policy" or approvals[0].revision != dispatch.revision
+                or approvals[0].scheduled_at != dispatch.due_at or approvals[0].snapshot_hash != dispatch.snapshot_hash
+                or snapshot != self.core.snapshot(variant, target)
+                or dispatch.snapshot_hash != fingerprint({"content": snapshot, "due_at": dispatch.due_at})
+                or variant.config_hash != self.core.settings.hash or variant.binding_hash != target.binding_hash
+                or target.platform != "max" or target.route != "max_browser" or not target.enabled
+                or metadata.get("origin") != "hourly_article_test" or metadata.get("approval_mode") != "automatic"
+                or metadata.get("reserve_contract") != "article-reserve-v1"
+                or metadata.get("postiz_state") != "QUEUE"
+                or metadata.get("postiz_hash") != self.normalize(previous_remote)[3]
+                or link.remote_state != "QUEUE" or link.remote_hash != metadata.get("postiz_hash")
+                or body != snapshot.get("body") or media != snapshot.get("media")
+                or abs(due - dispatch.due_at) >= .001 or abs(link.due_at - due) >= .001
+                or link.target_id != target.id or not link.active or link.error is not None
+                or link.mutation_owner is not None or link.mutation_until != 0
+                or remote.get("group") != link.group_id or remote.get("integration", {}).get("id") != link.integration_id
+                or target.options.get("postiz_integration_id") != link.integration_id
+                or remote.get("releaseId") not in (None, "") or remote.get("releaseURL") not in (None, "")
+                or session.scalar(select(Dispatch).join(Variant).where(Variant.target_id == target.id,
+                    Dispatch.id != dispatch.id, Dispatch.state.in_(ACTIVE) | Dispatch.owner.is_not(None)
+                    | (Dispatch.lease_until != 0) | Dispatch.lease_until.is_(None)))):
+            return False
+        try:
+            read_preclick_failure(self.core.settings, dispatch.id, snapshot=snapshot, chat_id=target.destination)
+        except AgentError:
+            return False
+        link.remote_state, link.remote_hash, link.updated_at = "ERROR", remote_hash, now()
+        self.core.db.audit(session, "postiz_bridge", "bridge_preclick_state_only", variant.id,
+            post_id=link.post_id, dispatch_id=dispatch.id, snapshot_hash=dispatch.snapshot_hash,
+            remote_hash=remote_hash, previous_state="QUEUE", state="ERROR")
+        return True
 
     def sync(self, force=False, *, target_id=None):
         if not self.enabled or (not force and now() < self.next_poll):
