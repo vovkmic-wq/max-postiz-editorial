@@ -93,6 +93,7 @@ class OpenCode:
 
     # Запрашиваем текст по заданным редакционным ограничениям.
     def generate_text(self, prompt):
+        self.last_completed_generation = None
         if self.mode == 'live':
             self.refresh_local_access()
         # Обрабатываем ветвь при условии: self.mode != 'live' or not self.base_url.
@@ -127,6 +128,7 @@ class OpenCode:
 
     def _generate_session(self, prompt, model):
         """Сбой удерживает точную сессию: interrupt/delete уничтожали доказательства."""
+        self.last_completed_generation = None
         journal = OpenCodeRequestJournal(self.root, prompt, model)
         stage = "create"
         try:
@@ -162,6 +164,7 @@ class OpenCode:
             if not isinstance(text, str) or not text.strip():
                 raise AgentError("OPENCODE_EMPTY_RESPONSE")
             journal.validated(text)
+            self.last_completed_generation = journal.completed_generation()
         except AgentError as exc:
             journal.failed(exc.code, stage)
             raise
