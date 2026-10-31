@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "max-postiz-agent"
-version = "0.11.9"
+version = "0.11.10"
 description = "Автономная редакция на VM с PostgreSQL, OpenCode и управлением из Postiz"
 requires-python = ">=3.12"
 dependencies = [
@@ -47,3 +47,7 @@ ignore = ["S101", "S603", "S607"]
 "src/max_postiz_agent/api.py" = ["B008"]
 "src/max_postiz_agent/hub_api.py" = ["B008"]
 "tests/*" = ["S105", "S106"]
+
+[tool.max-postiz.check]
+# Остальные 213 файлов требуют отдельной миграции форматирования.
+format-paths = ["scripts/check.py", "tests/test_check.py"]

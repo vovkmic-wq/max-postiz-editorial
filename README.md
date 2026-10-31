@@ -65,6 +65,48 @@ durable-доказательство; только его точная пров�
 [инструкция VM](docs/VM_EDITORIAL.md), [история версий](CHANGELOG.md),
 [навигатор документации](docs/README.md), [правила проекта](AGENTS.md).
 
+## Проверка изменений одной командой
+
+Для разработки нужен **Python 3.12**, Git, Node.js и Google Chrome
+(браузерные тесты открывают только изолированные HTML-фикстуры).
+Из корня нового checkout в PowerShell:
+
+```powershell
+py -3.12 -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements.lock -r requirements-dev.lock -r requirements-browser.lock -r requirements-deployment.lock
+.venv/Scripts/python.exe -m pip install --no-deps --no-build-isolation -e .
+python scripts/check.py
+```
+
+На Linux создайте `.venv` командой `python3.12 -m venv .venv` и используйте
+`.venv/bin/python` для установки теми же двумя командами pip. Если Chrome
+отсутствует, установите его через Playwright: `.venv/bin/python -m playwright
+install --with-deps chrome` (Windows: `.venv/Scripts/python.exe -m playwright
+install chrome`). Node/npm OpenCode, веса моделей и `hub-agent init` для проверки
+не нужны. Существующая `scripts/test.ps1` запускает ту же общую проверку.
+
+Команда показывает результат каждого обязательного этапа и возвращает ненулевой
+код при сбое. Отчёт JSON, JUnit и логи создаются в отдельном игнорируемом
+`data/check-runs/<run>/`. Проверяются locks/окружение, зависимости, весь Ruff lint,
+явная область форматирования, JavaScript, Chrome, полный pytest и whitespace diff.
+После изменения версии переустановите editable-пакет второй командой pip.
+
+Отдельный тест на Windows:
+
+```powershell
+New-Item -ItemType Directory -Force .test-state | Out-Null
+.venv/Scripts/python.exe -X utf8 -B -m pytest tests/test_check.py -q --basetemp=.test-state/targeted
+```
+
+Базовый прогон не требует PostgreSQL; его пропуски явно отражены в отчёте.
+Для проверки БД задайте **только отдельную тестовую** `TEST_DATABASE_URL` в текущем
+окружении и выполните `python scripts/check.py --postgres`. Поддерживаются имена
+БД `test_*` / `*_tests` без query-параметров; значение URL команда не выводит.
+Postiz, MAX, OpenCode/MADLAD и LanguageTool относятся к отдельным живым проверкам:
+успех pytest не подтверждает доставку в канал. CI в текущем репозитории отсутствует.
+Критерии готовности, ограничения и порядок исправления — в
+[руководстве проверки кода](docs/CODE_CHECKS.md).
+
 ## Как устроена публикация
 
 1. Сборщик сохраняет полный оригинал, страницу, условия использования и credit.
