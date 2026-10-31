@@ -242,6 +242,11 @@ class BenchmarkGatewayTranslator(DedicatedTranslator):
 
     def __init__(self, route, transport):
         self.model, self.url = route["model"], route["base_url"].rstrip("/")
+        # Стенд сохраняет общий размер сегмента и proof-конфигурацию базового адаптера.
+        # Дополнительные aliases не расширяют production-список разрешённых моделей.
+        self.segment_chars = 1400
+        self.config_hash = fingerprint({"model": self.model, "base_url": self.url,
+                                        "segment_chars": self.segment_chars})
         self.client = httpx.Client(timeout=600, trust_env=False, transport=transport, follow_redirects=False)
         self._cached_source = self._cached_result = None
 
