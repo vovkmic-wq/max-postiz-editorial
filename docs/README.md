@@ -1,5 +1,10 @@
 # Навигатор документации 0.11.10
 
+31 октября: дополнительная Linux/PostgreSQL QA29 — 1155 passed в 21 модуле,
+без ошибок и пропусков; все пять Windows-skips выполнены. Доказательства
+и границы: [CODE_CHECKS](CODE_CHECKS.md), [CHANGELOG](../CHANGELOG.md).
+Установка на VM пока ожидает закрытия текущего preparation claim.
+
 Исходники 0.11.10 и воспроизводимая проверка: [CODE_CHECKS](CODE_CHECKS.md).
 Полный Windows/PostgreSQL прогон: 5089 passed, 5 платформенных skips.
 Подготовка Linux-проверки и установки продолжается. Далее — сохранённые
