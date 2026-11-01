@@ -11,7 +11,7 @@ dependencies = [
   "fastapi>=0.115,<1", "uvicorn>=0.34,<1", "sqlalchemy>=2.0,<2.1",
   "psycopg[binary]>=3.2,<4", "httpx>=0.28,<1", "jsonschema>=4.23,<5",
   "beautifulsoup4>=4.13,<5", "feedparser>=6.0,<7", "tzdata>=2025.1",
-  "cryptography>=44,<50", "alembic>=1.15,<2", "imageio-ffmpeg>=0.6,<1",
+  "cryptography>=44,<51", "alembic>=1.15,<2", "imageio-ffmpeg>=0.6,<1",
   "python-multipart==0.0.32", "Pillow>=12.3,<13"
 ]
 
