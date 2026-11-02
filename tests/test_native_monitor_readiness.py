@@ -8,10 +8,12 @@ import shutil
 import sqlite3
 import threading
 import time
+from urllib.parse import urlsplit
 
 import pytest
 
 from max_postiz_agent.config import Settings
+from max_postiz_agent.cli import load_env
 from max_postiz_agent.isolated_workspace import assert_isolated, mark_isolated
 from max_postiz_agent.monitor_config import initialize_monitor_config
 from max_postiz_agent.monitor_store import MonitorStore
@@ -34,6 +36,20 @@ def state():
     return {"monitor_dsn": "postgresql+psycopg://fixture:fixture-password@127.0.0.1:55448/editorial_hub",
         "postiz_api_key": "synthetic-api-key", "internal_key": "synthetic-internal-key-00000000000000000000",
         "owner_id": "synthetic-owner", "org_id": "synthetic-org"}
+
+
+def assert_ephemeral_credentials(root, value, endpoint):
+    # Actual fixture values only; template comments/variable names are not credentials.
+    before = (root / ".env.local").read_bytes()
+    load_env(root)
+    assert os.environ["DATABASE_URL"] == endpoint
+    assert os.environ["POSTIZ_API_KEY"] == value["postiz_api_key"]
+    assert os.environ["EDITORIAL_INTERNAL_KEY"] == value["internal_key"]
+    assert (root / ".env.local").read_bytes() == before
+    private_values = (urlsplit(value["monitor_dsn"]).password, value["postiz_api_key"], value["internal_key"])
+    assert not any(secret.encode() in before for secret in private_values)
+    assert any(line.startswith(b"APP_AUTH_SECRET=") and len(line.split(b"=", 1)[1]) >= 32
+               for line in before.splitlines())
 
 
 @pytest.mark.parametrize("endpoint", [
@@ -92,6 +108,9 @@ def test_copy_bootstrap_uses_honest_marker_valid_settings_and_only_explicit_migr
         assert settings.app["require_postgresql"] is True
         assert settings.app["max"]["adapter_mode"] == "fake"
         assert settings.app["opencode"]["adapter_mode"] == "fake"
+        assert os.environ["DATABASE_URL"] == value["monitor_dsn"]
+        assert os.environ["POSTIZ_API_KEY"] == value["postiz_api_key"]
+        assert os.environ["EDITORIAL_INTERNAL_KEY"] == value["internal_key"]
         assert not any(row["enabled"] for row in settings.sources["sources"])
         assert json.loads((root / "config/publishing.json").read_text())["targets"] == []
         assert json.loads((root / "data/hourly-article-policy.local.json").read_text())["enabled"] is False
@@ -103,6 +122,7 @@ def test_copy_bootstrap_uses_honest_marker_valid_settings_and_only_explicit_migr
     with scenario.monitor_environment(value, value["monitor_dsn"]) as values:
         instance.monitor_copy(root, value["monitor_dsn"], values, restored=False)
         assert_isolated(root)
+        assert_ephemeral_credentials(root, value, value["monitor_dsn"])
     marker = json.loads((root / "data/four-platform/isolation.json").read_text())
     assert marker["source_root"] == str(source.resolve()) and marker["root"] == str(root.resolve())
     assert marker["production_access"] is False
@@ -181,12 +201,17 @@ def test_restore_keeps_own_marker_unknown_instance_and_private_runtime_bytes_wit
     with scenario.monitor_environment(value, endpoint) as values:
         instance.monitor_copy(restored, endpoint, values, restored=True)
         assert_isolated(restored)
+        assert_ephemeral_credentials(restored, value, endpoint)
     assert scenario.monitor_ledger_history(restored) == expected
     assert MonitorStore(restored).get(row["id"])["state"] == "unknown"
     assert MonitorStore(restored).meta("instance_id") == store.meta("instance_id")
     assert (restored / sentinel.relative_to(original)).read_bytes() == sentinel.read_bytes()
     marker = json.loads((restored / "data/four-platform/isolation.json").read_text())
     assert marker["root"] == str(restored.resolve()) and marker["root"] != str(original.resolve())
+    private_values = (urlsplit(value["monitor_dsn"]).password, value["postiz_api_key"], value["internal_key"])
+    for copy in (original, restored, backup):
+        assert not any(secret.encode() in path.read_bytes() for path in copy.rglob("*")
+                       if path.is_file() for secret in private_values)
 
 
 @pytest.fixture

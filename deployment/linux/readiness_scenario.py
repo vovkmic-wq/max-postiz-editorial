@@ -861,8 +861,6 @@ class Scenario:
         publishing["targets"] = []
         atomic(root / "config/publishing.json", publishing, private=True)
         path = root / ".env.local"
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write("\n" + "\n".join(key + "=" + value for key, value in values.items()) + "\n")
         path.chmod(0o600)
         assert_isolated(root)
         initialize_monitor_config(root)

@@ -16,6 +16,12 @@ MAX, Telegram и VK до успешной приёмки, включить в п
 точные source/tree/manifest, image ID и SHA/размер переносимого Docker archive.
 Прежний принятый artifact относится только к своим точным исходникам.
 
+Проверять все PR checks, включая отдельный code-scanning check `CodeQL` и его
+annotations. Успешный Actions workflow с jobs `Analyze` сам по себе не подтверждает
+прохождение security gate. Новый HIGH alert воспроизводить и исправлять без
+suppress/dismiss ради зелёного статуса. Credentials native-копии передавать через
+ограниченный environment context, без лишней записи секретов в `.env.local`.
+
 Монитор должен иметь собственные marker, PostgreSQL, SQLite и профиль.
 Обычный запуск не выполняет миграцию или активацию. Проверить owner-only API,
 свежесть heartbeat, watchdog, restart, SQL/SQLite restore и сохранность
