@@ -1,5 +1,25 @@
 # История версий
 
+## 0.14.0 — 2026-11-03: обязательная проверка read-only Prisma engines при развёртывании
+
+- В deployment tooling добавлен metadata-only preflight immutable Postiz image.
+  Обычные `postiz-release.sh --check` и `--up` требуют его до Compose recreate.
+  Собственный контейнер только создаётся, читается и удаляется; приложение,
+  Prisma и БД не запускаются. Используется прежний Docker CLI wrapper/default
+  context, без новых прав на socket и без изменения Docker daemon.
+- Для Prisma 6.5.0 commit engines определяется из того же образа; проверяются
+  оба cache-файла, SHA, уникальность target и явный контракт OpenSSL image OS.
+  Неизвестная версия/ABI, отсутствующий или повреждённый engine блокируют
+  развёртывание. Приватный `engine.env` задаёт обе engine overrides для отдельно
+  охраняемой проверки схемы на восстановленной копии: это обходит cache `utime`
+  на read-only rootfs без download, checksum bypass и изменения приложения.
+- Добавлены регрессии cache/ABI, unknown create/cleanup и обязательного release
+  gate; документация разделяет metadata, schema diff и живую интеграцию.
+  Целевой набор: 58 passed, один честный Windows skip POSIX pipe/process-group
+  test; Ruff и diff-check успешны. Обязательные общие checks и Linux
+  Docker/Prisma приёмка окончательного tooling source остаются отдельными gates.
+  Версия пакета 0.14.0, Dockerfile, принятый образ и application bytes не меняются.
+
 ## 0.14.0 — 2026-11-02: секреты native-монитора только в окружении процесса
 
 - Отдельный CodeQL PR gate нашёл `py/clear-text-storage-sensitive-data` в новом
