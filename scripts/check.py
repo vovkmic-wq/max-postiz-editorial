@@ -176,6 +176,8 @@ def owned_postgres_summary(path: Path) -> dict:
             "test_postgres_recovery_skips_locked_sender_then_reconciles_during_pause",
         ),
         ("test_monitor_configuration_postgres", 9, None),
+        ("test_preapproval_retirement_postgres", 28, None),
+        ("test_max_plaintext_postgres", 4, None),
     ):
         selected = [
             case
@@ -189,7 +191,7 @@ def owned_postgres_summary(path: Path) -> dict:
         )
         if len(selected) < minimum or passed != len(selected):
             raise ValueError(
-                "Required isolated route/monitor PostgreSQL cases missing or not passed"
+                "Required isolated route/monitor/preapproval PostgreSQL cases missing or not passed"
             )
         groups[name] = {"total": len(selected), "passed": passed}
     return groups

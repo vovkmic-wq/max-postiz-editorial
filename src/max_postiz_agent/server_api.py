@@ -6,7 +6,7 @@ import os
 from fastapi import Depends, FastAPI, Header
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 from sqlalchemy import select
 
 from . import __version__
@@ -27,6 +27,14 @@ class ControlInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     action: str
     revision: StrictInt = Field(ge=1)
+
+
+class PreapprovalRetirementInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    operation_id: str
+    plan_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    retire_confirmed: StrictBool
+    reason: str = Field(min_length=20, max_length=500)
 
 
 def reddit_capability(core):
@@ -82,6 +90,21 @@ def editorial_app(core, store=None):
     store = store or ServerState(core)
     app = FastAPI(title="Автономная редакция Postiz", docs_url=None, redoc_url=None, openapi_url=None)
 
+    @app.middleware("http")
+    async def reconciliation_privacy(request, call_next):
+        if not request.url.path.startswith("/internal/editorial/reconciliation/"):
+            return await call_next(request)
+        if request.url.query:
+            response = JSONResponse({"code": "INPUT_INVALID"}, status_code=422)
+        else:
+            try:
+                response = await call_next(request)
+            except Exception:
+                response = JSONResponse({"code": "PREAPPROVAL_RECONCILIATION_FAILED"}, status_code=500)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
     @app.exception_handler(AgentError)
     async def known_error(request, error):
         return JSONResponse({"code": error.code}, status_code=error.status)
@@ -124,6 +147,21 @@ def editorial_app(core, store=None):
         return {"revision": value["revision"], "settings": validate_settings(value["settings"])}
 
     owner_dependency = Depends(owner)
+
+    @app.get("/internal/editorial/reconciliation/preapproval/{record_id}", dependencies=[Depends(owner)])
+    def inspect_preapproval(record_id: str):
+        from .article_reserve import ArticleReserveStore
+        return ArticleReserveStore(core).inspect_preapproval_retirement(record_id)
+
+    @app.get("/internal/editorial/reconciliation/operations/{operation_id}", dependencies=[Depends(owner)])
+    def preapproval_operation(operation_id: str):
+        from .preapproval_retirement import operation_status
+        return operation_status(core, operation_id)
+
+    @app.post("/internal/editorial/reconciliation/preapproval/{record_id}/retire")
+    def retire_preapproval(record_id: str, value: PreapprovalRetirementInput, actor=owner_dependency):
+        from .article_reserve import ArticleReserveStore
+        return ArticleReserveStore(core).retire_preapproval_no_send(record_id, actor=actor, **value.model_dump())
 
     @app.put("/internal/editorial/settings")
     def save_settings(value: SettingsInput, actor=owner_dependency):

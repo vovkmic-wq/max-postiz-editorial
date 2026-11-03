@@ -133,6 +133,14 @@ class ArticleReserveStore:
     def __init__(self, core):
         self.core = core
 
+    def inspect_preapproval_retirement(self, record_id):
+        from .preapproval_retirement import inspect
+        return inspect(self.core, record_id)
+
+    def retire_preapproval_no_send(self, record_id, **decision):
+        from .preapproval_retirement import apply
+        return apply(self.core, record_id, **decision)
+
     def _control(self, session, *, running=True):
         if running:
             require_running(self.core, session, lock=True)

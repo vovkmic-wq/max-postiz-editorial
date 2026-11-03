@@ -80,17 +80,21 @@ def test_contracts_verify_current_checkout_and_all_locks(checkout):
             "test_route_dispatch_postgres",
             "test_route_recovery",
             "test_monitor_configuration_postgres",
+            "test_preapproval_retirement_postgres",
+            "test_max_plaintext_postgres",
         )
         for damage in ("missing", "skipped", "failure", "error")
     ],
 )
-def test_owned_postgres_report_requires_all_three_suites_without_skips(
+def test_owned_postgres_report_requires_all_five_suites_without_skips(
     tmp_path, damaged_group, damage
 ):
     groups = (
         ("test_route_dispatch_postgres", 1),
         ("test_route_recovery", 1),
         ("test_monitor_configuration_postgres", 9),
+        ("test_preapproval_retirement_postgres", 28),
+        ("test_max_plaintext_postgres", 4),
     )
     cases = []
     for group, count in groups:
@@ -114,6 +118,8 @@ def test_owned_postgres_report_requires_all_three_suites_without_skips(
             "test_route_dispatch_postgres": {"total": 1, "passed": 1},
             "test_route_recovery": {"total": 1, "passed": 1},
             "test_monitor_configuration_postgres": {"total": 9, "passed": 9},
+            "test_preapproval_retirement_postgres": {"total": 28, "passed": 28},
+            "test_max_plaintext_postgres": {"total": 4, "passed": 4},
         }
     else:
         with pytest.raises(ValueError, match="PostgreSQL cases missing or not passed"):

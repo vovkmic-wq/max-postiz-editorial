@@ -1,5 +1,6 @@
 """Postiz can request review and observe status; only the owner can approve MAX delivery."""
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -7,6 +8,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlsplit, unquote
 
 import httpx
@@ -160,11 +162,147 @@ class MaxBridge:
                            "sha256": digest.hexdigest(), "mime": mime})
         return self.core.check_media(result, target)
 
-    def import_post(self, remote, target):
+    @staticmethod
+    def _row_view(row):
+        return {column.key: copy.deepcopy(getattr(row, column.key)) for column in row.__table__.columns}
+
+    def capture_draft_sync(self, session, variant, target):
+        """Capture local CAS before the explicit owner's read; never repair old metadata."""
+        from .preapproval_retirement import assert_mutable
+        assert_mutable(session, variant.id)
+        draft = session.get(RemoteDraft, variant.id)
+        locked_delivery = session.scalar(select(Dispatch).where(Dispatch.variant_id == variant.id,
+            Dispatch.state.in_({"sending", "unknown", "scheduled", "published"})
+            | Dispatch.owner.is_not(None) | (Dispatch.lease_until != 0) | Dispatch.lease_until.is_(None)))
+        if locked_delivery:
+            raise AgentError("CANCEL_OR_RECONCILE_FIRST", 409)
+        links = list(session.scalars(select(BridgePost).where(BridgePost.variant_id == variant.id)))
+        if (draft is None or len(links) != 1 or draft.synced_revision != variant.revision
+                or draft.remote_hash != fingerprint({"body": variant.body}) or draft.state != "draft"):
+            raise AgentError("REMOTE_EDIT_CONFLICT", 409)
+        link = links[0]
+        duplicates = list(session.scalars(select(RemoteDraft).where(RemoteDraft.external_id == draft.external_id)))
+        if (len(duplicates) != 1 or not draft.correlation or not draft.external_id
+                or link.post_id != draft.external_id or link.target_id != target.id
+                or variant.target_id != target.id or target.route != "max_browser" or target.platform != "max"
+                or not target.enabled or link.integration_id != target.options.get("postiz_integration_id")
+                or not link.active or link.error or link.remote_state != "DRAFT"
+                or link.mutation_owner is not None or link.mutation_until != 0
+                or variant.config_hash != self.core.settings.hash or variant.binding_hash != target.binding_hash):
+            raise AgentError("REMOTE_EDIT_CONFLICT", 409)
+        return {"variant_id": variant.id, "revision": variant.revision, "external_id": draft.external_id,
+                "variant": self._row_view(variant), "target": self._row_view(target),
+                "draft": self._row_view(draft), "bridge": self._row_view(link),
+                "config_hash": self.core.settings.hash}
+
+    def _check_draft_sync(self, session, target, expected):
+        if not isinstance(expected, dict) or not expected.get("variant_id"):
+            raise AgentError("REMOTE_EDIT_CONFLICT", 409)
+        variant = self.core._variant(session, expected["variant_id"], True)
+        current_target = session.scalar(select(Target).where(Target.id == variant.target_id)
+                                        .with_for_update().execution_options(populate_existing=True))
+        session.scalar(select(RemoteDraft).where(RemoteDraft.variant_id == variant.id)
+                       .with_for_update().execution_options(populate_existing=True))
+        session.scalar(select(BridgePost).where(BridgePost.variant_id == variant.id)
+                       .with_for_update().execution_options(populate_existing=True))
+        if (current_target is None or target.id != current_target.id
+                or self.capture_draft_sync(session, variant, current_target) != expected):
+            raise AgentError("REMOTE_EDIT_CONFLICT", 409)
+        return variant, current_target
+
+    @staticmethod
+    def _remote_settings(remote):
+        try:
+            settings = remote.get("settings") or {}
+            settings = json.loads(settings) if isinstance(settings, str) else settings
+            if not isinstance(settings, dict):
+                raise ValueError
+            return settings
+        except (ValueError, TypeError):
+            raise AgentError("BRIDGE_REMOTE_INVALID", 409) from None
+
+    def _check_draft_binding(self, remote, target, draft, link=None, *, require_draft=True):
+        settings = self._remote_settings(remote)
+        marked = "hub_variant_id" in settings or "hub_correlation" in settings
+        if (remote.get("id") != draft.external_id or (require_draft and remote.get("state") != "DRAFT")
+                or remote.get("integration", {}).get("id") != target.options.get("postiz_integration_id")
+                or (link is not None and (link.target_id != target.id or link.group_id != remote.get("group")
+                    or link.integration_id != remote.get("integration", {}).get("id")))
+                or ("__type" in settings and settings["__type"] != PROVIDER)
+                or (marked and (settings.get("hub_variant_id") != draft.variant_id
+                                or settings.get("hub_correlation") != draft.correlation))):
+            raise AgentError("BRIDGE_REMOTE_BINDING_CHANGED", 409)
+
+    @staticmethod
+    def _blocked_post(session, post_id):
+        from .preapproval_retirement import mutation_blocked
+        link = session.get(BridgePost, post_id)
+        identifiers = [row.variant_id for row in session.scalars(
+            select(RemoteDraft).where(RemoteDraft.external_id == post_id))]
+        if link:
+            identifiers.append(link.variant_id)
+        return next((ident for ident in identifiers if mutation_blocked(session, ident)), None)
+
+    @staticmethod
+    def _tracked_draft(session, post_id, link=None):
+        matches = list(session.scalars(select(RemoteDraft).where(RemoteDraft.external_id == post_id)))
+        if len(matches) > 1 or (matches and link is not None and matches[0].variant_id != link.variant_id):
+            raise AgentError("BRIDGE_REMOTE_BINDING_CHANGED", 409)
+        return matches[0] if matches else None
+
+    def _resolve_tracked(self, session, remote, target, link=None):
+        """Native correlation markers are an identity claim, never owner-content fallback."""
+        tracked = self._tracked_draft(session, remote.get("id"), link)
+        settings = self._remote_settings(remote)
+        marked = "hub_variant_id" in settings or "hub_correlation" in settings
+        if marked:
+            variant_id, correlation = settings.get("hub_variant_id"), settings.get("hub_correlation")
+            if not isinstance(variant_id, str) or not variant_id or not isinstance(correlation, str) or not correlation:
+                raise AgentError("BRIDGE_REMOTE_BINDING_CHANGED", 409)
+            candidate = session.get(RemoteDraft, variant_id)
+            if (candidate is None or candidate.correlation != correlation
+                    or candidate.external_id not in {None, remote.get("id")}
+                    or (tracked is not None and tracked.variant_id != candidate.variant_id)):
+                raise AgentError("BRIDGE_REMOTE_BINDING_CHANGED", 409)
+            tracked = candidate
+        if tracked is not None:
+            variant_target = session.scalar(select(Variant.target_id).where(Variant.id == tracked.variant_id))
+            other = session.scalar(select(BridgePost).where(BridgePost.variant_id == tracked.variant_id))
+            if (variant_target != target.id
+                    or remote.get("integration", {}).get("id") != target.options.get("postiz_integration_id")
+                    or (other is not None and (other.post_id != remote.get("id") or other.target_id != target.id))):
+                raise AgentError("BRIDGE_REMOTE_BINDING_CHANGED", 409)
+        return tracked
+
+    def import_post(self, remote, target, *, expected_local=None):
+        from .preapproval_retirement import mutation_blocked
+        explicit = expected_local is not None
+        with self.core.db.session() as s:
+            blocked = self._blocked_post(s, remote.get("id"))
+            if blocked:
+                if explicit:
+                    raise AgentError("PREAPPROVAL_RETIRED_OR_RECONCILING", 409)
+                return blocked
+            if not explicit:
+                tracked = self._resolve_tracked(s, remote, target, s.get(BridgePost, remote.get("id")))
+                if tracked is not None and mutation_blocked(s, tracked.variant_id):
+                    return tracked.variant_id
         body, images, due, remote_hash = self.normalize(remote)
         with self.core.db.session() as s:
             link = s.get(BridgePost, remote["id"])
-            if link and (link.mutation_owner or link.remote_hash == remote_hash):
+            if not explicit:
+                self._resolve_tracked(s, remote, target, link)
+            if not explicit and link and (link.target_id != target.id or link.integration_id != remote["integration"]["id"]):
+                raise AgentError("BRIDGE_REMOTE_BINDING_CHANGED", 409)
+            if explicit:
+                try:
+                    captured_target = SimpleNamespace(**expected_local["target"])
+                    captured_draft = SimpleNamespace(**expected_local["draft"])
+                    captured_bridge = SimpleNamespace(**expected_local["bridge"])
+                except (KeyError, TypeError):
+                    raise AgentError("REMOTE_EDIT_CONFLICT", 409) from None
+                self._check_draft_binding(remote, captured_target, captured_draft, captured_bridge)
+            elif link and (link.mutation_owner or link.remote_hash == remote_hash):
                 return link.variant_id
         media = self._media(images, target)
         with self.core.db.session.begin() as s:
@@ -175,12 +313,29 @@ class MaxBridge:
             else:
                 s.execute(update(Target).where(Target.id == target.id).values(paused=Target.paused))
             link = s.get(BridgePost, remote["id"])
+            if explicit:
+                v, target = self._check_draft_sync(s, target, expected_local)
+                link = s.get(BridgePost, remote["id"])
+                tracked = s.get(RemoteDraft, v.id)
+                self._check_draft_binding(remote, target, tracked, link)
+                resolved = self._resolve_tracked(s, remote, target, link)
+                if link is not None and link.remote_hash == remote_hash:
+                    if body != v.body or media != v.media:
+                        raise AgentError("BRIDGE_REMOTE_CHANGED", 409)
+                    return {"state": "unchanged", "revision": v.revision}
+            else:
+                resolved = self._resolve_tracked(s, remote, target, link)
+            blocked = self._blocked_post(s, remote["id"])
+            if blocked:
+                return blocked
             if link:
                 v = self.core._variant(s, link.variant_id, True)
-                if link.mutation_owner or link.remote_hash == remote_hash:
+                if not explicit and (link.mutation_owner or link.remote_hash == remote_hash):
                     return v.id
                 published = s.scalar(select(Dispatch).where(Dispatch.variant_id == v.id, Dispatch.state == "published"))
                 if published:
+                    if explicit:
+                        raise AgentError("CANCEL_OR_RECONCILE_FIRST", 409)
                     link.remote_state = remote["state"]
                     return v.id
                 if self._preclick_error_state(s, link, v, target, remote, body, media, due, remote_hash):
@@ -188,6 +343,8 @@ class MaxBridge:
                 try:
                     self.core._invalidate(s, v)
                 except AgentError:
+                    if explicit:
+                        raise
                     link.error = "REMOTE_EDIT_DURING_SEND"
                     return v.id
                 v.body, v.media = body, media
@@ -195,19 +352,18 @@ class MaxBridge:
                 v.state = "review_pending"
             else:
                 # Preserve source evidence for a draft originally exported by this hub.
-                settings = remote.get("settings") or "{}"
-                if isinstance(settings, str):
-                    settings = json.loads(settings)
-                tracked = s.scalar(select(RemoteDraft).where(RemoteDraft.external_id == remote["id"]))
-                if not tracked and settings.get("hub_variant_id"):
-                    candidate = s.get(RemoteDraft, settings["hub_variant_id"])
-                    if candidate and candidate.external_id in {None, remote["id"]} and candidate.correlation == settings.get("hub_correlation"):
-                        tracked = candidate
+                tracked = resolved
                 if tracked and tracked.state in {"creating", "unknown", "draft"}:
+                    if mutation_blocked(s, tracked.variant_id):
+                        return tracked.variant_id
                     v = self.core._variant(s, tracked.variant_id, True)
                     if v.target_id != target.id:
                         raise AgentError("BRIDGE_TARGET_CHANGED")
-                    tracked.external_id, tracked.state = remote["id"], "draft"
+                    # Correlation fields are optional on the public API; foreign values are never adopted.
+                    if tracked.external_id is None:
+                        tracked.external_id = remote["id"]
+                    self._check_draft_binding(remote, target, tracked, require_draft=False)
+                    tracked.state = "draft"
                     self.core._invalidate(s, v)
                     v.body, v.media, v.revision = body, media, v.revision + 1
                 else:
@@ -242,9 +398,17 @@ class MaxBridge:
             link.active, link.error, link.updated_at = True, None, now()
             v.metadata_json = {**v.metadata_json, "postiz_post_id": link.post_id,
                                "postiz_hash": remote_hash, "postiz_due_at": due, "postiz_state": remote["state"]}
+            tracked = s.get(RemoteDraft, v.id)
+            if tracked is not None and tracked.external_id == link.post_id:
+                # Plaintext hash and imported revision describe the very same atomic snapshot.
+                # Existing same-hash imports return above: historical stale metadata is not migrated.
+                self._check_draft_binding(remote, target, tracked, link, require_draft=explicit)
+                tracked.synced_revision = v.revision
+                tracked.remote_hash = fingerprint({"body": body})
+                tracked.updated_at = now()
             self.core._history(s, v, target, "postiz_bridge")
             self.core.db.audit(s, "postiz_bridge", "bridge_import", v.id, post_id=link.post_id)
-            return v.id
+            return {"state": "updated", "revision": v.revision} if explicit else v.id
 
     def _preclick_error_state(self, session, link, variant, target, remote, body, media, due, remote_hash):
         """Postiz ERROR меняет только состояние при новом exact pre-click proof.
@@ -332,19 +496,25 @@ class MaxBridge:
                 self.import_post(remote, targets[ident])
                 count += 1
             except AgentError as exc:
+                if exc.code == "PREAPPROVAL_RETIRED_OR_RECONCILING":
+                    continue
                 with self.core.db.session.begin() as s:
                     link = s.get(BridgePost, remote["id"])
-                    if link:
+                    if link and not self._blocked_post(s, remote["id"]):
                         link.error = exc.code
         with self.core.db.session.begin() as s:
             for link in s.scalars(select(BridgePost)):
                 if target_id is not None and link.target_id != target_id:
                     continue
                 if link.post_id not in seen and link.active:
-                    v = self.core._variant(s, link.variant_id, True)
                     try:
+                        if self._blocked_post(s, link.post_id):
+                            continue
+                        v = self.core._variant(s, link.variant_id, True)
                         self.core._invalidate(s, v)
-                    except AgentError:
+                    except AgentError as exc:
+                        if exc.code == "PREAPPROVAL_RETIRED_OR_RECONCILING":
+                            continue
                         link.error = "REMOTE_DELETE_DURING_SEND"
                     link.active = False
         self.last_error = None
@@ -401,6 +571,9 @@ class MaxBridge:
         t = self.channel(token)
         if t.options.get("postiz_integration_id") != integration_id:
             raise AgentError("BRIDGE_INTEGRATION_MISMATCH", 403)
+        with self.core.db.session() as s:
+            if self._blocked_post(s, post_id):
+                return self.status(token, integration_id, post_id)
         integration = next((i for i in self.core.postiz.integrations() if i["id"] == integration_id), None)
         if (not integration or integration.get("identifier") != PROVIDER
                 or integration.get("accountId") != t.destination or integration.get("disabled") or integration.get("refreshNeeded")):
@@ -418,6 +591,8 @@ class MaxBridge:
             link = s.get(BridgePost, post_id)
             if not link or link.target_id != t.id or link.integration_id != integration_id:
                 raise AgentError("BRIDGE_POST_NOT_FOUND", 404)
+            if self._blocked_post(s, post_id):
+                return {"state": "cancelled", "error": "PREAPPROVAL_RETIRED_OR_RECONCILING"}
             # A rescheduled dispatch may have an earlier date than its cancelled
             # predecessor. Poll the active attempt, then confirmed history.
             d = s.scalar(select(Dispatch).where(Dispatch.variant_id == link.variant_id)
@@ -455,7 +630,11 @@ class MaxBridge:
             if compare and (len(links) != 1 or links[0].post_id != expected_post_id):
                 raise AgentError("BRIDGE_MUTATION_CAS_INVALID", 409)
             for link in links:
-                self.core._variant(s, link.variant_id, True)
+                if release:
+                    # Releasing this exact owner must remain possible after a retirement claim.
+                    s.scalar(select(Variant).where(Variant.id == link.variant_id).with_for_update())
+                else:
+                    self.core._variant(s, link.variant_id, True)
                 # Another native mutation may have committed while this call
                 # waited for the variant lock. Do not reuse its earlier owner.
                 s.refresh(link)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Owner-operated future handoff only. The default never changes a container.
+# Owner-operated handoff. Default checks own only a never-started metadata container.
 set -euo pipefail
 umask 077
 mode=${1:---check}
