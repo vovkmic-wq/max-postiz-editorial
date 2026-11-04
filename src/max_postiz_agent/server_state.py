@@ -150,6 +150,10 @@ class ServerState:
             if row is None:
                 raise AgentError("EDITORIAL_NOT_INITIALIZED", 409)
             previous = row.runtime.get(channel, {})
+            if (phase == "selecting" and isinstance(details.get("claim_id"), str)
+                    and details["claim_id"] and details["claim_id"] != previous.get("claim_id")):
+                # Новая подготовка ещё не выбрала статью; старые сведения остаются в её истории.
+                previous = {k: v for k, v in previous.items() if k not in {"source_url", "record_id"}}
             row.runtime = {**row.runtime, channel: {**previous, **details, "phase": phase, "heartbeat_at": now()}}
 
     def control(self, action, revision, actor, *, prepare_only=False):

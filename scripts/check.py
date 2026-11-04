@@ -4,19 +4,22 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import importlib.metadata
 import importlib.util
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCKS = (
@@ -25,6 +28,82 @@ LOCKS = (
     "requirements-browser.lock",
     "requirements-deployment.lock",
 )
+WHEEL_CASES = ("nasa_links_v1", "science_mailto_isolation")
+WHEEL_PROBE = r"""
+import json, os, socket, subprocess, sys
+from pathlib import Path
+wheel = Path(sys.argv[1]).resolve()
+repository, build_source = (Path(p).resolve() for p in sys.argv[3:5])
+forbidden_roots = (repository / 'src', repository / 'scripts', build_source)
+assert not any(n == 'max_postiz_agent' or n.startswith('max_postiz_agent.') for n in sys.modules)
+sys.path.insert(0, str(wheel))
+attempted = []
+def audit(event, args):
+    if (event in {'subprocess.Popen', 'os.system', 'os.fork', 'os.forkpty',
+                  'socket.getaddrinfo', 'socket.gethostbyname', 'socket.gethostbyaddr', 'socket.getnameinfo'}
+            or event.startswith(('os.exec', 'os.spawn', 'os.posix_spawn', 'os.startfile',
+                                 'socket.connect', 'socket.bind', 'socket.send'))):
+        attempted.append(True)
+        raise AssertionError('Installed wheel probe cannot access network or start processes')
+    if event == 'open' and isinstance(args[0], (str, bytes)):
+        path = Path(os.fsdecode(args[0])).resolve()
+        if path.name == 'fetch_nasa_article.py' or any(path.is_relative_to(p) for p in forbidden_roots):
+            attempted.append(True)
+            raise AssertionError('Installed wheel cannot read repository/build source')
+sys.addaudithook(audit)
+def forbidden(*args, **kwargs):
+    attempted.append(True)
+    raise AssertionError('Installed wheel probe cannot access network or start processes')
+socket.getaddrinfo = socket.create_connection = forbidden
+socket.socket.connect = socket.socket.connect_ex = socket.socket.bind = forbidden
+socket.socket.sendto = forbidden
+class ForbiddenProcess(subprocess.Popen):
+    def __init__(self, *args, **kwargs):
+        forbidden()
+subprocess.Popen = ForbiddenProcess
+os.system = forbidden
+from max_postiz_agent import server_nasa
+from max_postiz_agent.config import AgentError
+def owned(module):
+    assert Path(module.__file__).resolve().is_relative_to(wheel), 'Module came from editable source'
+owned(server_nasa)
+from max_postiz_agent import __version__
+from importlib.metadata import distribution
+assert __version__ == sys.argv[2], 'Installed wheel version differs'
+assert Path(distribution('max-postiz-agent').locate_file('')).resolve() == wheel, 'Metadata came from editable source'
+base = 'https://noirlab.edu/public/images/iotw2601a/'
+legacy = server_nasa._parser(science_mailto=False)
+science = server_nasa._parser(science_mailto=True)
+again = server_nasa._parser(science_mailto=False)
+for parser in (legacy, science, again):
+    owned(parser)
+assert len({id(legacy), id(science), id(again)}) == 3
+for parser in (legacy, science, again):
+    assert parser.narrative_text('<p>News <a href="https://example.org/ref?a=1&amp;b=2">paper</a>.</p>', base) == 'News [paper](https://example.org/ref?a=1&b=2).'
+for address in ('mailto:comms@noirlab.edu', 'mailto:info@noirlab.edu'):
+    assert science.narrative_text('<p>News <a href="' + address + '">team</a>.</p>', base) == 'News [team](' + address + ').'
+    for parser in (legacy, again):
+        try:
+            parser._narrative_href(address, base)
+        except AgentError as exc:
+            assert exc.code == 'ARTICLE_SOURCE_LINK_INVALID'
+        else:
+            raise AssertionError('Science mailto override leaked to legacy parser')
+try:
+    science._narrative_href('mailto:outside@example.org', base)
+except AgentError as exc:
+    assert exc.code == 'ARTICLE_SOURCE_LINK_INVALID'
+else:
+    raise AssertionError('Foreign mailto accepted')
+for name, module in tuple(sys.modules.items()):
+    if name == 'max_postiz_agent' or name.startswith('max_postiz_agent.'):
+        owned(module)
+assert not attempted, 'Forbidden capability was attempted and swallowed'
+print(json.dumps({'contract': 'installed-wheel-extractor-probe-v1',
+                  'passed': ['nasa_links_v1', 'science_mailto_isolation'],
+                  'server_nasa_origin': server_nasa.__file__,
+                  'extractor_origin': legacy.__file__, 'network_or_process_calls': 0}))
+"""
 
 
 def interpreter(root: Path) -> Path:
@@ -178,6 +257,7 @@ def owned_postgres_summary(path: Path) -> dict:
         ("test_monitor_configuration_postgres", 9, None),
         ("test_preapproval_retirement_postgres", 28, None),
         ("test_max_plaintext_postgres", 4, None),
+        ("test_unbound_selection_reconciliation_postgres", 16, None),
     ):
         selected = [
             case
@@ -195,6 +275,187 @@ def owned_postgres_summary(path: Path) -> dict:
             )
         groups[name] = {"total": len(selected), "passed": passed}
     return groups
+
+
+def wheel_sources(root: Path) -> dict[str, bytes]:
+    """Fresh build context includes tracked metadata/backend files and new package modules."""
+    completed = subprocess.run(
+        [shutil.which("git"), "ls-files", "-z"],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        check=True,
+        timeout=30,
+    )
+    names = set(completed.stdout.decode("utf-8").split("\0")) - {""}
+    package_paths = list((root / "src/max_postiz_agent").rglob("*"))
+    if any(path.is_symlink() for path in package_paths):
+        raise ValueError("Symlink in installed-wheel package source")
+    names.update(path.relative_to(root).as_posix() for path in package_paths if path.is_file())
+    result = {}
+    total = 0
+    for name in sorted(names):
+        relative = PurePosixPath(name)
+        if (
+            "__pycache__" in relative.parts
+            or any(part.endswith(".egg-info") for part in relative.parts)
+            or relative.suffix in {".pyc", ".pyo"}
+        ):
+            continue
+        path = root / relative
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not path.resolve().is_relative_to(root.resolve())
+            or any(p.is_symlink() for p in (path, *path.parents))
+            or not path.is_file()
+            or path.stat().st_size > 16 * 1024 * 1024
+        ):
+            raise ValueError("Unsafe or missing installed-wheel build source")
+        raw = path.read_bytes()
+        total += len(raw)
+        if total > 128 * 1024 * 1024:
+            raise ValueError("Installed-wheel build source exceeds bound")
+        result[name] = raw
+    return result
+
+
+def installed_wheel(root: Path, directory: Path, xml: Path) -> int:
+    """Build and probe an actual wheel; never import the editable application here."""
+    suite = ET.Element("testsuite", name="installed_wheel", tests=str(len(WHEEL_CASES)))
+    cases = {name: ET.SubElement(suite, "testcase", name=name) for name in WHEEL_CASES}
+    outcome = {"contract": "installed-wheel-gate-v1", "status": "failed"}
+    directory.mkdir(mode=0o700)
+    try:
+        source, dist, extracted = (directory / name for name in ("source", "dist", "site-packages"))
+        source.mkdir()
+        dist.mkdir()
+        extracted.mkdir()
+        before = wheel_sources(root)
+        for name, raw in before.items():
+            destination = source / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(raw)
+        subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-m",
+                "pip",
+                "wheel",
+                "--no-deps",
+                "--no-build-isolation",
+                "--no-index",
+                "--wheel-dir",
+                str(dist),
+                str(source),
+            ],
+            cwd=directory,
+            check=True,
+            timeout=180,
+        )
+        wheels = list(dist.glob("*.whl"))
+        if len(wheels) != 1:
+            raise ValueError("Expected exactly one built wheel")
+        wheel = wheels[0]
+        with zipfile.ZipFile(wheel) as archive:
+            infos = archive.infolist()
+            names = [info.filename for info in infos]
+            if len(names) != len(set(names)) or sum(i.file_size for i in infos) > 64 * 1024 * 1024:
+                raise ValueError("Invalid installed-wheel archive bound or duplicate member")
+            for info in infos:
+                name = PurePosixPath(info.filename)
+                if (
+                    name.is_absolute()
+                    or ".." in name.parts
+                    or "\\" in info.filename
+                    or stat.S_ISLNK(info.external_attr >> 16)
+                    or info.file_size > 16 * 1024 * 1024
+                ):
+                    raise ValueError("Unsafe installed-wheel member")
+                destination = extracted / name
+                if not destination.resolve().is_relative_to(extracted.resolve()):
+                    raise ValueError("Installed-wheel member escapes extraction directory")
+                if info.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(archive.read(info))
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-X",
+                "utf8",
+                "-I",
+                "-B",
+                "-c",
+                WHEEL_PROBE,
+                str(extracted),
+                configuration(root)["project"]["version"],
+                str(root),
+                str(source),
+            ],
+            cwd=directory,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=60,
+        )
+        (directory / "probe.stdout.log").write_bytes(completed.stdout)
+        (directory / "probe.stderr.log").write_bytes(completed.stderr)
+        if completed.returncode:
+            print(
+                completed.stderr.decode("utf-8", errors="backslashreplace")
+                .encode("ascii", errors="backslashreplace")
+                .decode("ascii"),
+                flush=True,
+            )
+            raise ValueError("Installed-wheel isolated probe failed")
+        probe = json.loads(completed.stdout)
+        if (
+            probe.get("contract") != "installed-wheel-extractor-probe-v1"
+            or probe.get("passed") != list(WHEEL_CASES)
+            or probe.get("network_or_process_calls") != 0
+        ):
+            raise ValueError("Invalid installed-wheel probe result")
+        if wheel_sources(root) != before:
+            raise ValueError("Installed-wheel source changed during validation")
+        outcome.update(
+            status="passed",
+            probe=probe,
+            wheel_sha256=hashlib.sha256(wheel.read_bytes()).hexdigest(),
+            source_files=len(before),
+            source_hash=hashlib.sha256(
+                json.dumps(
+                    {n: hashlib.sha256(raw).hexdigest() for n, raw in before.items()},
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest(),
+        )
+    except (OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile) as exc:
+        outcome["error"] = type(exc).__name__
+        for case in cases.values():
+            ET.SubElement(case, "error", message="Installed wheel build/probe did not pass")
+        print("Installed wheel build/probe failed: " + type(exc).__name__, flush=True)
+    with xml.open("xb") as stream:
+        ET.ElementTree(suite).write(stream, encoding="utf-8", xml_declaration=True)
+    with (directory / "report.json").open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(outcome, indent=2))
+    return 0 if outcome["status"] == "passed" else 1
+
+
+def installed_wheel_summary(path: Path) -> dict:
+    summary = junit_summary(path)
+    cases = list(ET.parse(path).getroot().iter("testcase"))  # noqa: S314 -- наш wheel report
+    if (
+        sorted(case.get("name", "") for case in cases) != sorted(WHEEL_CASES)
+        or summary["passed"] != len(WHEEL_CASES)
+        or summary["skipped"]
+        or summary["failed"]
+        or summary["errors"]
+    ):
+        raise ValueError("Required installed-wheel cases missing or not passed")
+    return summary
 
 
 class Checks:
@@ -267,6 +528,24 @@ def run(root: Path, *, postgres: bool) -> int:
         print(f"[FAILED] environment: {exc}\nReport: {directory / 'report.json'}", flush=True)
         return 1
     checks.stage("dependencies", python + ["-m", "pip", "check"])
+    wheel_xml = directory / "installed-wheel.xml"
+    wheel = checks.stage(
+        "installed-wheel",
+        python
+        + [
+            "scripts/check.py",
+            "--installed-wheel",
+            str(directory / "installed-wheel"),
+            "--junitxml=" + str(wheel_xml),
+        ],
+        timeout=300,
+    )
+    try:
+        report["installed_wheel_tests"] = installed_wheel_summary(wheel_xml)
+    except (ET.ParseError, OSError, ValueError):
+        wheel.update(
+            status="failed", exit_code=1, error="Required installed-wheel report missing or invalid"
+        )
     checks.stage("lint", python + ["-m", "ruff", "check", "src", "tests", "scripts"])
     paths = configuration(root)["tool"]["max-postiz"]["check"]["format-paths"]
     checks.stage("format", python + ["-m", "ruff", "format", "--check", *paths])
@@ -295,8 +574,10 @@ def run(root: Path, *, postgres: bool) -> int:
         timeout=60,
     )
     xml = directory / "tests.xml"
-    if browser["status"] == "passed" and (
-        owned_preflight is None or owned_preflight["status"] == "passed"
+    if (
+        wheel["status"] == "passed"
+        and browser["status"] == "passed"
+        and (owned_preflight is None or owned_preflight["status"] == "passed")
     ):
         temporary = directory / "pytest"
         tests = checks.stage(
@@ -348,7 +629,7 @@ def run(root: Path, *, postgres: bool) -> int:
             {
                 "name": "tests",
                 "status": "blocked",
-                "error": "Chrome or owned PostgreSQL preflight failed",
+                "error": "Installed wheel, Chrome or owned PostgreSQL preflight failed",
             }
         )
     checks.stage("diff", [shutil.which("git"), "diff", "--check"])
@@ -377,6 +658,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Require dedicated TEST_DATABASE_URL and PostgreSQL tests",
     )
+    parser.add_argument("--installed-wheel", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--junitxml", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     target = interpreter(ROOT)
     if Path(sys.prefix).resolve() != (ROOT / ".venv").resolve():
@@ -397,6 +680,17 @@ def main(argv: list[str] | None = None) -> int:
             cwd=ROOT,
             check=False,
         ).returncode
+    if args.installed_wheel is not None:
+        directory = args.installed_wheel.resolve()
+        if (
+            args.junitxml is None
+            or not directory.is_relative_to((ROOT / "data/check-runs").resolve())
+            or args.junitxml.resolve().parent != directory.parent
+        ):
+            parser.error("Installed wheel probe requires its own check-run directory/report")
+        return installed_wheel(ROOT, directory, args.junitxml.resolve())
+    if args.junitxml is not None:
+        parser.error("--junitxml is internal to the installed-wheel stage")
     return run(ROOT, postgres=args.postgres)
 
 

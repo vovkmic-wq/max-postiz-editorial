@@ -188,7 +188,9 @@ def test_workflow_matches_strict_fixture_contracts_and_runs_canonical_full_check
     assert upload["with"]["name"] == "canonical-${{ matrix.mode }}-report"
     assert len({upload["with"]["name"].replace("${{ matrix.mode }}", mode)
                 for mode in job["strategy"]["matrix"]["mode"]}) == 2
-    assert upload["with"]["path"].splitlines() == ["data/check-runs/*/report.json", "data/check-runs/*/tests.xml", "data/check-runs/*/*.log"]
+    assert upload["with"]["path"].splitlines() == [
+        "data/check-runs/*/report.json", "data/check-runs/*/tests.xml",
+        "data/check-runs/*/installed-wheel.xml", "data/check-runs/*/*.log"]
     assert upload["with"]["if-no-files-found"] == "error"
     for name in ("quality", "python-tests", "postgres-tests"):
         install = next(step["run"] for step in jobs[name]["steps"] if step.get("name") == "Install pinned dependencies")
@@ -228,20 +230,28 @@ def test_full_postgres_job_requires_one_owned_report_and_ignores_nested_fixtures
             "--junit", str(Path("data/check-runs/run-0/tests.xml"))]
 
 
-@pytest.mark.parametrize("skipped", [False, True])
-def test_junit_gate_rejects_skips_and_requires_all_new_pg_cases(tmp_path, skipped, capsys):
+@pytest.mark.parametrize("damage", [None, "existing_skip", "missing", "skipped", "failure", "error"])
+def test_junit_gate_rejects_skips_and_requires_all_new_pg_cases(tmp_path, damage, capsys):
     root = ET.Element("testsuite")
     for group, count in (("test_route_dispatch_postgres", 1), ("test_route_recovery", 1),
                          ("test_monitor_configuration_postgres", 9),
-                         ("test_preapproval_retirement_postgres", 28), ("test_max_plaintext_postgres", 4)):
+                         ("test_preapproval_retirement_postgres", 28), ("test_max_plaintext_postgres", 4),
+                         ("test_unbound_selection_reconciliation_postgres", 16)):
         for index in range(count):
+            unbound = group == "test_unbound_selection_reconciliation_postgres" and index == 0
+            if unbound and damage == "missing":
+                continue
             name = ("test_postgres_recovery_skips_locked_sender_then_reconciles_during_pause"
                     if group == "test_route_recovery" else "test_guard_" + str(index))
             case = ET.SubElement(root, "testcase", classname=group, name=name)
-            if skipped and group == "test_monitor_configuration_postgres" and index == 0:
+            if damage == "existing_skip" and group == "test_monitor_configuration_postgres" and index == 0:
                 ET.SubElement(case, "skipped", message="synthetic missing fixture")
+            if unbound and damage in {"skipped", "failure", "error"}:
+                ET.SubElement(case, damage)
     report = tmp_path / "tests.xml"
     ET.ElementTree(root).write(report)
-    assert helper().main(["--junit", str(report)]) == (1 if skipped else 0)
+    assert helper().main(["--junit", str(report)]) == (1 if damage else 0)
     output = capsys.readouterr()
+    if damage is None:
+        assert json.loads(output.out)["test_unbound_selection_reconciliation_postgres"] == {"total": 16, "passed": 16}
     assert "synthetic-private" not in output.out + output.err

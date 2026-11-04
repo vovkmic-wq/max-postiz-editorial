@@ -133,6 +133,18 @@ class ArticleReserveStore:
     def __init__(self, core):
         self.core = core
 
+    def inspect_unbound_selection(self, claim_id):
+        from .unbound_selection_reconciliation import inspect
+        return inspect(self.core, claim_id)
+
+    def reconcile_unbound_selection_pre_request(self, claim_id, **decision):
+        from .unbound_selection_reconciliation import apply
+        return apply(self.core, claim_id, **decision)
+
+    def unbound_selection_operation_status(self, operation_id):
+        from .unbound_selection_reconciliation import operation_status
+        return operation_status(self.core, operation_id)
+
     def inspect_preapproval_retirement(self, record_id):
         from .preapproval_retirement import inspect
         return inspect(self.core, record_id)

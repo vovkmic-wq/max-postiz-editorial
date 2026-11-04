@@ -49,8 +49,8 @@ def _get(client, url, params=None):
 
 
 def _parser(*, science_mailto=False):
-    # Используем проверенный links-v1 extractor с сохранением видимых href.
-    path = Path(__file__).resolve().parents[2] / "scripts/fetch_nasa_article.py"
+    # Wheel содержит тот же extractor; отдельный модуль сохраняет изоляцию mailto.
+    path = Path(__file__).with_name("nasa_extractor.py")
     spec = importlib.util.spec_from_file_location("max_postiz_nasa_extractor", path)
     if spec is None or spec.loader is None:
         raise AgentError("NASA_EXTRACTOR_UNAVAILABLE", 503)
