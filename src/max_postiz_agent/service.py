@@ -76,6 +76,8 @@ class Service:
         video_changed = self.settings.app.get("video") != settings.app.get("video")
         # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
         with self.db.session.begin() as session:
+            from .preapproval_retirement import fence_draft_mutation
+            fence_draft_mutation(session)
             # Обрабатываем ветвь при условии: not session.get(ConfigVersion, settings.hash).
             if not session.get(ConfigVersion, settings.hash):
                 session.add(
@@ -107,6 +109,9 @@ class Service:
                 for draft in session.scalars(select(Draft).where(
                     Draft.state.not_in(["published", "archived"]), Draft.config_id != settings.hash
                 )):
+                    from .preapproval_retirement import draft_mutation_blocked
+                    if draft_mutation_blocked(session, draft.id):
+                        continue
                     draft.state = "stale"
                 session.execute(update(Approval).where(
                     Approval.config_id != settings.hash
@@ -548,6 +553,9 @@ class Service:
 
     # Сохраняем согласование после проверки хеша, версии и ограничений.
     def _approve(self, session, draft, actor):
+        from .preapproval_retirement import assert_draft_mutable, fence_draft_mutation
+        fence_draft_mutation(session)
+        assert_draft_mutable(session, draft.id)
         profile = self.settings.channel(draft.channel_id)
         # Обрабатываем ветвь при условии: self.config_error or draft.config_id != self.settings.hash.
         if self.config_error or draft.config_id != self.settings.hash:
@@ -608,10 +616,13 @@ class Service:
         self.refresh()
         # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
         with self.db.session.begin() as session:
+            from .preapproval_retirement import assert_draft_mutable, fence_draft_mutation
+            fence_draft_mutation(session)
             draft = session.scalar(select(Draft).where(Draft.id == draft_id).with_for_update())
             # Обрабатываем ветвь при условии: not draft.
             if not draft:
                 raise AgentError("DRAFT_NOT_FOUND", 404)
+            assert_draft_mutable(session, draft_id)
             # Обрабатываем ветвь при условии: draft.revision != revision or fingerprint(draft.current) != content_hash.
             if draft.revision != revision or fingerprint(draft.current) != content_hash:
                 raise AgentError("DRAFT_REVISION_CONFLICT", 409)
@@ -624,6 +635,9 @@ class Service:
     def revise(self, draft_id, revision, body, actor="editor"):
         # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
         with self.db.session.begin() as session:
+            from .preapproval_retirement import assert_draft_mutable, fence_draft_mutation
+            fence_draft_mutation(session)
+            assert_draft_mutable(session, draft_id)
             draft = session.get(Draft, draft_id)
             # Обрабатываем ветвь при условии: not draft or draft.revision != revision or draft.state == 'published'.
             if not draft or draft.revision != revision or draft.state == "published":
@@ -693,7 +707,11 @@ class Service:
             # sending intent, never another automatic send after lease expiry.
             # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
             with self.db.session.begin() as session:
+                from .preapproval_retirement import draft_mutation_blocked, fence_draft_mutation
+                fence_draft_mutation(session)
                 draft = session.scalar(select(Draft).where(Draft.id == draft_id).with_for_update())
+                if draft_mutation_blocked(session, draft_id):
+                    continue
                 profile = self.settings.channel(draft.channel_id)
                 channel = session.scalar(
                     select(Channel).where(Channel.id == draft.channel_id).with_for_update()

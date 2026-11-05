@@ -216,6 +216,7 @@ jobs:
           path: |
             data/check-runs/*/report.json
             data/check-runs/*/tests.xml
+            data/check-runs/*/installed-wheel.xml
             data/check-runs/*/*.log
           if-no-files-found: error
           include-hidden-files: true

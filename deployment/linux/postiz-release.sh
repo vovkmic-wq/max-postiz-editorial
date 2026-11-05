@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Owner-operated future handoff only. The default never changes a container.
+# Owner-operated handoff. Default checks own only a never-started metadata container.
 set -euo pipefail
 umask 077
 mode=${1:---check}
@@ -28,6 +28,9 @@ python3 deployment/linux/verify-three-platform-image.py --image-id "$EDITORIAL_P
   --archive "$EDITORIAL_POSTIZ_ARCHIVE" --archive-sha256 "$EDITORIAL_POSTIZ_ARCHIVE_SHA256" \
   --env-file deployment/postiz/.env --acceptance "$EDITORIAL_NATIVE_ACCEPTANCE" \
   --source-commit "$EDITORIAL_SOURCE_COMMIT" "${source_arguments[@]}"
+# Metadata-only: discover and verify both existing Prisma engines in one owned,
+# never-started image container. No database connection, engine download or DDL.
+python3 deployment/linux/check-postiz-schema.py --inspect-image "$EDITORIAL_POSTIZ_IMAGE"
 compose=(docker --context default compose --project-name max-postiz --env-file deployment/postiz/.env
   -f deployment/postiz/compose.yaml -f deployment/postiz/images.lock.yaml
   -f deployment/postiz-max/compose.bridge.yaml -f deployment/linux/compose.yaml

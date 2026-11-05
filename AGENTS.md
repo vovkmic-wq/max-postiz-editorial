@@ -251,7 +251,8 @@ Python — 3.12; зависимости разработки ставятся и
 Подробная подготовка и границы проверки: `docs/CODE_CHECKS.md`.
 
 Единая обязательная команда: `python scripts/check.py`. Она выбирает `.venv`
-этого checkout, проверяет точные версии locks и пакета, `pip check`, полный
+этого checkout, проверяет точные версии locks и пакета, `pip check`, собранный
+wheel из отдельного чистого build-контекста и изоляцию его extractor, полный
 `ruff check src tests scripts`, установленную область `ruff format --check`,
 синтаксис обоих JS-интерфейсов, изолированный Chrome, полный pytest и
 `git diff --check`. Результаты каждого этапа, JUnit и JSON находятся в новом

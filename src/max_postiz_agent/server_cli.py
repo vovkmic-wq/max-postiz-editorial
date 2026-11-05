@@ -2,6 +2,7 @@
 import argparse
 import json
 import logging
+import re
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,6 +12,39 @@ from .config import AgentError
 from .hub_cli import build
 from .server_api import editorial_app, public_state
 from .server_state import DatabaseArticleLedger, ServerState
+
+
+def _log_unexpected_exception(exc, stage):
+    """Сохранять место сбоя без текста исключения, данных и полного traceback."""
+    if isinstance(exc, AgentError):
+        return
+    try:
+        identifier = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+        module_name = re.compile(r"max_postiz_agent(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+        kind = type(exc).__name__
+        if not identifier.fullmatch(kind):
+            kind = "Exception"
+        stages = {"dispatch_tick", "platform_publish_due", "controller", "preparation"}
+        frames = []
+        trace = exc.__traceback__
+        for _ in range(64):
+            if trace is None:
+                break
+            module = trace.tb_frame.f_globals.get("__name__")
+            function = trace.tb_frame.f_code.co_name
+            if (isinstance(module, str) and len(module) <= 160 and module_name.fullmatch(module)
+                    and identifier.fullmatch(function)):
+                frames.append({"module": module, "function": function})
+            trace = trace.tb_next
+        details = {"exception_type": kind, "stage": stage if stage in stages else "unknown",
+                   "frames": frames[-8:]}
+        # Отдельная строка журнала сохраняет первую причину, даже если следующий
+        # проход заменит текущую ошибку на известный блокирующий claim.
+        logging.getLogger(__name__).error(
+            "EDITORIAL_UNEXPECTED_EXCEPTION %s", json.dumps(details, ensure_ascii=True))
+    except Exception:
+        # Диагностика не меняет обработку исходной ошибки и не убивает worker.
+        return
 
 
 def prepare_with_monitor(core, preparer):
@@ -78,13 +112,17 @@ def main(argv=None):
                 def worker():
                     # Только этот поток выполняет внешние изменения Postiz/MAX.
                     while not stop.is_set():
+                        stage = "dispatch_tick"
                         try:
                             core.dispatch_tick()
                             # Отдельные согласования новых адресатов не наследуют
                             # MAX hourly policy; отправляет тот же владелец worker.
+                            stage = "platform_publish_due"
                             core.publish_due(platform_routes_only=True)
+                            stage = "controller"
                             controller.run_once()
                         except Exception as exc:
+                            _log_unexpected_exception(exc, stage)
                             code = exc.code if isinstance(exc, AgentError) else "EDITORIAL_WORKER_ERROR"
                             try:
                                 store.phase("blocked", last_error={"code": code})
@@ -98,6 +136,7 @@ def main(argv=None):
                         try:
                             prepare_with_monitor(core, preparer)
                         except Exception as exc:
+                            _log_unexpected_exception(exc, "preparation")
                             code = exc.code if isinstance(exc, AgentError) else "EDITORIAL_PREPARATION_ERROR"
                             try:
                                 store.progress("preparation", "blocked", last_error={"code": code})

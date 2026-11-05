@@ -165,6 +165,8 @@ def authorize(settings, payload):
             if not intent or intent.state != "sending":
                 raise AgentError("BROWSER_INTENT_NOT_APPROVED")
             draft = session_db.get(Draft, intent.draft_id)
+            from .preapproval_retirement import assert_draft_mutable
+            assert_draft_mutable(session_db, intent.draft_id)
             channel = session_db.get(Channel, intent.channel_id)
             # Обрабатываем ветвь при условии: not draft or not channel or channel.paused or (channel.chat_id != payload['chat_id']).
             if not draft or not channel or channel.paused or channel.chat_id != payload["chat_id"]:
