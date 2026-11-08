@@ -1,5 +1,9 @@
 # Проверка и исправление кода
 
+## Приёмка 0.14.5, 8 ноября 2026
+
+В [CI PR #24](https://github.com/vovkmic-wq/max-postiz-editorial/actions/runs/42481579886) прошли оба полных режима, обычный и PostgreSQL, а также тесты на Linux и Windows. [CodeQL](https://github.com/vovkmic-wq/max-postiz-editorial/actions/runs/42481578317) успешен. Датированное подтверждение установки и доставки описано в [сводке выпуска](RELEASE_0.14.5.md).
+
 ## Проверка установленного пакета 0.14.2, 4 ноября 2026
 
 Оба режима `python scripts/check.py` обязательно собирают настоящий wheel
