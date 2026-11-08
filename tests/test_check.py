@@ -14,6 +14,20 @@ check = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(check)
 
 
+def write_stage_junit(command, body=None):
+    path = next((arg.split("=", 1)[1] for arg in command if arg.startswith("--junitxml=")), None)
+    if path is None:
+        return
+    if "--installed-wheel" in command:
+        body = (
+            "<testsuite>"
+            + "".join(f'<testcase name="{n}"/>' for n in check.WHEEL_CASES)
+            + "</testsuite>"
+        )
+    if body is not None:
+        Path(path).write_text(body)
+
+
 @pytest.fixture
 def checkout(tmp_path, monkeypatch):
     (tmp_path / "src/max_postiz_agent").mkdir(parents=True)
@@ -80,17 +94,23 @@ def test_contracts_verify_current_checkout_and_all_locks(checkout):
             "test_route_dispatch_postgres",
             "test_route_recovery",
             "test_monitor_configuration_postgres",
+            "test_preapproval_retirement_postgres",
+            "test_max_plaintext_postgres",
+            "test_unbound_selection_reconciliation_postgres",
         )
         for damage in ("missing", "skipped", "failure", "error")
     ],
 )
-def test_owned_postgres_report_requires_all_three_suites_without_skips(
+def test_owned_postgres_report_requires_all_six_suites_without_skips(
     tmp_path, damaged_group, damage
 ):
     groups = (
         ("test_route_dispatch_postgres", 1),
         ("test_route_recovery", 1),
         ("test_monitor_configuration_postgres", 9),
+        ("test_preapproval_retirement_postgres", 28),
+        ("test_max_plaintext_postgres", 4),
+        ("test_unbound_selection_reconciliation_postgres", 16),
     )
     cases = []
     for group, count in groups:
@@ -114,6 +134,9 @@ def test_owned_postgres_report_requires_all_three_suites_without_skips(
             "test_route_dispatch_postgres": {"total": 1, "passed": 1},
             "test_route_recovery": {"total": 1, "passed": 1},
             "test_monitor_configuration_postgres": {"total": 9, "passed": 9},
+            "test_preapproval_retirement_postgres": {"total": 28, "passed": 28},
+            "test_max_plaintext_postgres": {"total": 4, "passed": 4},
+            "test_unbound_selection_reconciliation_postgres": {"total": 16, "passed": 16},
         }
     else:
         with pytest.raises(ValueError, match="PostgreSQL cases missing or not passed"):
@@ -148,6 +171,7 @@ def test_owned_postgres_identity_failure_blocks_all_pytest_before_database_mutat
         stage = Path(kwargs["stdout"].name).stem
         executed.append(stage)
         assert "pytest" not in command
+        write_stage_junit(command)
         return SimpleNamespace(returncode=int(stage == "owned-postgres-preflight"))
 
     monkeypatch.setattr(check.subprocess, "run", execute)
@@ -221,8 +245,12 @@ def test_unified_check_exit_code_reflects_real_test_result(checkout, monkeypatch
     def execute(command, **kwargs):
         xml = next((arg.split("=", 1)[1] for arg in command if arg.startswith("--junitxml=")), None)
         if xml:
-            Path(xml).write_text("<testsuites><testsuite>" + case + "</testsuite></testsuites>")
-            return SimpleNamespace(returncode=1 if "failure" in case else 0)
+            write_stage_junit(
+                command, "<testsuites><testsuite>" + case + "</testsuite></testsuites>"
+            )
+            return SimpleNamespace(
+                returncode=int("failure" in case and "--installed-wheel" not in command)
+            )
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(check.subprocess, "run", execute)
@@ -255,9 +283,10 @@ def test_full_suite_budget_preserves_long_success_and_bounded_timeout(
         if duration > kwargs["timeout"]:
             raise check.subprocess.TimeoutExpired(command, kwargs["timeout"])
         if xml:
-            Path(xml).write_text(
+            write_stage_junit(
+                command,
                 '<testsuites><testsuite><testcase name="virtual_complete_suite" '
-                f'time="{suite_seconds}"/></testsuite></testsuites>'
+                f'time="{suite_seconds}"/></testsuite></testsuites>',
             )
         return SimpleNamespace(returncode=0)
 
@@ -269,6 +298,7 @@ def test_full_suite_budget_preserves_long_success_and_bounded_timeout(
     assert report["status"] == ("passed" if expected == 0 else "failed")
     assert list(executed) == [
         "dependencies",
+        "installed-wheel",
         "lint",
         "format",
         "javascript-dashboard",
@@ -279,9 +309,15 @@ def test_full_suite_budget_preserves_long_success_and_bounded_timeout(
     ]
     stages = {stage["name"]: stage for stage in report["stages"]}
     assert all(stage["timeout_seconds"] == executed[name] for name, stage in stages.items())
-    assert executed["tests"] == 7200 and executed["browser"] == 60
+    assert (
+        executed["tests"] == 7200
+        and executed["browser"] == 60
+        and executed["installed-wheel"] == 300
+    )
     assert all(
-        budget == 3600 for name, budget in executed.items() if name not in {"tests", "browser"}
+        budget == 3600
+        for name, budget in executed.items()
+        if name not in {"tests", "browser", "installed-wheel"}
     )
     assert all(stage["status"] == "passed" for name, stage in stages.items() if name != "tests")
     assert stages["tests"]["seconds"] == min(suite_seconds, 7200)
@@ -300,8 +336,8 @@ def test_lint_failure_does_not_hide_other_checks(checkout, monkeypatch):
         executed.append(command)
         xml = next((arg.split("=", 1)[1] for arg in command if arg.startswith("--junitxml=")), None)
         if xml:
-            Path(xml).write_text(
-                '<testsuites><testsuite><testcase name="ok"/></testsuite></testsuites>'
+            write_stage_junit(
+                command, '<testsuites><testsuite><testcase name="ok"/></testsuite></testsuites>'
             )
         failed = "ruff" in command and "check" in command
         return SimpleNamespace(returncode=int(failed))
@@ -369,7 +405,7 @@ def test_invalid_junit_or_false_success_exit_code_cannot_make_report_green(
             (arg.split("=", 1)[1] for arg in command if arg.startswith("--junitxml=")), None
         )
         if path:
-            Path(path).write_text(xml)
+            write_stage_junit(command, xml)
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(check.subprocess, "run", execute)
@@ -406,6 +442,7 @@ def test_browser_failure_blocks_tests_but_still_reports_other_stages(checkout, m
 
     def execute(command, **kwargs):
         calls.append(command)
+        write_stage_junit(command)
         browser = any("chromium.launch" in arg for arg in command)
         return SimpleNamespace(returncode=int(browser))
 
@@ -419,3 +456,230 @@ def test_browser_failure_blocks_tests_but_still_reports_other_stages(checkout, m
     assert (
         next(stage for stage in report["stages"] if stage["name"] == "tests")["status"] == "blocked"
     )
+
+
+def test_installed_wheel_failure_blocks_editable_suite(checkout, monkeypatch):
+    executed = []
+
+    def execute(command, **kwargs):
+        stage = Path(kwargs["stdout"].name).stem
+        executed.append(stage)
+        path = next(
+            (arg.split("=", 1)[1] for arg in command if arg.startswith("--junitxml=")), None
+        )
+        if path:
+            Path(path).write_text('<testsuite><testcase name="editable_pass"/></testsuite>')
+        return SimpleNamespace(returncode=int(stage == "installed-wheel"))
+
+    monkeypatch.setattr(check.subprocess, "run", execute)
+    assert check.run(checkout, postgres=False) == 1
+    assert "installed-wheel" in executed and "tests" not in executed
+    report = json.loads(next((checkout / "data/check-runs").glob("*/report.json")).read_text())
+    assert report["status"] == "failed"
+    assert next(s for s in report["stages"] if s["name"] == "tests")["status"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    "damage", [None, "missing", "skipped", "failure", "error", "duplicate", "wrong_name"]
+)
+def test_installed_wheel_report_requires_both_semantic_cases(tmp_path, damage):
+    names = list(check.WHEEL_CASES)
+    if damage == "missing":
+        names.pop()
+    if damage == "duplicate":
+        names.append(names[0])
+    if damage == "wrong_name":
+        names[-1] = "editable_source_test"
+    cases = [
+        f'<testcase name="{name}">{("<" + damage + "/>") if damage in {"skipped", "failure", "error"} and index == 0 else ""}</testcase>'
+        for index, name in enumerate(names)
+    ]
+    path = tmp_path / "wheel.xml"
+    path.write_text("<testsuite>" + "".join(cases) + "</testsuite>")
+    if damage is None:
+        assert check.installed_wheel_summary(path)["passed"] == 2
+    else:
+        with pytest.raises(ValueError, match="installed-wheel cases"):
+            check.installed_wheel_summary(path)
+
+
+@pytest.mark.parametrize("damage", ["missing", "wrong_names", "skipped"])
+def test_false_success_wheel_command_cannot_hide_invalid_junit(checkout, monkeypatch, damage):
+    def execute(command, **kwargs):
+        stage = Path(kwargs["stdout"].name).stem
+        assert stage != "tests"
+        if stage == "installed-wheel" and damage != "missing":
+            path = next(a.split("=", 1)[1] for a in command if a.startswith("--junitxml="))
+            names = ["editable_fake"] if damage == "wrong_names" else list(check.WHEEL_CASES)
+            Path(path).write_text(
+                "<testsuite>"
+                + "".join(
+                    f'<testcase name="{n}">{"<skipped/>" if damage == "skipped" else ""}</testcase>'
+                    for n in names
+                )
+                + "</testsuite>"
+            )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(check.subprocess, "run", execute)
+    assert check.run(checkout, postgres=False) == 1
+    report = json.loads(next((checkout / "data/check-runs").glob("*/report.json")).read_text())
+    assert next(s for s in report["stages"] if s["name"] == "installed-wheel")["status"] == "failed"
+
+
+def test_wheel_build_context_preserves_declared_metadata_and_new_module_not_caches(
+    checkout, monkeypatch
+):
+    (checkout / "README.md").write_text("Declared project readme")
+    (checkout / "LICENSE").write_text("Project license")
+    package = checkout / "src/max_postiz_agent"
+    (package / "nasa_extractor.py").write_text("# New untracked package source")
+    (package / "__pycache__").mkdir()
+    (package / "__pycache__/stale.pyc").write_bytes(b"stale")
+    (package / "__pycache__/stale.py").write_text("stale source")
+    (checkout / ".env.local").write_text("PRIVATE_RUNTIME_NEVER_COPY")
+    tracked = b"pyproject.toml\0README.md\0LICENSE\0src/max_postiz_agent/__init__.py\0"
+    monkeypatch.setattr(check.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=tracked))
+    sources = check.wheel_sources(checkout)
+    assert set(sources) == {
+        "pyproject.toml",
+        "README.md",
+        "LICENSE",
+        "src/max_postiz_agent/__init__.py",
+        "src/max_postiz_agent/nasa_extractor.py",
+    }
+    assert sources["README.md"] == b"Declared project readme"
+
+
+def test_wheel_build_context_refuses_traversal_instead_of_copying_private_files(
+    checkout, monkeypatch
+):
+    monkeypatch.setattr(
+        check.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=b"../private\0")
+    )
+    with pytest.raises(ValueError, match="Unsafe or missing"):
+        check.wheel_sources(checkout)
+
+
+@pytest.mark.parametrize(
+    "attempt",
+    [
+        "socket.getaddrinfo('example.invalid', 443)",
+        "subprocess.Popen(['must-not-run'])",
+        "__import__('sys').audit('os.posix_spawn', 'never', [], {})",
+        "__import__('sys').audit('os.exec', 'never', [], {})",
+        "__import__('sys').audit('socket.sendmsg', None, [], [], None)",
+        "__import__('sys').audit('os.fork')",
+    ],
+)
+def test_isolated_wheel_probe_blocks_capabilities_even_during_import(tmp_path, attempt):
+    package = tmp_path / "max_postiz_agent"
+    package.mkdir()
+    (package / "__init__.py").touch()
+    (package / "server_nasa.py").write_text("import socket, subprocess\n" + attempt)
+    result = check.subprocess.run(
+        [
+            check.sys.executable,
+            "-X",
+            "utf8",
+            "-I",
+            "-B",
+            "-c",
+            check.WHEEL_PROBE,
+            str(tmp_path),
+            "1.0",
+            str(Path(__file__).resolve().parents[1]),
+            str(tmp_path / "build-source"),
+        ],
+        cwd=tmp_path,
+        stdout=check.subprocess.PIPE,
+        stderr=check.subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert b"cannot access network or start processes" in result.stderr
+
+
+def test_isolated_wheel_probe_cannot_pass_with_editable_package(tmp_path):
+    result = check.subprocess.run(
+        [
+            check.sys.executable,
+            "-X",
+            "utf8",
+            "-I",
+            "-B",
+            "-c",
+            check.WHEEL_PROBE,
+            str(tmp_path),
+            "1.0",
+            str(Path(__file__).resolve().parents[1]),
+            str(tmp_path / "build-source"),
+        ],
+        cwd=tmp_path,
+        stdout=check.subprocess.PIPE,
+        stderr=check.subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode != 0 and b"cannot read repository/build source" in result.stderr
+
+
+def test_wheel_probe_rejects_repository_fallback_even_inside_packaged_module(tmp_path):
+    package = tmp_path / "max_postiz_agent"
+    package.mkdir()
+    (package / "__init__.py").touch()
+    root = Path(__file__).resolve().parents[1]
+    source = f"from pathlib import Path\nPath({str(root / 'scripts/fetch_nasa_article.py')!r}).read_text()\n"
+    (package / "server_nasa.py").write_text(source, encoding="utf-8")
+    result = check.subprocess.run(
+        [
+            check.sys.executable,
+            "-X",
+            "utf8",
+            "-I",
+            "-B",
+            "-c",
+            check.WHEEL_PROBE,
+            str(tmp_path),
+            "1.0",
+            str(root),
+            str(tmp_path / "build-source"),
+        ],
+        cwd=tmp_path,
+        stdout=check.subprocess.PIPE,
+        stderr=check.subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode != 0 and b"cannot read repository/build source" in result.stderr
+
+
+def test_wheel_probe_allows_local_hostname_audit_for_windows_platform_import(tmp_path):
+    package = tmp_path / "max_postiz_agent"
+    package.mkdir()
+    (package / "__init__.py").touch()
+    (package / "server_nasa.py").write_text("import sys\nsys.audit('socket.gethostname')\n")
+    root = Path(__file__).resolve().parents[1]
+    result = check.subprocess.run(
+        [
+            check.sys.executable,
+            "-X",
+            "utf8",
+            "-I",
+            "-B",
+            "-c",
+            check.WHEEL_PROBE,
+            str(tmp_path),
+            "1.0",
+            str(root),
+            str(tmp_path / "build-source"),
+        ],
+        cwd=tmp_path,
+        stdout=check.subprocess.PIPE,
+        stderr=check.subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode != 0 and b"max_postiz_agent.config" in result.stderr
+    assert b"cannot access network" not in result.stderr

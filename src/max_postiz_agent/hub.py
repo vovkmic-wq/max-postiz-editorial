@@ -180,6 +180,9 @@ class HubService(Service):
         v = s.scalar(query)
         if not v:
             raise AgentError("VARIANT_NOT_FOUND", 404)
+        if lock:
+            from .preapproval_retirement import assert_mutable
+            assert_mutable(s, v.id)
         return v
 
     def snapshot(self, v, target):
@@ -454,6 +457,8 @@ class HubService(Service):
         # Authorization must precede bridge synchronization or any other mutation.
         with self.db.session() as check:
             variant = self._variant(check, ident)
+            from .preapproval_retirement import assert_mutable
+            assert_mutable(check, variant.id)
             if automatic:
                 from .automatic_policy import POLICY_ACTOR, eligible as automatic_eligible
                 if actor != POLICY_ACTOR:
@@ -557,6 +562,8 @@ class HubService(Service):
     def _valid_dispatch(self, s, d):
         from .human_review import HUMAN_ACTORS, eligible, hourly
         v = self._variant(s, d.variant_id)
+        from .preapproval_retirement import assert_mutable
+        assert_mutable(s, v.id)
         self.bridge.check_approval(s, v, d.due_at)
         t = self._target(s, v.target_id)
         a = s.get(TargetApproval, d.approval_id)
@@ -935,6 +942,8 @@ class HubService(Service):
             link = s.get(RemoteDraft, v.id)
             if link:
                 raise AgentError("REMOTE_DRAFT_ALREADY_TRACKED", 409)
+            if bridge_target:
+                PostizClient.validate_max_plaintext(v.body)
             link = RemoteDraft(variant_id=v.id, synced_revision=v.revision, correlation=uid())
             s.add(link)
         try:
@@ -963,11 +972,16 @@ class HubService(Service):
     def sync_remote(self, variant_id):
         with self.db.session() as s:
             v = self._variant(s, variant_id)
+            target = self._target(s, v.target_id)
             link = s.get(RemoteDraft, variant_id)
             if not link or not link.external_id:
                 raise AgentError("REMOTE_DRAFT_UNCONFIRMED", 409)
+            captured = (self.bridge.capture_draft_sync(s, v, target)
+                        if target.route == "max_browser" and target.platform == "max" else None)
             old_revision, old_hash, external_id = link.synced_revision, link.remote_hash, link.external_id
-        remote = self.postiz.get_post(external_id)
+        remote = self.postiz.get_post_fresh(external_id) if captured is not None else self.postiz.get_post(external_id)
+        if captured is not None:
+            return self.bridge.import_post(remote, target, expected_local=captured)
         if remote.get("state") != "DRAFT":
             raise AgentError("REMOTE_SCHEDULED_OUTSIDE_APPROVAL", 409)
         body = remote.get("content")

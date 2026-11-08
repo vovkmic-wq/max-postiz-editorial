@@ -49,8 +49,8 @@ def _get(client, url, params=None):
 
 
 def _parser(*, science_mailto=False):
-    # Используем проверенный links-v1 extractor с сохранением видимых href.
-    path = Path(__file__).resolve().parents[2] / "scripts/fetch_nasa_article.py"
+    # Wheel содержит тот же extractor; отдельный модуль сохраняет изоляцию mailto.
+    path = Path(__file__).with_name("nasa_extractor.py")
     spec = importlib.util.spec_from_file_location("max_postiz_nasa_extractor", path)
     if spec is None or spec.loader is None:
         raise AgentError("NASA_EXTRACTOR_UNAVAILABLE", 503)
@@ -84,6 +84,7 @@ def _pre_model_image_narrative(core, session, record):
     """Исходник отмены до моделей остаётся в dedup; это не восстановление статьи."""
     from .article_attribution import illustrated_presentation
     from .article_reserve import KNOWN_IMAGE_REJECTIONS, RESERVE_CONTRACT
+    from .article_sources import IMAGE_SOURCE_PROOF_CONFLICT
     from .db import Audit, Story
     from .hub_models import Variant
     from .server_models import EditorialLedger, EditorialPreparationClaim, PublicationSlot
@@ -165,6 +166,13 @@ def _pre_model_image_narrative(core, session, record):
                 and not session.scalar(select(PublicationSlot).where(PublicationSlot.record_id == ident))
                 and not any(v.metadata_json.get('record_id') == ident for v in session.scalars(select(Variant))))
         root = core.settings.root
+        if error == IMAGE_SOURCE_PROOF_CONFLICT:
+            images = root / 'data/article-images'
+            require(images.resolve() == images)
+            try:
+                require(not any(path.name.startswith(ident + '.') for path in images.iterdir()))
+            except FileNotFoundError:
+                pass
         expected = f'data/hourly-articles/quality-{ident}.local.jsonl'
         require(record.get('quality_trace') == expected)
         absent(root / expected)

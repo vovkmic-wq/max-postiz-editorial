@@ -83,12 +83,41 @@ def test_login_wrong_heading_missing_permission_or_ambiguous_header_fail_without
     unchanged(page, requests)
 
 
-@pytest.mark.parametrize("address", [
+NONCANONICAL_ADDRESSES = [
     "http://web.max.ru/-123", "https://other.invalid/-123", "https://web.max.ru/-456",
     "https://web.max.ru/-123?other=1", "https://web.max.ru/-123#other",
-])
+]
+
+
+@pytest.mark.parametrize("address", NONCANONICAL_ADDRESSES)
 @pytest.mark.parametrize("require_publish", [True, False])
 def test_noncanonical_address_is_rejected_before_any_dom_wait_or_navigation(
+        project, address, require_publish):
+    settings = browser_config(project)
+
+    class LiteralAddressPage:
+        # Chrome may upgrade an HTTP fixture navigation to HTTPS before our
+        # guard sees page.url. Keep the exact invalid address under test here.
+        url = address
+
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            self.calls.append(name)
+            raise AssertionError("Address rejection must not access the DOM or navigate")
+
+    page = LiteralAddressPage()
+    with pytest.raises(AgentError, match="^BROWSER_WRONG_CHANNEL$"):
+        browser_runtime.ensure_channel(page, settings, "-123", navigate=False,
+                                       require_publish=require_publish)
+    assert page.url == address
+    assert page.calls == []
+
+
+@pytest.mark.parametrize("address", NONCANONICAL_ADDRESSES[1:])
+@pytest.mark.parametrize("require_publish", [True, False])
+def test_noncanonical_https_real_page_keeps_composer_and_request_count_unchanged(
         channel, address, require_publish):
     settings, page, requests = channel
     page.route("**/*", lambda request: request.fulfill(body=html(), content_type="text/html"))

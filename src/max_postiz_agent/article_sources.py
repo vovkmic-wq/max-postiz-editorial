@@ -12,6 +12,8 @@ from urllib.parse import urlsplit
 
 from .config import AgentError, fingerprint, parse_json
 
+IMAGE_SOURCE_PROOF_CONFLICT = "ARTICLE_IMAGE_SOURCE_PROOF_CONFLICT"
+
 _SOURCES = {
     "noirlab_iotw": {
         "id": "noirlab_iotw", "host": "noirlab.edu",

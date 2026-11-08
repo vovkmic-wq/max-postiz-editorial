@@ -1,7 +1,9 @@
 """Documented Postiz public API, with no implicit retry of mutating requests."""
 import os
 import re
+import secrets
 from datetime import UTC, datetime
+from html import escape
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -24,7 +26,7 @@ class PostizClient:
                                    trust_env=False, follow_redirects=False, transport=transport)
         self.max_video = options.get("max_video_verified", False)
 
-    def request(self, method, path, *, expected_cas_hash=None, **kwargs):
+    def request(self, method, path, *, expected_cas_hash=None, fresh_read=False, **kwargs):
         parsed = urlsplit(self.base)
         if not self.key or not self.base or parsed.scheme not in {"http", "https"}:
             raise AgentError("POSTIZ_NOT_CONFIGURED", 503)
@@ -33,6 +35,11 @@ class PostizClient:
         if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "postiz"}:
             raise AgentError("POSTIZ_HTTPS_REQUIRED")
         headers = {"Authorization": self.key}
+        if fresh_read:
+            if method != "GET":
+                raise AgentError("POSTIZ_FRESH_READ_INVALID")
+            headers.update({"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"})
+            kwargs["params"] = {**dict(kwargs.get("params") or {}), "owned_maxreadnonce": secrets.token_hex(16)}
         if expected_cas_hash is not None:
             if (method != "POST" or path != "/posts" or not isinstance(expected_cas_hash, str)
                     or not re.fullmatch(r"[a-f0-9]{64}", expected_cas_hash)):
@@ -67,6 +74,12 @@ class PostizClient:
             raise AgentError("POSTIZ_RESPONSE_INVALID")
         return data
 
+    def integrations_fresh(self):
+        data = self.request("GET", "/integrations", fresh_read=True)
+        if not isinstance(data, list):
+            raise AgentError("POSTIZ_RESPONSE_INVALID")
+        return data
+
     def posts(self, start=None, end=None):
         start = start or datetime(2000, 1, 1, tzinfo=UTC)
         end = end or datetime(2100, 1, 1, tzinfo=UTC)
@@ -82,6 +95,18 @@ class PostizClient:
             raise AgentError("POSTIZ_POST_NOT_FOUND", 409)
         return found[0]
 
+    def get_post_fresh(self, post_id):
+        """One uncached, nonce-bound GET; a failed read never triggers a retry."""
+        data = self.request("GET", "/posts", fresh_read=True, params={
+            "startDate": datetime(2000, 1, 1, tzinfo=UTC).isoformat(),
+            "endDate": datetime(2100, 1, 1, tzinfo=UTC).isoformat()})
+        if not isinstance(data, dict) or not isinstance(data.get("posts"), list):
+            raise AgentError("POSTIZ_RESPONSE_INVALID")
+        found = [post for post in data["posts"] if isinstance(post, dict) and post.get("id") == post_id]
+        if len(found) != 1:
+            raise AgentError("POSTIZ_POST_NOT_FOUND", 409)
+        return found[0]
+
     def upload(self, path, mime):
         with path.open("rb") as stream:
             data = self.request("POST", "/upload", files={"file": (path.name, stream, mime)})
@@ -89,15 +114,23 @@ class PostizClient:
             raise AgentError("POSTIZ_RESPONSE_INVALID")
         return {"id": data["id"], "path": data["path"]}
 
+    @staticmethod
+    def validate_max_plaintext(content):
+        if not isinstance(content, str) or not content or content != content.strip():
+            raise AgentError("MAX_CANONICAL_PLAINTEXT_REQUIRED")
+
     def create(self, target, content, media, kind="draft", due_at=None, tag=None):
         if kind not in {"draft", "schedule"}:
             raise AgentError("POSTIZ_TYPE_INVALID")
+        if target.platform == "max-browser":
+            self.validate_max_plaintext(content)
         settings = dict(target.options.get("settings", {}))
         settings["__type"] = target.platform
         date = datetime.now(UTC) if due_at is None else datetime.fromtimestamp(due_at, UTC)
         body = {"type": kind, "date": date.isoformat(),
                 "shortLink": False, "tags": [], "posts": [{"integration": {"id": target.destination},
-                "value": [{"content": content, "image": media}], "settings": settings}]}
+                "value": [{"content": escape(content, quote=False) if target.platform == "max-browser" else content,
+                           "image": media}], "settings": settings}]}
         # Correlation is local metadata, not a visible watermark or unsupported API field.
         data = self.request("POST", "/posts", json=body)
         if not isinstance(data, list) or len(data) != 1 or not data[0].get("postId"):

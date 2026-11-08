@@ -92,6 +92,30 @@ def test_settings_revision_is_independent_from_worker_heartbeat(cycle):
         store.settings(settings, store.read()["revision"], "postiz:owner")
 
 
+@pytest.mark.parametrize("next_claim", [None, "first", "second"])
+def test_new_preparation_claim_does_not_inherit_previous_article_status(cycle, next_claim):
+    old, core, _, _, calls, *_ = cycle
+    store = ServerState(core)
+    initial = store.initialize()
+    store.phase("waiting_dispatch", record_id="scheduled-record")
+    store.progress("preparation", "preparing", claim_id="first",
+                   source_url="https://example.test/previous/", record_id="previous-record")
+    history = copy.deepcopy(old._load())
+    details = {"claim_id": next_claim} if next_claim is not None else {}
+    store.progress("preparation", "selecting", **details)
+    current = store.read()
+    progress = current["runtime"]["preparation"]
+    assert progress["claim_id"] == (next_claim or "first")
+    if next_claim == "second":
+        assert "source_url" not in progress and "record_id" not in progress
+    else:
+        assert progress["source_url"] == "https://example.test/previous/"
+        assert progress["record_id"] == "previous-record"
+    assert current["runtime"]["record_id"] == "scheduled-record"
+    assert current["revision"] == initial["revision"]
+    assert old._load() == history and calls == []
+
+
 @pytest.mark.parametrize("blocker", [None, "target", "sending", "unknown", "dispatch_owner",
                                     "dispatch_lease", "bridge_owner", "bridge_lease", "preparation"])
 def test_prepare_only_resume_is_fenced_and_never_resumes_targets(cycle, blocker):

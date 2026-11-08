@@ -15,6 +15,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
 from .article_attribution import illustrated_presentation
+from .article_sources import IMAGE_SOURCE_PROOF_CONFLICT
 from .config import AgentError, fingerprint
 from .db import Audit, now, uid
 from .hub import ACTIVE
@@ -28,6 +29,7 @@ KNOWN_IMAGE_REJECTIONS = frozenset({
     "ARTICLE_IMAGE_REQUIRED", "ARTICLE_IMAGE_SOURCE_NOT_SUPPORTED", "ARTICLE_IMAGE_RIGHTS_REQUIRED",
     "ARTICLE_IMAGE_DOWNLOAD_REQUIRED", "ARTICLE_IMAGE_QUALITY_REQUIRED", "ARTICLE_IMAGE_SIZE_INVALID",
     "ARTICLE_IMAGE_FORMAT_INVALID", "ARTICLE_IMAGE_SOURCE_UNAVAILABLE", "IMAGE_FORMAT_INVALID", "IMAGE_SIZE_INVALID",
+    IMAGE_SOURCE_PROOF_CONFLICT,
 })
 ACTIVE_SLOT_STATES = {"assigned", "pending", "blocked_unknown", "delivered"}
 _IDENTITY = ("id", "target_id", "source_id", "url", "original_hash", "input_hash", "policy_hash",
@@ -132,6 +134,26 @@ def _hash(value):
 class ArticleReserveStore:
     def __init__(self, core):
         self.core = core
+
+    def inspect_unbound_selection(self, claim_id):
+        from .unbound_selection_reconciliation import inspect
+        return inspect(self.core, claim_id)
+
+    def reconcile_unbound_selection_pre_request(self, claim_id, **decision):
+        from .unbound_selection_reconciliation import apply
+        return apply(self.core, claim_id, **decision)
+
+    def unbound_selection_operation_status(self, operation_id):
+        from .unbound_selection_reconciliation import operation_status
+        return operation_status(self.core, operation_id)
+
+    def inspect_preapproval_retirement(self, record_id):
+        from .preapproval_retirement import inspect
+        return inspect(self.core, record_id)
+
+    def retire_preapproval_no_send(self, record_id, **decision):
+        from .preapproval_retirement import apply
+        return apply(self.core, record_id, **decision)
 
     def _control(self, session, *, running=True):
         if running:
@@ -392,6 +414,11 @@ class ArticleReserveStore:
                 claim_id=row.id, control_revision=row.control_revision, error=error,
                 source_hash=record.get("original_hash"), policy_hash=record.get("policy_hash"),
                 model_calls=0, source_remains_used=True)
+            if error == IMAGE_SOURCE_PROOF_CONFLICT:
+                # До commit доказываем отсутствие image claim и доступность полного исходника для dedup.
+                from .server_nasa import _pre_model_image_narrative
+                session.flush()
+                _pre_model_image_narrative(self.core, session, record)
             return _claim_view(row)
 
     def reject_translation_preflight(self, claim, record_id, rejection, *, cycle):

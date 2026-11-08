@@ -188,15 +188,73 @@ def test_duplicate_contact_obfuscation_keeps_raw_proofs_hashes_selection_and_one
     assert all(path.read_bytes() == data for path, data in raw.items())
 
 
+def test_valid_conflicting_snapshots_have_a_distinct_pre_download_error(illustration):
+    value = illustration
+    duplicate_cf_source_proofs(value, "page")
+    transport, calls, _ = download(value)
+    with pytest.raises(AgentError, match="^ARTICLE_IMAGE_SOURCE_PROOF_CONFLICT$"):
+        prepare_article_image(value.core, value.article, value.record, value.policy, transport=transport)
+    assert not calls and not (value.root / "data/article-images").exists()
+
+
 @pytest.mark.parametrize("change", ["email", "terms", "other_href", "other_html", "license", "raw_hash",
                                     "page", "image", "credit", "copyright"])
 def test_contact_equivalence_never_accepts_other_rights_page_image_or_credit_changes(illustration, change):
     value = illustration
     duplicate_cf_source_proofs(value, change)
-    with pytest.raises(AgentError):
+    with pytest.raises(AgentError) as failure:
         prepare_article_image(value.core, value.article, value.record, value.policy,
             transport=httpx.MockTransport(lambda _: pytest.fail("different proof reached image download")))
+    if change == "raw_hash":
+        assert failure.value.code == "ARTICLE_IMAGE_PROOF_INVALID"
     assert not (value.root / "data/article-images/image-record-1.claim.local.json").exists()
+
+
+@pytest.mark.parametrize("change", ["exact", "wrong_version", "attribute", "duplicate", "other_html"])
+def test_esa_aladin_migration_keeps_exact_source_evidence(illustration, change):
+    value = illustration
+    old = ('<script type="text/javascript" src="https://aladin.u-strasbg.fr/'
+           'AladinLite/api/v3/latest/aladin.js" charset="utf-8"></script>')
+    new = ('<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/'
+           'aladin-lite/3.4.4/aladin.js" charset="utf-8" defer></script>')
+    updated = "<!--" + old + "-->" + new
+    if change == "wrong_version":
+        updated = updated.replace("3.4.4", "3.4.5")
+    elif change == "attribute":
+        old = "<div title='" + old + "'></div>"
+        updated = "<div title='" + updated + "'></div>"
+    elif change == "duplicate":
+        old, updated = old * 2, updated * 2
+    elif change == "other_html":
+        updated += "<!--unrelated-->"
+    first = json.loads(value.source_path.read_bytes())
+    second = copy.deepcopy(first)
+    other = value.source_path.with_name(value.source.source_id + "-zz-aladin.local.json")
+    for path, source, addition in ((value.source_path, first, old), (other, second, updated)):
+        source["page_html"] = source["page_html"].replace("</html>", addition + "</html>")
+        source["hashes"]["page"] = hashlib.sha256(source["page_html"].encode()).hexdigest()
+        path.write_text(json.dumps(source), encoding="utf-8")
+    original_proofs = {path: path.read_bytes() for path in (value.source_path, other)}
+    transport, calls, _ = download(value)
+    if value.source.source_id == "esahubble_potw" and change == "exact":
+        proof = prepare_article_image(value.core, value.article, value.record, value.policy, transport=transport)
+        assert len(calls) == 1
+        assert proof["source_proof"] == value.source_path.relative_to(value.root).as_posix()
+        assert proof["page_sha256"] == first["hashes"]["page"] != second["hashes"]["page"]
+        assert proof["source_proof_sha256"] == hashlib.sha256(original_proofs[value.source_path]).hexdigest()
+        # Поздний снимок может сортироваться раньше файла, на который ссылается доказательство.
+        earlier = other.with_name(value.source.source_id + "-000-aladin.local.json")
+        assert earlier < value.source_path
+        earlier.write_bytes(original_proofs[other])
+        assert prepare_article_image(value.core, value.article, value.record, value.policy, transport=transport) == proof
+        assert len(calls) == 1
+        value.record.update(illustration=proof, image_credit=proof["credit"], illustration_proof_hash=fingerprint(proof))
+        assert validate_article_image(value.core, value.record) == [proof["media"]]
+    else:
+        with pytest.raises(AgentError, match="^ARTICLE_IMAGE_SOURCE_PROOF_CONFLICT$"):
+            prepare_article_image(value.core, value.article, value.record, value.policy, transport=transport)
+        assert not calls
+    assert all(path.read_bytes() == data for path, data in original_proofs.items())
 
 
 def test_official_page_exact_download_credit_and_rights_yield_canonical_good_jpeg_once(illustration):
