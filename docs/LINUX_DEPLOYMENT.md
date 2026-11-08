@@ -1,6 +1,8 @@
 # Эксплуатация редакции в Linux VM
 
-## Действующий порядок 0.11.5
+Актуальные версия и рабочий цикл: [выпуск 0.14.5](RELEASE_0.14.5.md).
+
+## Исторический порядок 0.11.5
 
 Единственная панель — Postiz `/editorial`, один Linux server owner в
 `/opt/max-postiz`, сервис `max-postiz-editorial.service`. Установлены Python
