@@ -16,10 +16,10 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 
 from .article_attribution import CC_BY_URL, ILLUSTRATED_PRESENTATION_CONTRACT, illustrated_presentation
-from .article_sources import source_spec, validate_source_url
+from .article_sources import IMAGE_SOURCE_PROOF_CONFLICT, source_spec, validate_source_url
 from .config import AgentError, fingerprint, inside
 from .media import inspect_image
 
@@ -31,6 +31,15 @@ HOSTS = {'noirlab_iotw': ('storage.noirlab.edu', '/media/archives/images/'),
 _PERSON = re.compile(r'\b(?:portrait|selfie|group photograph|group photo|team photo|people|person|visitors|students|astronauts?)\b', re.I)
 PART_BYTES = 8192
 MAX_PARTS = (MAX_BYTES + PART_BYTES - 1) // PART_BYTES
+_ESA_ALADIN_OLD = (
+    '<script type="text/javascript" src="https://aladin.u-strasbg.fr/'
+    'AladinLite/api/v3/latest/aladin.js" charset="utf-8"></script>'
+)
+_ESA_ALADIN_NEW = (
+    '<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/'
+    'aladin-lite/3.4.4/aladin.js" charset="utf-8" defer></script>'
+)
+_ESA_ALADIN_MIGRATION = '<!--' + _ESA_ALADIN_OLD + '-->' + _ESA_ALADIN_NEW
 
 
 def _require(ok, code='ARTICLE_IMAGE_PROOF_INVALID'):
@@ -40,6 +49,16 @@ def _require(ok, code='ARTICLE_IMAGE_PROOF_INVALID'):
 
 def _sha(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+def _page_comparison_hash(html, soup, source_id):
+    """Учитываем точную замену просмотрщика ESA только при сравнении снимков."""
+    if (source_id == 'esahubble_potw' and _ESA_ALADIN_MIGRATION in html
+            and html.count(_ESA_ALADIN_OLD) == html.count(_ESA_ALADIN_NEW) == 1):
+        comment = soup.find(string=lambda node: isinstance(node, Comment) and node == _ESA_ALADIN_OLD)
+        if comment is not None and getattr(comment.next_sibling, 'name', None) == 'script':
+            html = html.replace(_ESA_ALADIN_MIGRATION, _ESA_ALADIN_OLD, 1)
+    return _sha(html.encode('utf-8'))
 
 
 def _rights_contact_hash(html):
@@ -213,7 +232,7 @@ def image_candidate(source_id, url, page_html):
     return {'image_url': selected, 'credit': credit, 'credit_links': credit_links}
 
 
-def _source_proof(core, article, source_id):
+def _source_proof(core, article, source_id, *, pinned_path=None, preparing=False):
     from .server_science import _article, _rights, _table_value, _html, _release_day
     from .server_nasa import _parser
     directory = inside(core.settings.root, 'data/server-sources')
@@ -231,6 +250,7 @@ def _source_proof(core, article, source_id):
                 found.append((path, proof))
     _require(found, 'ARTICLE_IMAGE_SOURCE_PROOF_REQUIRED')
     checked = []
+    identities = set()
     for path, proof in found:
         spec = source_spec(source_id)
         _require(proof.get('source_id') == source_id and proof.get('rights_evidence') == spec['rights_evidence']
@@ -249,10 +269,14 @@ def _source_proof(core, article, source_id):
             _require(proof.get('extraction_contract') == 'science-mailto-v1')
         candidate = image_candidate(source_id, article['url'], proof['page_html'])
         checked.append((path, proof, candidate))
-    # Несколько catalog checkpoints допустимы только при одних странице/условиях/картинке.
-    _require(len({fingerprint({'page': p['hashes']['page'], 'rights': _rights_contact_hash(p['rights_html']),
-                              'image': c}) for _, p, c in checked}) == 1)
-    return checked[0]
+        identities.add(fingerprint({'page': _page_comparison_hash(proof['page_html'], soup, source_id),
+                                    'rights': _rights_contact_hash(proof['rights_html']), 'image': candidate}))
+    # Привязки к исходным файлам и их хешам остаются точными.
+    # Отдельный отказ только после проверки каждого снимка и до запроса изображения.
+    _require(len(identities) == 1, IMAGE_SOURCE_PROOF_CONFLICT if preparing else 'ARTICLE_IMAGE_PROOF_INVALID')
+    selected = checked[0] if pinned_path is None else next((row for row in checked if row[0] == pinned_path), None)
+    _require(selected is not None)
+    return selected
 
 
 def _dimensions(root, media):
@@ -281,27 +305,34 @@ def prepare_article_image(core, article, record, policy, *, transport=None):
     source_id = record.get('source_id')
     _require(policy.get('source_id') == source_id and source_id in HOSTS, 'ARTICLE_IMAGE_SOURCE_NOT_SUPPORTED')
     _require(policy.get('rights_evidence') == source_spec(source_id)['rights_evidence'], 'ARTICLE_IMAGE_RIGHTS_REQUIRED')
-    path, source_proof, candidate = _source_proof(core, article, source_id)
     directory = inside(core.settings.root, 'data/article-images')
-    directory.mkdir(parents=True, exist_ok=True)
     claim_path = directory / (record['id'] + '.claim.local.json')
     proof_path = directory / (record['id'] + '.proof.local.json')
+    saved = None
+    pinned_path = None
+    if proof_path.exists():
+        _require(proof_path.is_file() and not proof_path.is_symlink() and proof_path.stat().st_size <= MAX_PROOF_BYTES
+                 and claim_path.is_file() and not claim_path.is_symlink())
+        saved = json.loads(proof_path.read_text(encoding='utf-8'))
+        _require(isinstance(saved, dict) and isinstance(saved.get('source_proof'), str))
+        pinned_path = inside(core.settings.root, saved['source_proof'])
+    path, source_proof, candidate = _source_proof(core, article, source_id, pinned_path=pinned_path,
+                                                  preparing=saved is None)
     binding_input = {'contract': marker, 'record_id': record['id'], 'input_hash': fingerprint(article),
         'policy_hash': fingerprint(policy), 'source_id': source_id, 'source_url': article['url'],
         'source_proof': path.relative_to(core.settings.root).as_posix(), 'source_proof_sha256': _sha(path.read_bytes()),
         'page_sha256': source_proof['hashes']['page'], 'rights_sha256': source_proof['hashes']['rights'],
         'rights_text_sha256': source_spec(source_id)['rights_text_sha256'],
         'rights_evidence': policy['rights_evidence'], 'license': CC_BY_URL, **candidate}
-    if proof_path.exists():
-        _require(not proof_path.is_symlink() and claim_path.is_file() and not claim_path.is_symlink())
+    if saved is not None:
         _require(json.loads(claim_path.read_text(encoding='utf-8')).get('input') == binding_input)
-        saved = json.loads(proof_path.read_text(encoding='utf-8'))
         _require({k: saved.get(k) for k in binding_input} == binding_input)
         probe = {**record, 'illustration': saved, 'image_credit': saved['credit'],
                  'illustration_proof_hash': fingerprint(saved)}
         validate_article_image(core, probe)
         return saved
     _require(not claim_path.exists(), 'ARTICLE_IMAGE_DOWNLOAD_RECONCILIATION_REQUIRED')
+    directory.mkdir(parents=True, exist_ok=True)
     _write(claim_path, {'input': binding_input, 'started_at': time.time(), 'automatic_retry': False})
     temporary = directory / (record['id'] + '.part')
     try:
@@ -370,8 +401,10 @@ def validate_article_image(core, record, variant=None):
              and not source_path.is_symlink() and _sha(source_path.read_bytes()) == proof['source_proof_sha256'])
     source_proof = json.loads(source_path.read_text(encoding='utf-8'))
     _require(fingerprint(source_proof['article']) == record['input_hash'])
-    _, checked, candidate = _source_proof(core, source_proof['article'], record['source_id'])
+    _, checked, candidate = _source_proof(core, source_proof['article'], record['source_id'],
+                                          pinned_path=source_path)
     _require(candidate['image_url'] == proof.get('image_url') and candidate['credit'] == proof.get('credit')
+             and checked == source_proof
              and checked['hashes']['page'] == proof.get('page_sha256')
              and checked['hashes']['rights'] == proof.get('rights_sha256'))
     media = proof.get('media')

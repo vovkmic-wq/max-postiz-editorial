@@ -372,7 +372,78 @@ def test_bounded_meaning_repair_keeps_the_same_illustration_and_new_footer(illus
     assert value.cycle._load()["records"][0]["state"] == "pending"
 
 
-@pytest.mark.parametrize("damage", ["proof_error", "model_unknown", "trace", "model_started", "partial_proof"])
+@pytest.mark.parametrize("postgres", [False, True], ids=["sqlite", "postgres"])
+def test_source_proof_conflict_does_not_block_other_articles(illustrated, monkeypatch, request, postgres):
+    from max_postiz_agent import article_images
+    from max_postiz_agent.adapters import Delivery
+    from max_postiz_agent.server_models import EditorialPreparationClaim
+    from max_postiz_agent.server_nasa import _used_narratives
+
+    value = illustrated
+    if postgres:
+        assert request.getfixturevalue("postgres_reserve") is value
+    rejected = value.article
+    accepted = {**rejected, "url": "https://science.example.org/article/after-image-conflict/",
+                "original": "Researchers mapped molecular clouds around a young star. "
+                            "The measurements show where dense pockets of gas are beginning to collapse."}
+    prepare_image = article_images.prepare_article_image
+    image_calls = []
+
+    def prepare(core, article, record, policy):
+        image_calls.append(article["url"])
+        if article["url"] == rejected["url"]:
+            raise AgentError("ARTICLE_IMAGE_SOURCE_PROOF_CONFLICT", 409)
+        return prepare_image(core, article, record, policy)
+
+    def select(_settings, *, ledger, **_kwargs):
+        if not ledger["records"]:
+            return copy.deepcopy(rejected)
+        if len(ledger["records"]) == 1:
+            assert _used_narratives(value.core, ledger) == [rejected["original"]]
+            return copy.deepcopy(accepted)
+        return None
+
+    monkeypatch.setattr(article_images, "prepare_article_image", prepare)
+    value.controller.selector = select
+    value.controller.prepare_once()
+    failed, ready = value.cycle._load()["records"]
+    assert failed["state"] == "cancelled" and ready["state"] == "quality_ready"
+    assert failed["error"] == failed["preparation_attempts"][0]["error"] == "ARTICLE_IMAGE_SOURCE_PROOF_CONFLICT"
+    assert failed["slot"] == ready["slot"] and failed["url"] == rejected["url"]
+    assert image_calls == [rejected["url"], accepted["url"]] and value.events == ["image", "models"]
+    assert value.store.active_preparation() is None and not value.posts and not value.writes
+    with value.core.db.session() as session:
+        claim = session.get(EditorialPreparationClaim, failed["reserve_claim"]["id"])
+        assert (claim.state, claim.active_key, claim.error) == ("rejected", None, failed["error"])
+
+    value.controller.run_once()
+    pending = value.cycle._load()["records"][1]
+    assert pending["state"] == "pending" and len(value.posts) == len(value.writes) == 1
+    monkeypatch.setattr(value.core.publisher, "upload_image", lambda _path: {
+        "type": "browser-image", "payload": {"path": value.media["path"], "sha256": value.media["sha256"]}},
+        raising=False)
+    delivered = []
+
+    def publish(_destination, _body, _attachment, **kwargs):
+        delivered.append(kwargs["request_id"])
+        return Delivery("confirmed", "fixture-delivered-after-conflict", None)
+
+    monkeypatch.setattr(value.core.publisher, "publish", publish)
+    value.core.publisher.mode = "browser"
+    value.stamp[0] = pending["due_at"] + 1
+    assert value.core.dispatch_tick() == 1 and value.core.dispatch_tick() == 0
+    assert delivered == [pending["dispatch_id"]]
+    with value.core.db.session() as session:
+        dispatch = session.query(Dispatch).one()
+        assert dispatch.id == pending["dispatch_id"] and dispatch.attempts == 1
+    value.posts[pending["postiz_id"]]["state"] = "PUBLISHED"
+    value.controller.run_once()
+    after = value.cycle._load()["records"]
+    assert after[0] == failed and after[1]["state"] == "published"
+
+
+@pytest.mark.parametrize("damage", ["proof_error", "conflict_with_claim", "conflict_with_scan_failure", "model_unknown", "trace",
+                                   "model_started", "partial_proof"])
 def test_unknown_or_damaged_image_preparation_keeps_claim_and_never_repeats_get(illustrated, monkeypatch, damage):
     import max_postiz_agent.article_images as images
     value = illustrated
@@ -380,6 +451,21 @@ def test_unknown_or_damaged_image_preparation_keeps_claim_and_never_repeats_get(
 
     def broken(core, article, record, policy):
         calls.append(record["id"])
+        if damage.startswith("conflict_with_"):
+            path = value.core.settings.root / "data/article-images" / (record["id"] + ".claim.local.json")
+            if damage == "conflict_with_claim":
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}")
+            else:
+                iterdir = type(path).iterdir
+
+                def scan(directory):
+                    if directory == path.parent:
+                        raise PermissionError("image directory unavailable")
+                    return iterdir(directory)
+
+                monkeypatch.setattr(type(path), "iterdir", scan)
+            raise AgentError("ARTICLE_IMAGE_SOURCE_PROOF_CONFLICT", 409)
         if damage == "model_unknown":
             record["model_result_unknown"] = True
         elif damage == "trace":

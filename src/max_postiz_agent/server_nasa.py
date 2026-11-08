@@ -84,6 +84,7 @@ def _pre_model_image_narrative(core, session, record):
     """Исходник отмены до моделей остаётся в dedup; это не восстановление статьи."""
     from .article_attribution import illustrated_presentation
     from .article_reserve import KNOWN_IMAGE_REJECTIONS, RESERVE_CONTRACT
+    from .article_sources import IMAGE_SOURCE_PROOF_CONFLICT
     from .db import Audit, Story
     from .hub_models import Variant
     from .server_models import EditorialLedger, EditorialPreparationClaim, PublicationSlot
@@ -165,6 +166,13 @@ def _pre_model_image_narrative(core, session, record):
                 and not session.scalar(select(PublicationSlot).where(PublicationSlot.record_id == ident))
                 and not any(v.metadata_json.get('record_id') == ident for v in session.scalars(select(Variant))))
         root = core.settings.root
+        if error == IMAGE_SOURCE_PROOF_CONFLICT:
+            images = root / 'data/article-images'
+            require(images.resolve() == images)
+            try:
+                require(not any(path.name.startswith(ident + '.') for path in images.iterdir()))
+            except FileNotFoundError:
+                pass
         expected = f'data/hourly-articles/quality-{ident}.local.jsonl'
         require(record.get('quality_trace') == expected)
         absent(root / expected)
