@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .article_attribution import illustrated_presentation
-from .browser_runtime import COMPOSER, ensure_channel, matching_posts, session
+from .browser_runtime import COMPOSER, BrowserChannelError, ensure_channel, matching_posts, session
 from .config import AgentError, Settings, fingerprint, inside, parse_json
 
 ILLUSTRATED_CONTRACT = "article-illustrated-v1"
@@ -799,9 +799,11 @@ def publish(settings, payload, *, authorize_before_click=None):
                     or saved.get("content_hash") != content_hash
                     or saved.get("started_at") != state["started_at"]):
                 return {"state": "unknown"}
-            state.update(contract=PRECLICK_CONTRACT, state="preclick_failed", failed_at=time.time(),
-                error={"code": exc.code if isinstance(exc, AgentError) else "BROWSER_OPERATION_FAILED",
-                       "type": type(exc).__name__, "message": str(exc)})
+            error = {"code": exc.code if isinstance(exc, AgentError) else "BROWSER_OPERATION_FAILED",
+                     "type": type(exc).__name__, "message": str(exc)}
+            if isinstance(exc, BrowserChannelError):
+                error["diagnostics"] = exc.diagnostics
+            state.update(contract=PRECLICK_CONTRACT, state="preclick_failed", failed_at=time.time(), error=error)
             save(path, state)
             return _preclick_result(settings, payload)
         except Exception:

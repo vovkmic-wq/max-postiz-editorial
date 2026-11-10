@@ -12,18 +12,47 @@ from .config import AgentError, inside
 ORIGIN = "https://web.max.ru"
 COMPOSER = '[contenteditable][role="textbox"][aria-placeholder="Пост"]'
 _CHANNEL_READY_TIMEOUT_MS = 30_000
-_CHANNEL_READY = """({url, title, composer, requirePublish}) => {
-  if (location.href !== url) return 'wrong_channel';
+_CHANNEL_READY = """({url, title, composer, requirePublish, diagnose}) => {
+  const exact_url = location.href === url;
+  const detail = diagnose ? {exact_url, document_state: document.readyState} : null;
+  const result = (state, reason) => diagnose ? {...detail, reason} : state;
+  if (!exact_url) return result('wrong_channel', 'url_mismatch');
   const headings = document.querySelectorAll('#main-header-title');
-  if (headings.length !== 1 || headings[0].innerText.trim() !== title) return false;
-  if (requirePublish === false) return 'ready';
+  const heading = headings.length === 1 ? headings[0].innerText.trim() : '';
+  if (diagnose) Object.assign(detail, {heading_count: headings.length, heading_matches: heading === title});
+  if (!headings.length) return result(false, 'heading_missing');
+  if (headings.length > 1) return result(false, 'heading_ambiguous');
+  if (!heading) return result(false, 'heading_empty');
+  if (heading !== title) return result(false, 'heading_mismatch');
+  if (requirePublish === false) return result('ready', 'ready_at_snapshot');
   const editors = document.querySelectorAll(composer);
-  if (editors.length !== 1) return false;
+  if (diagnose) detail.composer_count = editors.length;
+  if (!editors.length) {
+    const candidates = diagnose ? document.querySelectorAll('[contenteditable][role="textbox"]').length : 0;
+    if (diagnose) detail.alternate_textbox_count = candidates;
+    return result(false, candidates ? 'composer_selector_mismatch' : 'composer_missing');
+  }
+  if (editors.length > 1) return result(false, 'composer_ambiguous');
   const editor = editors[0], box = editor.getBoundingClientRect();
-  if (!editor.isContentEditable || editor.getAttribute('aria-disabled') === 'true'
-      || getComputedStyle(editor).visibility !== 'visible' || !box.width || !box.height) return false;
-  return 'ready';
+  const style = getComputedStyle(editor);
+  const editable = editor.isContentEditable, aria_disabled = editor.getAttribute('aria-disabled') === 'true';
+  const visible = style.visibility === 'visible' && style.display !== 'none';
+  const has_dimensions = Boolean(box.width && box.height);
+  if (diagnose) Object.assign(detail, {editable, aria_disabled, visible, has_dimensions});
+  if (!editable) return result(false, 'composer_not_editable');
+  if (aria_disabled) return result(false, 'composer_disabled');
+  if (!visible) return result(false, 'composer_hidden');
+  if (!has_dimensions) return result(false, 'composer_no_dimensions');
+  return result('ready', 'ready_at_snapshot');
 }"""
+
+
+class BrowserChannelError(AgentError):
+    """A channel check failure with safe observations for the local journal."""
+
+    def __init__(self, code, diagnostics):
+        super().__init__(code)
+        self.diagnostics = diagnostics
 
 
 # Удерживаем системную блокировку профиля на время работы с браузером.
@@ -131,19 +160,34 @@ def ensure_channel(page, settings, chat_id, *, navigate=True, require_publish=Tr
     address = ORIGIN + "/" + chat_id
     budget = min(_CHANNEL_READY_TIMEOUT_MS,
                  int(settings.app["max"].get("browser", {}).get("operation_timeout_seconds", 120) * 1000))
-    deadline = time.monotonic() + budget / 1000
-    # Единственный GET до редактора. После отправки navigate=False не добавляет reload.
-    if navigate:
-        response = page.goto(address, wait_until="domcontentloaded", timeout=budget)
-        if response is not None and response.status == 429:
-            raise AgentError("BROWSER_CHANNEL_RATE_LIMITED")
-        if response is not None and response.status >= 400:
-            raise AgentError("BROWSER_CHANNEL_UNAVAILABLE")
-    # Чужой адрес не пережидаем и не заменяем повторной навигацией.
-    if page.url != address:
-        raise AgentError("BROWSER_WRONG_CHANNEL")
+    started = time.monotonic()
+    deadline = started + budget / 1000
+    http_status = None
     arguments = {"url": address, "title": "Окно чата с " + expected, "composer": COMPOSER,
                  "requirePublish": require_publish}
+
+    def failure(check, trigger, code, **observed):
+        return BrowserChannelError(code, {"check": check, "trigger": trigger,
+            "navigation_requested": navigate, "http_status": http_status,
+            "publish_required": require_publish, "budget_ms": budget,
+            "elapsed_ms": round((time.monotonic() - started) * 1000), **observed})
+
+    # Единственный GET до редактора. После отправки navigate=False не добавляет reload.
+    if navigate:
+        try:
+            response = page.goto(address, wait_until="domcontentloaded", timeout=budget)
+        except Exception as exc:
+            raise failure("navigation", _failure_trigger(exc), code="BROWSER_OPERATION_FAILED",
+                          reason="navigation_failed") from exc
+        if response is not None:
+            http_status = response.status
+        if http_status is not None and http_status >= 400:
+            code = "BROWSER_CHANNEL_RATE_LIMITED" if http_status == 429 else "BROWSER_CHANNEL_UNAVAILABLE"
+            raise failure("navigation", "http_error", code=code, reason="http_status")
+    # Чужой адрес не пережидаем и не заменяем повторной навигацией.
+    if page.url != address:
+        raise failure("address", "mismatch", code="BROWSER_WRONG_CHANNEL",
+                      reason="url_mismatch", exact_url=False)
     try:
         # До Send ждём и название, и права в одном бюджете. Сверка уже
         # существующего сообщения не требует права создать следующее.
@@ -152,27 +196,40 @@ def ensure_channel(page, settings, chat_id, *, navigate=True, require_publish=Tr
         state = result.json_value()
         result.dispose()
     except Exception as exc:
-        raise AgentError(_channel_not_ready(page, address, arguments["title"])) from exc
+        observed = _channel_snapshot(page, arguments)
+        raise failure("readiness_wait", _failure_trigger(exc), _channel_error_code(observed), **observed) from exc
     if state != "ready":
-        raise AgentError("BROWSER_WRONG_CHANNEL")
+        raise failure("readiness_wait", "mismatch", code="BROWSER_WRONG_CHANNEL",
+                      reason="url_mismatch", exact_url=False)
     # Немедленная повторная сверка закрывает смену адреса/прав в конце ожидания.
-    if page.evaluate(_CHANNEL_READY, arguments) != "ready":
-        raise AgentError(_channel_not_ready(page, address, arguments["title"]))
-
-
-def _channel_not_ready(page, address, title):
-    """Классифицируем отказ без новых ожиданий, переходов или входа в аккаунт."""
     try:
-        return page.evaluate("""({address, title}) => {
-          if (location.href !== address) return 'BROWSER_WRONG_CHANNEL';
-          const headings = document.querySelectorAll('#main-header-title');
-          if (headings.length !== 1 || !headings[0].innerText.trim())
-            return 'BROWSER_LOGIN_OR_CHANNEL_REQUIRED';
-          return headings[0].innerText.trim() === title
-            ? 'BROWSER_PUBLISH_PERMISSION_REQUIRED' : 'BROWSER_WRONG_CHANNEL';
-        }""", {"address": address, "title": title})
+        observed = page.evaluate(_CHANNEL_READY, {**arguments, "diagnose": True})
+    except Exception as exc:
+        raise failure("readiness_recheck", _failure_trigger(exc), code="BROWSER_OPERATION_FAILED",
+                      reason="recheck_failed") from exc
+    if observed["reason"] != "ready_at_snapshot":
+        raise failure("readiness_recheck", "mismatch", _channel_error_code(observed), **observed)
+
+
+def _failure_trigger(exc):
+    return "timeout" if type(exc).__name__ == "TimeoutError" else "browser_error"
+
+
+def _channel_snapshot(page, arguments):
+    """Снимаем признаки DOM без повторного ожидания или перехода."""
+    try:
+        return page.evaluate(_CHANNEL_READY, {**arguments, "diagnose": True})
     except Exception:
+        return {"reason": "dom_snapshot_unavailable"}
+
+
+def _channel_error_code(observed):
+    reason = observed["reason"]
+    if reason in {"url_mismatch", "heading_mismatch"}:
+        return "BROWSER_WRONG_CHANNEL"
+    if reason in {"heading_missing", "heading_ambiguous", "heading_empty", "dom_snapshot_unavailable"}:
         return "BROWSER_LOGIN_OR_CHANNEL_REQUIRED"
+    return "BROWSER_PUBLISH_PERMISSION_REQUIRED"
 
 
 # Находим сообщения с точным текстом для сверки результата.
