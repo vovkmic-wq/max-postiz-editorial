@@ -14,6 +14,7 @@ from .db import Audit, Cursor, Draft, DraftRevision, Job, Material, Story, now, 
 from .editorial import validate_draft
 from .hub_models import (Dispatch, DispatchAttempt, RecurringTask, RemoteDraft, Target,
                          TargetApproval, Variant, VariantRevision, SourceArchive)
+from .mobile_hold import assert_item_unheld
 from .postiz import PostizClient
 from .service import Service
 
@@ -77,7 +78,7 @@ class HubService(Service):
         self.publishing = parse_json(path.read_text(encoding="utf-8")) if path.exists() else {
             "schema_version": "1.0", "postiz": {}, "targets": [], "tasks": []}
         validate_schema(settings.root, "publishing.schema.json", self.publishing)
-        self.postiz = postiz or PostizClient(self.publishing["postiz"])
+        self.postiz = postiz or PostizClient(self.publishing["postiz"], journal_root=settings.root)
         from .platform_routes import PlatformRoutes
         self.routes = PlatformRoutes(self, route_publishers)
         from .max_bridge import MaxBridge
@@ -104,7 +105,7 @@ class HubService(Service):
         self.publishing = publishing
         if previous != publishing["postiz"]:
             self.postiz.close()
-            self.postiz = PostizClient(publishing["postiz"])
+            self.postiz = PostizClient(publishing["postiz"], journal_root=candidate.root)
         self.sync_targets()
 
     def sync_targets(self):
@@ -459,6 +460,7 @@ class HubService(Service):
             variant = self._variant(check, ident)
             from .preapproval_retirement import assert_mutable
             assert_mutable(check, variant.id)
+            assert_item_unheld(check, variant.id)
             if automatic:
                 from .automatic_policy import POLICY_ACTOR, eligible as automatic_eligible
                 if actor != POLICY_ACTOR:
@@ -765,6 +767,7 @@ class HubService(Service):
         return expired
 
     def publish_due(self, *, human_hourly_only=False, hourly_only=False, platform_routes_only=False):
+        from .server_models import MobileItemHold
         from .server_state import require_running
         try:
             require_running(self)
@@ -812,6 +815,8 @@ class HubService(Service):
                     raise
                 query = select(Dispatch).join(Variant).join(Target).where(
                     Dispatch.state.in_({"pending", "retry_wait"}), Target.paused.is_(False),
+                    ~select(MobileItemHold.variant_id).where(MobileItemHold.variant_id == Dispatch.variant_id,
+                                                           MobileItemHold.active.is_(True)).exists(),
                     or_(Dispatch.due_at <= now(), Target.route == "postiz")).order_by(Dispatch.due_at)
                 if scope is not None:
                     query = query.where(Dispatch.id.in_(scope))
@@ -829,7 +834,7 @@ class HubService(Service):
                 try:
                     _, t = self._valid_dispatch(s, d)
                 except AgentError as exc:
-                    if exc.code in {"TARGET_PAUSED", "BRIDGE_EDIT_IN_PROGRESS", "ARTICLE_HOURLY_GAP",
+                    if exc.code in {"TARGET_PAUSED", "MOBILE_ITEM_HELD", "BRIDGE_EDIT_IN_PROGRESS", "ARTICLE_HOURLY_GAP",
                                     "ARTICLE_OUTSTANDING_DELIVERY"}:
                         # Pausing freezes work without invalidating its approval.
                         break
@@ -933,6 +938,7 @@ class HubService(Service):
             raise AgentError("SCHEDULE_INVALID")
         with self.db.session.begin() as s:
             v = self._variant(s, variant_id, True)
+            assert_item_unheld(s, v.id)
             t = self._target(s, v.target_id)
             bridge_target = t.route == "max_browser" and self.bridge.enabled and t.options.get("postiz_integration_id")
             if t.route != "postiz" and not bridge_target:

@@ -12,6 +12,7 @@ from .db import Base
 def require_schema(db):
     # Register all declared tables without invoking initialize/create_all/upgrade.
     from . import hub_models as hub_models, server_models as server_models
+    from . import mobile_store as mobile_store
     try:
         if db.engine.dialect.name == "sqlite" and db.engine.url.database != ":memory:":
             if not Path(db.engine.url.database).is_file():

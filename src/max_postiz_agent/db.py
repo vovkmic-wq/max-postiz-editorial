@@ -318,6 +318,7 @@ class Database:
     def initialize(self):
         from . import hub_models  # noqa: F401 -- register hub tables before either backend
         from . import server_models  # noqa: F401 -- постоянное управление автономной редакцией
+        from . import mobile_store  # noqa: F401 -- журнал мобильного управления
         if self.engine.dialect.name == "postgresql":
             from alembic import command
             from alembic.config import Config
@@ -364,6 +365,9 @@ class Database:
             "editorial_article_ledger",
             "publication_slots",
             "editorial_preparation_claims",
+            "mobile_item_holds",
+            "mobile_plans",
+            "mobile_operations",
         }:
             raise AgentError("BACKUP_SCHEMA_MISMATCH")
         data = {name: data.get(name, []) for name in Base.metadata.tables}

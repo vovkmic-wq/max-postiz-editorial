@@ -69,11 +69,35 @@ def source_id_for_url(url):
     return None
 
 
+def _science_source_ages(settings):
+    """Локальные пределы возраста для зарегистрированных научных источников."""
+    root = getattr(settings, "root", None)
+    if root is None:
+        return {}
+    relative = "data/hourly-science-age.local.json"
+    candidate = Path(root) / relative
+    try:
+        if not candidate.exists() and not candidate.is_symlink() and not candidate.is_junction():
+            return {}
+        from .server_route_admin import plain, read_local
+
+        if not plain(root, relative).is_file():
+            raise ValueError
+        ages = parse_json(read_local(root, relative, limit=4096).decode("utf-8"))
+        if (not isinstance(ages, dict) or not ages or set(ages) - set(_SOURCES)
+                or any(type(age) is not int or not 72 <= age <= 87600 for age in ages.values())):
+            raise ValueError
+    except (AgentError, OSError, ValueError) as exc:
+        raise AgentError("ARTICLE_SCIENCE_AGE_INVALID", 409) from exc
+    return ages
+
+
 def registered_policies(base, settings):
     """Не переписываем NASA policy: новые hashes относятся только к новым статьям."""
     result = [copy.deepcopy(base)]
     if base.get("approval_mode") != "automatic":
         return result
+    ages = _science_source_ages(settings)
     for source_id, spec in _SOURCES.items():
         # Конфигурация обязательна; наличие встроенного адаптера само по себе не
         # разрешает новый маршрут. Неизвестный ID никогда не превращается в NASA.
@@ -97,6 +121,8 @@ def registered_policies(base, settings):
             + " | Owner authorized additional scientific source: " + source_id
             + "; unchanged quality, history, cadence and deduplication safeguards"
             + "; rights-contract-sha256=" + spec["rights_text_sha256"])
+        if source_id in ages:
+            policy["max_source_age_hours"] = ages[source_id]
         result.append(policy)
     return result
 

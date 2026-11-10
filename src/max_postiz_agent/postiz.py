@@ -1,7 +1,9 @@
 """Documented Postiz public API, with no implicit retry of mutating requests."""
+import hashlib
 import os
 import re
 import secrets
+import time
 from datetime import UTC, datetime
 from html import escape
 from urllib.parse import quote, urlsplit
@@ -9,10 +11,39 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from .config import AgentError
+from .postiz_http_journal import PostizHttpJournal
+
+
+_ENDPOINTS = {'/posts', '/integrations', '/upload'}
+_UPSTREAM_CODES = {
+    'MAX_BROWSER_CAS_INVALID', 'MAX_BROWSER_CAS_SCHEDULE_CHANGED', 'MAX_BROWSER_CAS_UNCONFIRMED',
+    'MAX_BROWSER_MUTATION_BLOCKED', 'BRIDGE_EDIT_IN_PROGRESS', 'BRIDGE_REMOTE_CHANGED',
+    'BRIDGE_MUTATION_CAS_INVALID', 'BRIDGE_DELIVERY_LOCKED', 'POSTIZ_UNAVAILABLE',
+}
+
+
+def _upstream_code(response):
+    if len(response.content) > 4096:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if isinstance(payload, dict):
+        for field in ('code', 'message'):
+            value = payload.get(field)
+            if isinstance(value, str) and value in _UPSTREAM_CODES:
+                return value
+    return None
+
+
+def _matches_post(result, expected_id):
+    return (isinstance(result, list) and len(result) == 1
+            and isinstance(result[0], dict) and result[0].get('postId') == expected_id)
 
 
 class PostizClient:
-    def __init__(self, options, transport=None):
+    def __init__(self, options, transport=None, *, journal_root=None):
         self.options = options
         self.base = os.getenv(options.get("base_url_env", "POSTIZ_BASE_URL"), "").rstrip("/")
         self.key = os.getenv(options.get("api_key_env", "POSTIZ_API_KEY"), "")
@@ -22,11 +53,16 @@ class PostizClient:
             if (public.scheme not in {'http', 'https'} or not public.netloc or public.path
                     or public.username or public.password or public.query or public.fragment):
                 raise AgentError('POSTIZ_PUBLIC_ORIGIN_INVALID')
-        self.client = httpx.Client(timeout=options.get("timeout_seconds", 30),
+        self.timeout = options.get("timeout_seconds", 30)
+        # Postiz can wait 60 seconds for its native CAS bridge. Give the controller
+        # time to finish and return the guarded response after that inner request.
+        self.mutation_read_timeout = max(self.timeout, options.get("mutation_read_timeout_seconds", 75))
+        self.journal = PostizHttpJournal(journal_root) if journal_root is not None else None
+        self.client = httpx.Client(timeout=self.timeout,
                                    trust_env=False, follow_redirects=False, transport=transport)
         self.max_video = options.get("max_video_verified", False)
 
-    def request(self, method, path, *, expected_cas_hash=None, fresh_read=False, **kwargs):
+    def request(self, method, path, *, expected_cas_hash=None, expected_post_id=None, fresh_read=False, **kwargs):
         parsed = urlsplit(self.base)
         if not self.key or not self.base or parsed.scheme not in {"http", "https"}:
             raise AgentError("POSTIZ_NOT_CONFIGURED", 503)
@@ -45,11 +81,47 @@ class PostizClient:
                     or not re.fullmatch(r"[a-f0-9]{64}", expected_cas_hash)):
                 raise AgentError("BRIDGE_EXPECTED_HASH_INVALID", 409)
             headers["X-Max-Postiz-Expected-Hash"] = expected_cas_hash
+            kwargs.setdefault('timeout', httpx.Timeout(self.timeout, read=self.mutation_read_timeout))
+
+        payload = kwargs.get('json')
+        operation = payload.get('type') if method == 'POST' and path == '/posts' and isinstance(payload, dict) else None
+        endpoint = path if path in _ENDPOINTS else '/posts/:id' if path.startswith('/posts/') else 'other'
+        event = {'at': datetime.now(UTC).isoformat(timespec='milliseconds'),
+                 'method': method if method in {'GET', 'POST', 'DELETE'} else 'other', 'endpoint': endpoint,
+                 'operation': operation if operation in ('draft', 'schedule') else None,
+                 'post_id_sha256': hashlib.sha256(expected_post_id.encode()).hexdigest() if expected_post_id else None,
+                 'read_timeout_s': httpx.Timeout(kwargs.get('timeout', self.client.timeout)).read,
+                 'cas': 'not_requested' if expected_cas_hash is None else 'no_response',
+                 'http_status': None, 'response_bytes': None, 'upstream_code': None,
+                 'stage': 'waiting_for_headers', 'outcome': 'incomplete'}
+        started = time.monotonic()
         try:
-            response = self.client.request(method, self.base + path,
-                                           headers=headers, **kwargs)
+            with self.client.stream(method, self.base + path, headers=headers, **kwargs) as response:
+                event.update(http_status=response.status_code, stage='reading_body')
+                if expected_cas_hash is not None:
+                    actual = response.headers.get('X-Max-Postiz-CAS-Verified')
+                    event['cas'] = ('missing' if actual is None else
+                                    'verified' if actual == expected_cas_hash else 'mismatch')
+                response.read()
+            event.update(response_bytes=len(response.content), stage='response')
+            return self._decode_response(method, response, expected_post_id, event)
         except httpx.HTTPError as exc:
-            raise AgentError("POSTIZ_UNKNOWN" if method != "GET" else "POSTIZ_UNAVAILABLE", 503) from exc
+            event.update(outcome='transport_error', exception_type=type(exc).__name__)
+            event['error_code'] = 'POSTIZ_UNKNOWN' if method != 'GET' else 'POSTIZ_UNAVAILABLE'
+            raise AgentError(event['error_code'], 503) from exc
+        except AgentError as exc:
+            event['error_code'] = exc.code
+            raise
+        finally:
+            if self.journal is not None:
+                event['elapsed_ms'] = round((time.monotonic() - started) * 1000)
+                self.journal.append(event)
+
+    @staticmethod
+    def _decode_response(method, response, expected_post_id, event):
+        if response.status_code >= 400 or response.is_redirect:
+            event.update(outcome='redirect' if response.is_redirect else 'http_error',
+                         upstream_code=_upstream_code(response))
         if response.status_code in {401, 403}:
             raise AgentError("POSTIZ_ACCESS_DENIED", 403)
         if response.status_code == 429:
@@ -58,15 +130,19 @@ class PostizClient:
             raise AgentError("POSTIZ_UNKNOWN" if method != "GET" else "POSTIZ_UNAVAILABLE", 503)
         if response.status_code >= 400:
             raise AgentError("POSTIZ_REJECTED")
-        if (expected_cas_hash is not None
-                and response.headers.get("X-Max-Postiz-CAS-Verified") != expected_cas_hash):
+        if event['cas'] in {'missing', 'mismatch'}:
+            event['outcome'] = 'cas_unconfirmed'
             raise AgentError("POSTIZ_UNKNOWN", 503)
-        if not response.content:
-            return {}
         try:
-            return response.json()
+            result = response.json() if response.content else {}
         except ValueError as exc:
+            event['outcome'] = 'invalid_json'
             raise AgentError("POSTIZ_UNKNOWN" if method != "GET" else "POSTIZ_RESPONSE_INVALID", 503) from exc
+        if expected_post_id is not None and not _matches_post(result, expected_post_id):
+            event['outcome'] = 'unexpected_response_shape'
+            raise AgentError('POSTIZ_UNKNOWN', 503)
+        event['outcome'] = 'ok'
+        return result
 
     def integrations(self):
         data = self.request("GET", "/integrations")
@@ -172,10 +248,9 @@ class PostizClient:
                    "posts": [{"integration": {"id": remote["integration"]["id"]}, "group": remote["group"],
                               "settings": settings, "value": [{"id": post_id,
                               "content": remote["content"], "image": images if illustrated else []}]}]}
-        result = self.request("POST", "/posts", json=payload,
+        result = self.request("POST", "/posts", json=payload, expected_post_id=post_id,
                               **({"expected_cas_hash": expected_remote_hash} if illustrated else {}))
-        if (not isinstance(result, list) or len(result) != 1
-                or not isinstance(result[0], dict) or result[0].get("postId") != post_id):
+        if not _matches_post(result, post_id):
             raise AgentError("POSTIZ_UNKNOWN", 503)
         return post_id
 
@@ -211,9 +286,8 @@ class PostizClient:
                               "group": remote["group"], "settings": settings,
                               "value": [{"id": post_id, "content": escape(corrected_body, quote=False),
                                          "image": []}]}]}
-        result = self.request("POST", "/posts", json=payload, expected_cas_hash=expected_hash)
-        if (not isinstance(result, list) or len(result) != 1
-                or not isinstance(result[0], dict) or result[0].get("postId") != post_id):
+        result = self.request("POST", "/posts", json=payload, expected_cas_hash=expected_hash, expected_post_id=post_id)
+        if not _matches_post(result, post_id):
             raise AgentError("POSTIZ_UNKNOWN", 503)
         return post_id
 

@@ -8,6 +8,37 @@ from .hub_models import Dispatch, DispatchAttempt, Target, TargetApproval, Varia
 from .platform_routes import DIRECT_ROUTES
 
 
+def _readback_kind(dispatch, value, external_id, permalink):
+    if not isinstance(value, dict):
+        return "unverified"
+    if value.get("fixture") is True:
+        return "fixture"
+    if value.get("fixture") is not False:
+        return "unverified"
+    independent = ((value.get("verification") == "browser_readback"
+                    and value.get("independent_readback") is True) or (
+        value.get("provider") == "vk" and value.get("code") == "VK_EXACT_READBACK"
+        and value.get("readback_exact") is True))
+    if independent:
+        return "independent_readback"
+    if value.get("verification") == "api_receipt" and value.get("independent_readback") is False:
+        return "api_receipt"
+    if (dispatch.snapshot.get("route") == "pikabu_browser"
+            and isinstance(external_id, str) and external_id
+            and isinstance(permalink, str) and permalink):
+        from .pikabu_browser_worker import READBACK_CONTRACT
+
+        snapshot_hash = fingerprint(dispatch.snapshot)
+        proof = value.get("proof")
+        if (value.get("kind") == "browser_readback" and value.get("request_id") == dispatch.id
+                and value.get("snapshot_sha256") == snapshot_hash and isinstance(proof, dict)
+                and proof.get("contract") == READBACK_CONTRACT and proof.get("snapshot_sha256") == snapshot_hash
+                and proof.get("verification") == "independent_reload_exact_text_owner_links_tags_image_sha256"
+                and proof.get("external_id") == external_id and proof.get("permalink") == permalink):
+            return "independent_readback"
+    return "unverified"
+
+
 def _evidence_kind(dispatch, audits):
     """Короткая метка только сохранённого proof, связанного с exact snapshot."""
     if fingerprint({"content": dispatch.snapshot, "due_at": dispatch.due_at}) != dispatch.snapshot_hash:
@@ -16,23 +47,11 @@ def _evidence_kind(dispatch, audits):
         details = audit.details
         if not isinstance(details, dict) or details.get("snapshot_hash") != dispatch.snapshot_hash:
             continue
-        value = details.get("evidence")
-        if not isinstance(value, dict):
+        kind = _readback_kind(dispatch, details.get("evidence"),
+                              getattr(dispatch, "external_id", None), getattr(dispatch, "permalink", None))
+        if kind == "independent_readback" and not (dispatch.verified is True and details.get("verified") is True):
             return "unverified"
-        if value.get("fixture") is True:
-            return "fixture"
-        if value.get("fixture") is not False:
-            return "unverified"
-        independent = ((value.get("verification") == "browser_readback"
-                        and value.get("independent_readback") is True) or (
-            value.get("provider") == "vk" and value.get("code") == "VK_EXACT_READBACK"
-            and value.get("readback_exact") is True))
-        if dispatch.verified is True and details.get("verified") is True and independent:
-            return "independent_readback"
-        if (value.get("verification") == "api_receipt"
-                and value.get("independent_readback") is False):
-            return "api_receipt"
-        return "unverified"
+        return kind
     return "unverified"
 
 
@@ -173,7 +192,7 @@ def preview(core, variant_id):
         return result
 
 
-def reconcile(core, dispatch_id, actor="owner"):
+def reconcile(core, dispatch_id, actor="owner", *, require_independent=False, expected_snapshot_hash=None):
     """Только чтение внешнего результата, без повторной загрузки или отправки."""
     reconciliation_started = now()
     with core.db.session() as session:
@@ -198,7 +217,8 @@ def reconcile(core, dispatch_id, actor="owner"):
         current = fingerprint({"content": core.snapshot(variant, target), "due_at": dispatch.due_at})
         stored = fingerprint({"content": dispatch.snapshot, "due_at": dispatch.due_at})
         if (approval is None or approval.revoked or approval.snapshot_hash != current
-                or dispatch.snapshot_hash != current or stored != current or dispatch.owner is not None):
+                or dispatch.snapshot_hash != current or stored != current or dispatch.owner is not None
+                or expected_snapshot_hash is not None and current != expected_snapshot_hash):
             raise AgentError("APPROVAL_STALE", 409)
         frozen = dispatch.snapshot_hash
     delivery = core.routes.reconcile(dispatch, target)
@@ -221,9 +241,12 @@ def reconcile(core, dispatch_id, actor="owner"):
             from .vk_media_review import VERIFICATION, final_acceptance_check
             if proof.get("verification") == VERIFICATION or "media_review" in proof:
                 final_acceptance_check(core, session, row, current_target, delivery, not_before=reconciliation_started)
-        if delivery.external_id:
+        evidence_kind = _readback_kind(row, delivery.evidence, delivery.external_id, delivery.permalink)
+        confirmed = delivery.state == "confirmed" and (
+            not require_independent or delivery.verified is True and evidence_kind == "independent_readback")
+        if delivery.external_id and (confirmed or not require_independent):
             row.external_id = delivery.external_id
-        if delivery.state == "confirmed":
+        if confirmed:
             row.state, row.error = "published", None
             row.permalink, row.verified = delivery.permalink, delivery.verified is True
             variant.state = row.state
@@ -232,9 +255,11 @@ def reconcile(core, dispatch_id, actor="owner"):
         core.db.audit(session, actor, "route_reconcile_read_only", row.id,
                       snapshot_hash=frozen, result=row.state, verified=row.verified,
                       evidence=delivery.evidence or {})
-        return {"id": row.id, "state": row.state, "verified": row.verified,
-                "external_id": row.external_id, "permalink": row.permalink,
-                "external_mutations": 0}
+        result = {"id": row.id, "state": row.state, "verified": row.verified,
+                  "external_id": row.external_id, "permalink": row.permalink, "external_mutations": 0}
+        if require_independent:
+            result.update(evidence_kind=evidence_kind, verified=confirmed)
+        return result
 
 
 def evidence(core, dispatch_id):
