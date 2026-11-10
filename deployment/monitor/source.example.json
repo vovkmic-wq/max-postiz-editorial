@@ -1,0 +1,28 @@
+{
+  "host": "vm.example.invalid",
+  "known_hosts_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "source": {
+    "binding": "pinned-editorial-monitor-v1",
+    "minimum_revision": 1,
+    "profiles": [
+      {
+        "version": "0.14.5",
+        "source_commit": "0000000000000000000000000000000000000000",
+        "runtime_count": 168,
+        "manifest_path": "/opt/max-postiz/data/reserve-20261026/source-manifest-example.local.json",
+        "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "pid": 1234,
+        "start_ticks": 12345
+      }
+    ],
+    "database": {
+      "host": "127.0.0.1",
+      "port": 5432,
+      "database": "editorial",
+      "user": "editorial"
+    },
+    "maintenance": {
+      "authorized": false
+    }
+  }
+}

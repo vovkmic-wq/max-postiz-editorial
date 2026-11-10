@@ -68,17 +68,61 @@ class MonitorService:
             expires_at=min(at + options["report_max_age_seconds"], expires_at)
                 if expires_at is not None else at + options["report_max_age_seconds"])
 
+    def _record_observation(self, at):
+        snapshot = self.snapshot()
+        self.store.set_meta("observer", {"heartbeat_at": at, "config_hash": self.config.hash,
+            "source_collected_at": snapshot.get("collected_at"),
+            "source_heartbeat_at": snapshot.get("editorial", {}).get("heartbeat_at"),
+            "source_paused": snapshot.get("editorial", {}).get("paused") is True})
+        return snapshot
+
+    def observe(self):
+        """Обновить свежесть источника без создания отчётов и доступа к браузеру."""
+        self._guard()
+        with profile_lock(private_path(self.core.settings.root, "data/monitor/producer.lock")):
+            self._record_observation(self.clock())
+
+    def report_only_tick(self, *, stop_requested, after_produce=None):
+        """Один проход под внешней блокировкой процесса report-only."""
+        if stop_requested():
+            return {"state": "stopped"}
+        sender = self.store.meta("sender", {})
+        hold_key = "report_only_sender_hold"
+        if (self.store.meta(hold_key, False) is not False
+                or sender.get("state") in {"failed", "unknown", "blocked"}
+                or self.store.unresolved()):
+            self.observe()
+            return {"state": "sender_held"}
+
+        self.produce()
+        if after_produce is not None:
+            after_produce()
+        if stop_requested():
+            return {"state": "stopped"}
+
+        # Если процесс прервётся между вызовом транспорта и записью итога,
+        # следующий проход будет только наблюдать до отдельной сверки.
+        self.store.set_meta(hold_key, True)
+        try:
+            result = self.deliver_once()
+        except AgentError as error:
+            # Обе блокировки транспорта берутся до claim. Занятый профиль
+            # не создаёт неизвестный результат и допускает очередной штатный проход.
+            if error.code == "BROWSER_PROFILE_BUSY" and not self.store.unresolved():
+                self.store.set_meta(hold_key, False)
+                return {"state": "busy", "code": error.code}
+            return {"state": "sender_held"}
+        if result.get("state") in {"confirmed", "idle_or_blocked", "disabled"} and not self.store.unresolved():
+            self.store.set_meta(hold_key, False)
+        return result
+
     def produce(self):
         """Только текущий час/день: пропущенные периоды не порождают пачку отчётов."""
         from .monitor_reports import alert_signatures, render_report
         self._guard()
         at, options = self.clock(), self.config.value
         with profile_lock(private_path(self.core.settings.root, "data/monitor/producer.lock")):
-            snapshot = self.snapshot()
-            self.store.set_meta("observer", {"heartbeat_at": at, "config_hash": self.config.hash,
-                "source_collected_at": snapshot.get("collected_at"),
-                "source_heartbeat_at": snapshot.get("editorial", {}).get("heartbeat_at"),
-                "source_paused": snapshot.get("editorial", {}).get("paused") is True})
+            snapshot = self._record_observation(at)
             if not options["enabled"]:
                 return {"state": "disabled", "queued": [], "external_mutations": 0}
             queued = []

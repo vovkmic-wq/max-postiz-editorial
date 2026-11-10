@@ -408,3 +408,82 @@ def test_atomic_sender_claim_accepts_only_bounded_destination_tuple(setup_monito
     service, _, _, _ = setup_monitor
     with pytest.raises(AgentError, match="MONITOR_DESTINATION_INVALID"):
         service.store.claim(service.config.hash, destinations, at=NOW)
+
+
+@pytest.mark.parametrize("state", ["failed", "unknown"])
+def test_report_only_observes_after_sender_failure_without_retry(setup_monitor, monkeypatch, state):
+    service, _, _, clock = setup_monitor
+    def send_report(chat_id, text, request_id, *, authorize):
+        assert authorize({"request_id": request_id, "chat_id": chat_id, "text": text,
+                          "chat_name": "Мониторинг", "destination_kind": "channel"})
+        service.transport.sent.append(request_id)
+        return {"state": "preclick_failed" if state == "failed" else "unknown"}
+
+    monkeypatch.setattr(service.transport, "send_report", send_report)
+    assert service.report_only_tick(stop_requested=lambda: False)["state"] == state
+    reports = service.store.recent()
+    sender = service.store.meta("sender")
+    assert any(row["state"] == state for row in reports)
+
+    restarted = MonitorService(service.core, service.config, transport=service.transport,
+                               clock=service.clock, collector=service.collector)
+    for hours in (1, 4):
+        clock[0] += hours * 3600
+        result = restarted.report_only_tick(stop_requested=lambda: False)
+        assert result["state"] == "sender_held"
+        assert restarted.store.meta("observer")["source_collected_at"] == clock[0]
+        assert restarted.store.meta("sender") == sender
+        assert restarted.store.recent() == reports
+    assert len(service.transport.sent) == 1
+
+
+@pytest.mark.parametrize("previous", ["legacy_failed", "interrupted_claim", "interrupted_poll"])
+def test_report_only_existing_stop_evidence_blocks_first_send(setup_monitor, previous):
+    service, _, _, _ = setup_monitor
+    service.queue("original", "hourly", "Исходный отчёт")
+    if previous == "legacy_failed":
+        service.store.set_meta("sender", {"heartbeat_at": NOW, "state": "failed"})
+    elif previous == "interrupted_claim":
+        assert service.store.claim(service.config.hash, "-123", at=NOW)
+    else:
+        service.store.set_meta("report_only_sender_hold", True)
+    reports = service.store.recent()
+    assert service.report_only_tick(stop_requested=lambda: False)["state"] == "sender_held"
+    assert service.store.meta("observer")["heartbeat_at"] == NOW
+    assert service.store.recent() == reports
+    assert service.transport.sent == []
+
+
+def test_report_only_healthy_ticks_and_cooperative_stop(setup_monitor, monkeypatch):
+    service, _, _, _ = setup_monitor
+    deliveries = []
+    queued = []
+
+    def deliver():
+        deliveries.append(True)
+        assert service.store.meta("report_only_sender_hold") is True
+        return {"state": "confirmed"}
+
+    monkeypatch.setattr(service, "deliver_once", deliver)
+    tick = service.report_only_tick
+    assert tick(stop_requested=lambda: False, after_produce=lambda: queued.append(True))["state"] == "confirmed"
+    assert service.store.meta("report_only_sender_hold") is False
+    stop = iter([False, True])
+    assert tick(stop_requested=lambda: next(stop))["state"] == "stopped"
+    assert deliveries == queued == [True]
+
+
+def test_report_only_busy_profile_waits_before_claim_without_holding_sender(setup_monitor):
+    service, _, _, clock = setup_monitor
+    path = service.core.settings.root / "data/monitor/transport.lock"
+    with profile_lock(path):
+        assert service.report_only_tick(stop_requested=lambda: False) == {
+            "state": "busy", "code": "BROWSER_PROFILE_BUSY",
+        }
+    assert service.store.meta("report_only_sender_hold") is False
+    assert not service.store.unresolved()
+    assert service.transport.sent == []
+
+    clock[0] += 30
+    assert service.report_only_tick(stop_requested=lambda: False)["state"] == "confirmed"
+    assert len(service.transport.sent) == 1
