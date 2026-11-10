@@ -1,0 +1,93 @@
+name: max-postiz-service-monitor
+x-monitor: &monitor
+  image: max-postiz-service-monitor:0.14.6
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+    - seccomp=./chromium-seccomp.json
+  shm_size: 512m
+  mem_limit: 2g
+  pids_limit: 256
+  tmpfs:
+    - /tmp:mode=1777,size=256m
+    - /home/monitor:uid=10460,gid=10460,mode=0700,size=64m
+  volumes:
+    - type: bind
+      source: ${MONITOR_STATE:?set MONITOR_STATE}
+      target: /state
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${MONITOR_PROFILE:?set MONITOR_PROFILE}
+      target: /state/data/monitor/browser-runtime/data
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${MONITOR_PRIVATE:?set MONITOR_PRIVATE}
+      target: /run/monitor
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${MONITOR_SNAPSHOT:?set MONITOR_SNAPSHOT}
+      target: /snapshot
+      read_only: true
+      bind:
+        create_host_path: false
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+services:
+  collector:
+    <<: *monitor
+    command: ["collect"]
+    mem_limit: 256m
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ${MONITOR_PRIVATE:?set MONITOR_PRIVATE}/source.local.json
+        target: /run/monitor/source.local.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${MONITOR_SOURCE_SSH:?set MONITOR_SOURCE_SSH}
+        target: /run/monitor-ssh
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${MONITOR_SNAPSHOT:?set MONITOR_SNAPSHOT}
+        target: /snapshot
+        bind:
+          create_host_path: false
+  monitor:
+    <<: *monitor
+    depends_on: [collector]
+    build:
+      context: ../..
+      dockerfile: deployment/monitor/Dockerfile
+      target: runtime
+      args:
+        PYTHON_BASE: ${MONITOR_PYTHON_BASE:-python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df}
+    restart: unless-stopped
+    stop_grace_period: 180s
+  login:
+    <<: *monitor
+    profiles: [login]
+    image: max-postiz-service-monitor-login:0.14.6
+    build:
+      context: ../..
+      dockerfile: deployment/monitor/Dockerfile
+      target: login
+      args:
+        PYTHON_BASE: ${MONITOR_PYTHON_BASE:-python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df}
+    entrypoint: ["/bin/sh", "/opt/monitor/login.sh"]
+    command: []
+    restart: "no"
+    ports:
+      - "127.0.0.1:${MONITOR_LOGIN_PORT:-16080}:6080"

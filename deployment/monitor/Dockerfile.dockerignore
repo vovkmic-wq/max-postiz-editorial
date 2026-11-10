@@ -1,0 +1,13 @@
+**
+!requirements.lock
+!requirements-browser.lock
+!pyproject.toml
+!src/
+!src/**
+!deployment/
+!deployment/monitor/
+!deployment/monitor/runner.py
+!deployment/monitor/source_sampler.py
+!deployment/monitor/login.sh
+**/__pycache__
+**/*.local.*
