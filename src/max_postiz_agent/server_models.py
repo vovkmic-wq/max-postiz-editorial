@@ -1,6 +1,6 @@
 """Постоянное состояние автономной редакции; старые таблицы истории сохраняются."""
 
-from sqlalchemy import JSON, Boolean, Float, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base, now, uid
@@ -65,3 +65,15 @@ class EditorialPreparationClaim(Base):
     error: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[float] = mapped_column(Float, default=now)
     updated_at: Mapped[float] = mapped_column(Float, default=now)
+
+
+class MobileItemHold(Base):
+    """Версия ручного барьера сохраняется и после его снятия."""
+
+    __tablename__ = "mobile_item_holds"
+    variant_id: Mapped[str] = mapped_column(ForeignKey("hub_variants.id"), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    active: Mapped[bool] = mapped_column(Boolean)
+    reason: Mapped[str] = mapped_column(Text)
+    actor: Mapped[str] = mapped_column(String(64))
+    updated_at: Mapped[float] = mapped_column(Float)

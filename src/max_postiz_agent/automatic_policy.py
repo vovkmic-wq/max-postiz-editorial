@@ -452,6 +452,9 @@ def publish(cycle, record, ledger, reviewed_hash, due_at):
     with core.db.session() as session:
         require_running(core, session, lock=True)
         variant = core._variant(session, record["variant_id"], True)
+        from .mobile_hold import assert_item_unheld
+
+        assert_item_unheld(session, variant.id)
         target = session.scalar(select(Target).where(Target.id == variant.target_id).with_for_update())
         eligible(core, session, variant)
         before = copy.deepcopy(core.snapshot(variant, target))

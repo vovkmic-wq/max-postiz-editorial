@@ -94,3 +94,86 @@ def test_native_policy_still_rejects_unbounded_or_invalid_age(tmp_path, base_pol
     cycle.core = SimpleNamespace(settings=SimpleNamespace(root=tmp_path))
     with pytest.raises(AgentError, match='ARTICLE_POLICY_INVALID'):
         cycle._policy()
+
+
+def science_age_file(root, contents):
+    path = root / 'data/hourly-science-age.local.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(contents, encoding='utf-8')
+    return path
+
+
+@pytest.mark.parametrize('source', ['noirlab_iotw', 'esahubble_potw'])
+@pytest.mark.parametrize('marker', [None, 'article-illustrated-v1', 'article-illustrated-v2'])
+def test_science_age_extension_keeps_base_and_pinned_history(tmp_path, base_policy, source, marker):
+    settings, _ = configured_sources()
+    settings.root = tmp_path
+    base = {**base_policy, 'max_source_age_hours': 43800}
+    if marker:
+        base.update(presentation_contract=marker, presentation_owner_instruction='Exact original image and bold instruction')
+    base_hash = fingerprint(base)
+    previous = next(p for p in registered_policies(base, settings) if p['source_id'] == source)
+    historical = {'source_id': source, 'url': URLS[source], 'policy_hash': fingerprint(previous)}
+    if marker:
+        historical['presentation_contract'] = marker
+    archive = save(settings, previous)
+    archived_bytes = archive.read_bytes()
+    science_age_file(tmp_path, '{"noirlab_iotw":87600,"esahubble_potw":87600}')
+
+    expanded = registered_policies(base, settings)
+    assert expanded[0] == base and fingerprint(base) == base_hash
+    assert {p['source_id']: p['max_source_age_hours'] for p in expanded} == {
+        'nasa_svs_articles': 43800, 'noirlab_iotw': 87600, 'esahubble_potw': 87600,
+    }
+    current = next(p for p in expanded if p['source_id'] == source)
+    assert current == {**previous, 'max_source_age_hours': 87600}
+    assert policy_for_record(base, settings, historical) == previous
+    fresh = {key: value for key, value in historical.items() if key != 'policy_hash'}
+    assert policy_for_record(base, settings, fresh) == current
+    assert archive.read_bytes() == archived_bytes
+
+
+def test_science_age_is_optional_per_registered_automatic_source(tmp_path, base_policy):
+    settings, sources = configured_sources()
+    settings.root = tmp_path
+    science_age_file(tmp_path, '{"noirlab_iotw":87600}')
+    effective = registered_policies(base_policy, settings)
+    assert [item['max_source_age_hours'] for item in effective] == [8760, 87600, 8760]
+    sources['noirlab_iotw']['enabled'] = False
+    assert [item['source_id'] for item in registered_policies(base_policy, settings)] == [
+        'nasa_svs_articles', 'esahubble_potw',
+    ]
+    manual = {**base_policy, 'approval_mode': 'human'}
+    assert registered_policies(manual, settings) == [manual]
+
+
+@pytest.mark.parametrize('contents', [
+    '', '{}', '[]', 'null', '{"nasa_svs_articles":87600}', '{"unregistered":87600}',
+    '{"noirlab_iotw":true}', '{"noirlab_iotw":87600.0}', '{"noirlab_iotw":"87600"}',
+    '{"noirlab_iotw":71}', '{"noirlab_iotw":87601}', '{"noirlab_iotw":NaN}',
+    '{"noirlab_iotw":87600,"noirlab_iotw":43800}', '{"noirlab_iotw":87600}' + ' ' * 4096,
+])
+def test_science_age_rejects_invalid_private_override(tmp_path, base_policy, contents):
+    settings, _ = configured_sources()
+    settings.root = tmp_path
+    science_age_file(tmp_path, contents)
+    with pytest.raises(AgentError, match='ARTICLE_SCIENCE_AGE_INVALID'):
+        registered_policies(base_policy, settings)
+
+
+@pytest.mark.parametrize('link_target', ['file', 'directory'])
+def test_science_age_rejects_symlink_path(tmp_path, base_policy, link_target):
+    settings, _ = configured_sources()
+    settings.root = tmp_path / 'runtime'
+    external = science_age_file(tmp_path / 'outside', '{"noirlab_iotw":87600}')
+    if link_target == 'file':
+        link, target = settings.root / 'data' / external.name, external
+    else:
+        link, target = settings.root / 'data', external.parent
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target, target_is_directory=link_target == 'directory')
+    except OSError:
+        pytest.skip('Symlink privilege unavailable on this host')
+    with pytest.raises(AgentError, match='ARTICLE_SCIENCE_AGE_INVALID'):
+        registered_policies(base_policy, settings)

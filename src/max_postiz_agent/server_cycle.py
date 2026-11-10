@@ -15,6 +15,7 @@ from .config import AgentError, fingerprint, inside
 from .db import now
 from .hub import ACTIVE
 from .hub_models import BridgePost, Dispatch, DispatchAttempt, Target, TargetApproval, Variant
+from .mobile_hold import item_is_held
 from .server_state import ServerState, require_running, validate_settings
 
 TERMINAL = {"published", "failed", "cancelled", "rejected", "awaiting_human_review"}
@@ -136,6 +137,8 @@ class ServerCycle:
             raise AgentError("ARTICLE_REVIEW_HASH_MISMATCH", 409)
         with self.core.db.session() as session:
             variant = session.get(Variant, record.get("variant_id"))
+            if variant is not None and item_is_held(session, variant.id):
+                return self._phase("blocked", record_id=record["id"], last_error={"code": "MOBILE_ITEM_HELD"})
             if (variant is None or automatic_evidence(session, variant) is None
                     or session.scalar(select(TargetApproval).where(TargetApproval.variant_id == variant.id))
                     or session.scalar(select(Dispatch).where(Dispatch.variant_id == variant.id))):
@@ -163,7 +166,8 @@ class ServerCycle:
         policy = self.cycle._policy_for_record(record)
         with self.core.db.session() as session:
             target = session.get(Target, record.get("target_id"))
-            if target is not None and not target.paused:
+            if (target is not None and not target.paused
+                    or item_is_held(session, record.get("variant_id"))):
                 return False
         if not record.get("postiz_id"):
             raise AgentError("EDITORIAL_PENDING_RESUME_NOT_SAFE", 409)
@@ -181,6 +185,8 @@ class ServerCycle:
             # Порядок согласован с глобальной паузой и отправкой: Control→Variant→Target→Dispatch.
             require_running(self.core, session, lock=True)
             variant = self.core._variant(session, record.get("variant_id"), True)
+            if item_is_held(session, variant.id):
+                return False
             target = session.scalar(select(Target).where(Target.id == variant.target_id).with_for_update())
             dispatch = session.scalar(select(Dispatch).where(Dispatch.id == dispatch_id).with_for_update())
             approval = session.get(TargetApproval, dispatch.approval_id) if dispatch else None

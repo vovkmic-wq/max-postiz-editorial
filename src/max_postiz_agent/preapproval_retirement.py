@@ -1104,7 +1104,7 @@ def apply(core, record_id, *, operation_id, plan_hash, actor, reason, retire_con
         return copy.deepcopy(receipt)
 
 
-def operation_status(core, operation_id):
+def operation_status(core, operation_id, *, expected_actor=None, expected_record_id=None):
     _operation_id(operation_id)
     with core.db.session() as session:
         claims = [
@@ -1113,6 +1113,10 @@ def operation_status(core, operation_id):
             if row.details.get("operation_id") == operation_id
         ]
         require(len(claims) == 1, "PREAPPROVAL_OPERATION_NOT_FOUND")
+        if expected_actor is not None:
+            require(claims[0].actor == expected_actor
+                    and claims[0].details["before"]["record"]["id"] == expected_record_id,
+                    "PREAPPROVAL_OPERATION_NOT_FOUND")
         variant_id = claims[0].entity
         rows = [
             session.get(Audit, _id(variant_id, stage))
@@ -1127,6 +1131,8 @@ def operation_status(core, operation_id):
         ]
         if rows[-1] is not None:
             _verify_committed(session, claims[0], rows[-1])
+            if expected_actor is not None:
+                return copy.deepcopy(rows[-1].details)
         return {
             "contract": CONTRACT,
             "operation_id": operation_id,

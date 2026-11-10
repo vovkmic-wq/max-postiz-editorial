@@ -10,15 +10,20 @@ from urllib.parse import urlencode
 from uuid import uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
 from max_postiz_agent import preapproval_retirement as recovery
 from max_postiz_agent.config import AgentError
-from max_postiz_agent.db import Audit, Database
+from max_postiz_agent.db import Audit, Database, now
 from max_postiz_agent.db import Draft
 from max_postiz_agent.hub_models import Variant
+from max_postiz_agent.mobile_api import mobile_app
+from max_postiz_agent.mobile_auth import MobilePrincipal
+from max_postiz_agent.mobile_domain import MobileDomain
+from max_postiz_agent.mobile_store import MobileOperation
 from max_postiz_agent.service import Service
 from max_postiz_agent.server_models import EditorialControl, EditorialLedger, PublicationSlot
 import test_preapproval_retirement as checks
@@ -249,3 +254,47 @@ def test_postgres_legacy_approval_serializes_with_first_retirement_claim(
     with value.core.db.session() as session:
         assert session.get(Audit, recovery._id(value.variant_id, "claim")) is None
     assert len(value.reads) == 2
+
+def test_mobile_owner_retires_only_proven_unsent_draft(retirement_pg):
+    value = retirement_pg
+    actor = "postiz:mobile:" + "a" * 32
+
+    class Owner:
+        def authenticate(self, _authorization):
+            return MobilePrincipal(actor, "owner", now())
+
+    with TestClient(mobile_app(value.core.db, MobileDomain(value.core), Owner(),
+                               environment="fixture", write_enabled=True),
+                    headers={"Authorization": "Bearer fixture"}) as client:
+        response = client.post("/mobile/v1/operation-plans", json={
+            "action": "retire_preapproval_no_send", "object_id": value.record_id,
+        })
+        assert response.status_code == 201, response.json()
+        plan = response.json()
+        request = {"operation_id": str(uuid4()), "plan_id": plan["plan_id"],
+                   "plan_hash": plan["plan_hash"], "confirmed": True,
+                   "reason": "Verified no send before approval"}
+        response = client.post("/mobile/v1/operations", json=request)
+        assert response.status_code == 202, response.json()
+        receipt = response.json()
+        assert receipt["state"] == "succeeded", receipt
+        assert receipt["result"]["outcome"] == "retired_no_send"
+        assert receipt["result"]["external_mutations"] == 0
+        assert client.get("/mobile/v1/operations/" + request["operation_id"]).json() == receipt
+        assert client.post("/mobile/v1/operations", json=request).json() == receipt
+        assert client.get("/mobile/v1/audit").json()["items"] == [receipt]
+
+        # A process crash between native commit and mobile receipt must be read-only on replay.
+        with value.core.db.session.begin() as session:
+            operation = session.get(MobileOperation, request["operation_id"])
+            operation.state, operation.result = "running", None
+        reads = len(value.reads)
+        resolved = client.get("/mobile/v1/operations/" + request["operation_id"]).json()
+        assert resolved["state"] == "succeeded" and resolved["result"] == receipt["result"]
+        assert client.post("/mobile/v1/operations", json=request).json() == resolved
+        assert len(value.reads) == reads
+
+    with value.core.db.session() as session:
+        assert session.get(PublicationSlot, value.slot_id).state == "missed"
+    assert all(post["state"] == "DRAFT" for post in value.posts.values())
+    assert len(value.events) == value.model_count

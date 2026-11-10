@@ -1,0 +1,54 @@
+services:
+  mobile-gateway:
+    image: max-postiz-mobile:0.15.3
+    build:
+      context: ../..
+      dockerfile: deployment/mobile/Dockerfile
+      target: gateway
+      args:
+        PYTHON_BASE: ${MOBILE_PYTHON_BASE:-python:3.12-slim-bookworm}
+    init: true
+    restart: unless-stopped
+    command: ["--root", "${MOBILE_RUNTIME_ROOT:?Set the provisioned editorial root}", "--port", "8093", "--container-bind"]
+    user: "${MOBILE_RUNTIME_UID:?Set the editorial service UID}:${MOBILE_RUNTIME_GID:?Set the editorial service GID}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - "seccomp=${MOBILE_BROWSER_SECCOMP_PROFILE:?Set the reviewed browser seccomp profile}"
+    shm_size: 256m
+    tmpfs:
+      - /tmp:mode=1777,size=512m
+    env_file:
+      - path: ${MOBILE_RUNTIME_ENV_FILE:?Set the private gateway env file}
+        format: raw
+    ports:
+      - "127.0.0.1:8093:8093"
+    networks:
+      editorial_private: {}
+      gateway_ingress:
+        gw_priority: 1
+    volumes:
+      - type: bind
+        source: ${MOBILE_RUNTIME_ROOT:?Set the provisioned editorial root}
+        target: ${MOBILE_RUNTIME_ROOT:?Set the provisioned editorial root}
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${MOBILE_RUNTIME_ROOT:?Set the provisioned editorial root}/data
+        target: ${MOBILE_RUNTIME_ROOT:?Set the provisioned editorial root}/data
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: [CMD, python, -c, "import http.client; c=http.client.HTTPConnection('127.0.0.1',8093,timeout=3); c.request('GET','/mobile/v1/capabilities'); assert c.getresponse().status==401"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+
+networks:
+  editorial_private:
+    external: true
+    name: ${MOBILE_PROJECT_NETWORK:?Set the existing private editorial Docker network}
+  gateway_ingress:
+    driver: bridge

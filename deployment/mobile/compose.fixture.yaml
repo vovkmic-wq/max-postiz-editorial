@@ -1,0 +1,59 @@
+services:
+  fixture-db:
+    image: postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    environment:
+      POSTGRES_DB: editorial_mobile_fixture
+      POSTGRES_USER: mobile_test
+      POSTGRES_PASSWORD_FILE: /run/secrets/mobile_fixture_pg_password
+    secrets: [mobile_fixture_pg_password]
+    networks: [fixture_private]
+    volumes:
+      - fixture_db:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, mobile_test, -d, editorial_mobile_fixture]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  mobile-fixture:
+    image: max-postiz-mobile-fixture:0.15.3
+    build:
+      context: ../..
+      dockerfile: deployment/mobile/Dockerfile
+      target: fixture
+      args:
+        PYTHON_BASE: ${MOBILE_PYTHON_BASE:-python:3.12-slim-bookworm}
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:mode=1777,size=128m
+      - /fixture:uid=10001,gid=10001,mode=0700,size=64m
+    secrets: [mobile_fixture_pg_password]
+    ports:
+      - "127.0.0.1:18094:8093"
+    networks: [fixture_private, fixture_ingress]
+    depends_on:
+      fixture-db:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import http.client,json; t=json.load(open('/fixture/runtime/fixture-access.private.json'))['token']; c=http.client.HTTPConnection('127.0.0.1',8093,timeout=3); c.request('GET','/mobile/v1/capabilities',headers={'Authorization':'Bearer '+t}); assert c.getresponse().status==200"]
+      interval: 2s
+      timeout: 4s
+      retries: 20
+
+networks:
+  fixture_private:
+    internal: true
+  fixture_ingress:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+
+secrets:
+  mobile_fixture_pg_password:
+    file: ${MOBILE_FIXTURE_PG_PASSWORD_FILE:?Set a private generated fixture password file}
+
+volumes:
+  fixture_db:

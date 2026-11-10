@@ -4,6 +4,7 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 from datetime import datetime
@@ -18,6 +19,7 @@ from sqlalchemy import select, text, update
 from .config import AgentError, fingerprint
 from .db import Draft, DraftRevision, Story, now, uid
 from .hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Target, TargetApproval, Variant
+from .mobile_hold import assert_item_unheld, item_is_held
 
 PROVIDER = "max-browser"
 
@@ -536,6 +538,7 @@ class MaxBridge:
         return {"revision": v.revision}
 
     def check_approval(self, s, v, due):
+        assert_item_unheld(s, v.id)
         link = s.scalar(select(BridgePost).where(BridgePost.variant_id == v.id))
         if not link:
             return
@@ -548,6 +551,7 @@ class MaxBridge:
 
     def guard_send(self, dispatch, target):
         with self.core.db.session() as s:
+            assert_item_unheld(s, dispatch.variant_id)
             link = s.scalar(select(BridgePost).where(BridgePost.variant_id == dispatch.variant_id))
         if not link:
             return
@@ -572,7 +576,8 @@ class MaxBridge:
         if t.options.get("postiz_integration_id") != integration_id:
             raise AgentError("BRIDGE_INTEGRATION_MISMATCH", 403)
         with self.core.db.session() as s:
-            if self._blocked_post(s, post_id):
+            link = s.get(BridgePost, post_id)
+            if self._blocked_post(s, post_id) or link is not None and item_is_held(s, link.variant_id):
                 return self.status(token, integration_id, post_id)
         integration = next((i for i in self.core.postiz.integrations() if i["id"] == integration_id), None)
         if (not integration or integration.get("identifier") != PROVIDER
@@ -604,6 +609,8 @@ class MaxBridge:
                 return {"state": "unverified", "error": "BRIDGE_DELIVERY_NOT_VERIFIED"}
             if not link.active and (not d or d.state not in {"sending", "unknown"}):
                 return {"state": "cancelled", "error": "BRIDGE_REMOTE_DELETED"}
+            if (not d or d.state == "pending") and item_is_held(s, link.variant_id):
+                return {"state": "held", "paused": t.paused, "error": "MOBILE_ITEM_HELD"}
             return {"state": d.state if d else "review_pending", "paused": t.paused, "error": link.error or (d.error if d else None)}
 
     def mutation(self, identifiers, release=None, *, expected_hash=None, expected_post_id=None):
@@ -635,6 +642,7 @@ class MaxBridge:
                     s.scalar(select(Variant).where(Variant.id == link.variant_id).with_for_update())
                 else:
                     self.core._variant(s, link.variant_id, True)
+                    assert_item_unheld(s, link.variant_id)
                 # Another native mutation may have committed while this call
                 # waited for the variant lock. Do not reuse its earlier owner.
                 s.refresh(link)
@@ -650,6 +658,9 @@ class MaxBridge:
                         link.mutation_owner, link.mutation_until = None, 0
                 else:
                     link.mutation_owner, link.mutation_until = owner, now() + 300
+                    # Наблюдение устаревает, даже если lease успели снять до
+                    # захвата строк операцией ручной блокировки.
+                    link.updated_at = max(now(), math.nextafter(link.updated_at, math.inf))
         if compare:
             try:
                 # The native guard owns this one committed lease. The fresh

@@ -1,9 +1,11 @@
 """A delayed MAX DOM never authorizes another channel or an extra request."""
+import json
 import time
+from contextlib import contextmanager
 
 import pytest
 
-from max_postiz_agent import browser_runtime
+from max_postiz_agent import browser_runtime, browser_worker
 from max_postiz_agent.config import AgentError
 from test_browser_publishing import browser_config
 
@@ -56,6 +58,54 @@ def test_delayed_editor_uses_same_bounded_readiness_budget(channel):
     """))
     browser_runtime.ensure_channel(page, settings, "-123")
     unchanged(page, requests)
+
+
+@pytest.mark.parametrize("editor,reason,count", [
+    ("", "composer_missing", 0),
+    ('<div contenteditable role="textbox" aria-placeholder="Draft">private</div>',
+     "composer_selector_mismatch", 0),
+    ('<div contenteditable role="textbox" aria-placeholder="Пост" style="display:none">private</div>',
+     "composer_hidden", 1),
+    ('<div contenteditable role="textbox" aria-placeholder="Пост" aria-disabled="true">private</div>',
+     "composer_disabled", 1),
+    ('<div contenteditable="false" role="textbox" aria-placeholder="Пост">private</div>',
+     "composer_not_editable", 1),
+    ('<div contenteditable role="textbox" aria-placeholder="Пост"></div>' * 2,
+     "composer_ambiguous", 2),
+])
+def test_channel_failure_journals_redacted_dom_evidence(channel, monkeypatch, editor, reason, count):
+    settings, page, requests = channel
+    route(page, html(editor=False) + editor)
+    page.goto("https://web.max.ru/-123", wait_until="domcontentloaded", timeout=5000)
+
+    @contextmanager
+    def local_session(_settings):
+        yield page
+
+    def check_current_page(page, settings, chat_id):
+        browser_runtime.ensure_channel(page, settings, chat_id, navigate=False)
+
+    monkeypatch.setattr(browser_worker, "session", local_session)
+    monkeypatch.setattr(browser_worker, "ensure_channel", check_current_page)
+    monkeypatch.setattr(browser_runtime, "_CHANNEL_READY_TIMEOUT_MS", 150)
+    payload = {"action": "publish", "request_id": "channel-diagnostics", "chat_id": "-123",
+               "text": "Тестовая статья", "attachment": None, "config_hash": settings.hash}
+    result = browser_worker.publish(settings, payload)
+    proof = browser_worker.read_preclick_failure(settings, payload["request_id"], chat_id="-123",
+                                                text=payload["text"])
+    assert result == {"state": "preclick_failed", "proof_sha256": proof["sha256"]}
+    saved = proof["proof"]
+    assert saved["phase"] == "channel" and saved["send_started"] is False
+    error = saved["error"]
+    assert error["code"] == "BROWSER_PUBLISH_PERMISSION_REQUIRED"
+    detail = error["diagnostics"]
+    assert detail["check"] == "readiness_wait" and detail["trigger"] == "timeout"
+    assert detail["reason"] == reason and detail["composer_count"] == count
+    assert detail["heading_matches"] is True and detail["exact_url"] is True
+    assert detail["budget_ms"] == 150 and detail["elapsed_ms"] > 0
+    assert all(value not in json.dumps(error, ensure_ascii=False) for value in
+               ("private", "Draft", "Окно чата с Тест", "web.max.ru", "-123"))
+    assert requests == ["https://web.max.ru/-123"] and page.evaluate("window.sendCalls") == 0
 
 
 @pytest.mark.parametrize("content,code", [
@@ -137,8 +187,10 @@ def test_http_rate_limit_or_channel_error_never_reloads_or_retries(
         channel, status, code, require_publish):
     settings, page, requests = channel
     route(page, html(), status=status)
-    with pytest.raises(AgentError, match="^" + code + "$"):
+    with pytest.raises(AgentError, match="^" + code + "$") as caught:
         browser_runtime.ensure_channel(page, settings, "-123", require_publish=require_publish)
+    detail = caught.value.diagnostics
+    assert (detail["check"], detail["trigger"], detail["http_status"]) == ("navigation", "http_error", status)
     unchanged(page, requests)
 
 
@@ -150,12 +202,13 @@ def test_route_change_during_wait_is_terminal_without_return_navigation(channel)
     unchanged(page, requests)
 
 
-@pytest.mark.parametrize("mutation,code", [
-    ("document.querySelector('h2').innerText='Окно чата с Другой'", "BROWSER_WRONG_CHANNEL"),
-    ("document.querySelector('[contenteditable]').contentEditable='false'", "BROWSER_PUBLISH_PERMISSION_REQUIRED"),
-    ("history.replaceState(null,'','/-456')", "BROWSER_WRONG_CHANNEL"),
+@pytest.mark.parametrize("mutation,code,reason", [
+    ("document.querySelector('h2').innerText='Окно чата с Другой'", "BROWSER_WRONG_CHANNEL", "heading_mismatch"),
+    ("document.querySelector('[contenteditable]').contentEditable='false'", "BROWSER_PUBLISH_PERMISSION_REQUIRED",
+     "composer_not_editable"),
+    ("history.replaceState(null,'','/-456')", "BROWSER_WRONG_CHANNEL", "url_mismatch"),
 ])
-def test_last_immediate_check_rejects_change_after_readiness(channel, monkeypatch, mutation, code):
+def test_last_immediate_check_rejects_change_after_readiness(channel, monkeypatch, mutation, code, reason):
     settings, page, requests = channel
     route(page, html())
     wait = page.wait_for_function
@@ -166,8 +219,10 @@ def test_last_immediate_check_rejects_change_after_readiness(channel, monkeypatc
         return result
 
     monkeypatch.setattr(page, "wait_for_function", changed)
-    with pytest.raises(AgentError, match="^" + code + "$"):
+    with pytest.raises(AgentError, match="^" + code + "$") as caught:
         browser_runtime.ensure_channel(page, settings, "-123")
+    detail = caught.value.diagnostics
+    assert detail["check"] == "readiness_recheck" and detail["reason"] == reason
     unchanged(page, requests)
 
 
