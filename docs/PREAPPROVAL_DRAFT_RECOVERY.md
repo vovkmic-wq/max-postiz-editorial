@@ -157,9 +157,11 @@ lease или закрытие слота с согласованием, отпр
 
 ### Включение на изолированной копии
 
-1. Соберите `node deployment/postiz-max/build-schedule-journal.cjs --build`
-   из закреплённого образа. Добавьте `deployment/linux/compose.schedule-journal.yaml`
-   последним файлом конфигурации Compose тестового стека.
+1. Проверьте `node deployment/postiz-max/build-schedule-journal.cjs --check`,
+   затем запустите ту же команду с `--build`. Сборка наследует рабочий
+   образ Postiz 0.14.1 по ID из `schedule-journal-manifest.json`.
+   Добавьте `deployment/linux/compose.schedule-journal.yaml` последним
+   файлом конфигурации Compose тестового стека.
 2. В БД **Postiz** тестового стека выполните
    `deployment/postiz-max/max-schedule-journal.sql` через `psql -X -v ON_ERROR_STOP=1`.
    Применение должно быть частью переноса копии, со штатной проверкой резервной

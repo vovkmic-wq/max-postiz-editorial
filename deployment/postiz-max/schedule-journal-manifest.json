@@ -1,7 +1,7 @@
 {
   "contract": "max-schedule-journal-v1",
-  "base_image": "max-postiz-linux:0.11.2-illustrated-cas",
-  "base_image_id": "sha256:cb1ae242411c6efeda348c85b658e848f0e23ae8a7397bbc90f125225ba6243b",
+  "base_image": "max-postiz-linux:0.14.1-production",
+  "base_image_id": "sha256:650b10943b459552889b8a70c7b32b448eea2b86d893c54b923d815ecd3f77b6",
   "target_image": "max-postiz-linux:0.11.3-schedule-journal",
   "controller_source_sha256": "cb8c068d36190e39bd48ff8569e260b47662fa67127ca30a26e2335492c3f429",
   "controller_compiled_sha256": "5e863f1cc7af76a5c9f0c546b7e8076c2178a42341f41fec43b185084c530e1b"

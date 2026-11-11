@@ -1,4 +1,4 @@
-# The build script verifies the pinned image ID before creating a new tag.
-FROM max-postiz-linux:0.11.2-illustrated-cas
+# The builder attaches this local alias to the verified production image ID.
+FROM max-postiz-linux:0.14.1-production
 COPY schedule-journal-manifest.json max-schedule-journal.ts compile-schedule-journal.cjs /adapter-schedule/
 RUN node /adapter-schedule/compile-schedule-journal.cjs

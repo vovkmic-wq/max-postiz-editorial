@@ -80,13 +80,24 @@ test('only a new atomic schedule starts the native workflow', async () => {
   }
 });
 
-test('build rejects an unexpected base and tags only the pinned candidate', () => {
+test('build inherits the exact working image and leaves a foreign alias alone', () => {
   const calls = [];
   assert.throws(() => build(['--build'], () => ({ status: 0, stdout: 'different' })), /BASE_MISMATCH/);
-  build(['--build'], (_executable, args) => {
+  const run = (alias) => (_executable, args) => {
     calls.push(args);
+    if (args[1] === 'inspect' && args.at(-1) === manifest.base_image) {
+      return alias === null ? { status: 1, stdout: '' } : { status: 0, stdout: alias };
+    }
     return { status: 0, stdout: manifest.base_image_id };
-  });
-  assert.equal(calls[0].at(-1), manifest.base_image);
-  assert.equal(calls[1][calls[1].indexOf('--tag') + 1], manifest.target_image);
+  };
+  build(['--check'], run(null));
+  assert.deepEqual(calls.map(args => args.at(-1)), [manifest.base_image_id, manifest.base_image]);
+  calls.length = 0;
+  assert.throws(() => build(['--build'], run('sha256:foreign')), /BASE_MISMATCH/);
+  assert.equal(calls.length, 2);
+  calls.length = 0;
+  build(['--build'], run(null));
+  assert.deepEqual(calls[2], ['image', 'tag', manifest.base_image_id, manifest.base_image]);
+  assert.equal(calls[3][calls[3].indexOf('--tag') + 1], manifest.target_image);
+  assert.equal(calls[3][calls[3].indexOf('--network') + 1], 'none');
 });
