@@ -22,6 +22,7 @@ from .hub_models import BridgePost, Dispatch, DispatchAttempt, RemoteDraft, Targ
 from .mobile_hold import assert_item_unheld, item_is_held
 
 PROVIDER = "max-browser"
+MUTATION_LEASE_SECONDS = 300
 
 
 class MaxBridge:
@@ -657,7 +658,7 @@ class MaxBridge:
                     if link.mutation_owner == owner:
                         link.mutation_owner, link.mutation_until = None, 0
                 else:
-                    link.mutation_owner, link.mutation_until = owner, now() + 300
+                    link.mutation_owner, link.mutation_until = owner, now() + MUTATION_LEASE_SECONDS
                     # Наблюдение устаревает, даже если lease успели снять до
                     # захвата строк операцией ручной блокировки.
                     link.updated_at = max(now(), math.nextafter(link.updated_at, math.inf))

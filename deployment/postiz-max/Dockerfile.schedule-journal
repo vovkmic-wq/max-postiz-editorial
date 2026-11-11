@@ -1,0 +1,4 @@
+# The build script verifies the pinned image ID before creating a new tag.
+FROM max-postiz-linux:0.11.2-illustrated-cas
+COPY schedule-journal-manifest.json max-schedule-journal.ts compile-schedule-journal.cjs /adapter-schedule/
+RUN node /adapter-schedule/compile-schedule-journal.cjs

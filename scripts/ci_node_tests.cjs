@@ -79,6 +79,7 @@ function main() {
       'test-provider-unavailable.cjs',
       'test-production-build.cjs',
       'test-production-startup.cjs',
+      'test-schedule-journal.cjs',
     ];
     assert.deepEqual(fs.readdirSync(adapter).filter(name => /^test-.*\.cjs$/.test(name)).sort(),
       [...suites].sort(), 'Update the CI runner when adding a Node contract suite');

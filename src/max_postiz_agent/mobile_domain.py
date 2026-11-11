@@ -257,10 +257,13 @@ class MobileDomain:
                 blocked.add("BROWSER_WORKER_CGROUP_UNAVAILABLE")
             elif route in _SUPPORTED_ROUTES:
                 actions.append("reconcile_dispatch")
-        if (slot and slot.state == "blocked_unknown" and not slot.dispatch_id
-                and record.get("error") == "ARTICLE_REMOTE_CHANGED"):
+        if (slot and slot.state == "blocked_unknown" and not slot.dispatch_id and not record.get("schedule_journal")
+                and (record.get("error") == "ARTICLE_REMOTE_CHANGED"
+                     or (record.get("error") == "POSTIZ_UNKNOWN" and bridge and bridge.mutation_owner
+                         and type(bridge.mutation_until) in {int, float}
+                         and 0 < bridge.mutation_until <= now() and slot.due_at <= now()))):
             actions.append("retire_preapproval_no_send")
-        if variant and not ambiguous:
+        if variant and not ambiguous and not record.get("no_send_disposition"):
             action = "release_item_hold" if hold["active"] else "hold_item"
             try:
                 capture_item_hold(self.core, session, variant.id, action)

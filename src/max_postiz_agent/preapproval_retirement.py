@@ -1,6 +1,7 @@
 """Owner-audited retirement of an exact preapproval DRAFT, without sending."""
 
 import copy
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -28,7 +29,8 @@ from .hub_models import (
     Variant,
     VariantRevision,
 )
-from .max_bridge import MaxBridge
+from .max_bridge import MUTATION_LEASE_SECONDS, MaxBridge
+from .postiz_http_journal import PostizHttpJournal
 from .server_models import (
     EditorialControl,
     EditorialLedger,
@@ -41,6 +43,7 @@ CONTRACT = "known-preapproval-draft-retirement-v1"
 CLAIM = "preapproval_retirement_claim"
 COMMIT = "preapproval_retirement_committed"
 MAX_AGE = 120
+_TIMEOUT_ERROR = "POSTIZ_UNKNOWN"
 # Completed native preparation outcomes and retained, owner-audited historical
 # diagnostic dispositions. An unsupported state never becomes quiescent by age.
 _PREPARATION_TERMINAL = {
@@ -391,6 +394,55 @@ def _validate_journal(core, session, request_id, value, dispatch):
     )
 
 
+def _schedule_timeout_proof(core, record, slot, bridge):
+    code = "PREAPPROVAL_POSTIZ_TIMEOUT_UNPROVEN"
+    require(
+        record.get("publication_slot_id") == slot.id
+        and record.get("due_at") == slot.due_at
+        and record.get("postiz_id") == bridge.post_id
+        and slot.error == "ARTICLE_RECONCILIATION_REQUIRED"
+        and isinstance(bridge.mutation_owner, str)
+        and type(bridge.updated_at) in {float, int}
+        and type(bridge.mutation_until) in {float, int}
+        and 0 < bridge.mutation_until <= now()
+        and abs(bridge.updated_at + MUTATION_LEASE_SECONDS - bridge.mutation_until) < 0.001,
+        code,
+    )
+    events = PostizHttpJournal(core.settings.root).events_for_post(bridge.post_id)
+    require(len(events) == 1, code)
+    event = events[0]
+    require(
+        all(event.get(key) == expected for key, expected in {
+            "method": "POST", "endpoint": "/posts", "operation": "schedule",
+            "http_status": 504, "cas": "missing", "outcome": "http_error",
+            "stage": "response", "error_code": _TIMEOUT_ERROR,
+        }.items())
+        and type(event.get("elapsed_ms")) is int
+        and type(event.get("read_timeout_s")) in {float, int}
+        and 60_000 <= event["elapsed_ms"] <= 70_000
+        and event["elapsed_ms"] < event["read_timeout_s"] * 1000,
+        code,
+    )
+    try:
+        require(str(UUID(bridge.mutation_owner)) == bridge.mutation_owner, code)
+        started = datetime.fromisoformat(event["at"])
+        require(started.tzinfo is not None, code)
+        started_at = started.timestamp()
+    except (KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
+        raise AgentError(code, 409) from exc
+    finished_at = started_at + event["elapsed_ms"] / 1000
+    # The exact bridge lease appeared after the 504 had already returned.
+    # An earlier, still active, or uncorrelated lease cannot prove this case.
+    require(
+        bridge.due_at <= started_at < finished_at < bridge.updated_at < slot.due_at
+        and bridge.updated_at - finished_at <= 30,
+        code,
+    )
+    return {"http_status": 504, "event_hash": fingerprint(event), "requested_at": started_at,
+            "response_at": finished_at, "lease_acquired_at": bridge.updated_at,
+            "lease_until": bridge.mutation_until}
+
+
 def _capture(core, session, record_id, *, locked=False):
     if locked:
         fence_editorial_configuration(session)
@@ -400,7 +452,7 @@ def _capture(core, session, record_id, *, locked=False):
         return session.scalar(query.with_for_update() if locked else query)
 
     control = one(EditorialControl, EditorialControl.id == "main")
-    require(control is not None and control.paused is True, "PREAPPROVAL_PAUSE_REQUIRED")
+    require(control is not None, "PREAPPROVAL_PAUSE_REQUIRED")
     initial = session.get(EditorialLedger, LEDGER_ID)
     matches = (
         [r for r in initial.payload.get("records", []) if r.get("id") == record_id]
@@ -444,9 +496,11 @@ def _capture(core, session, record_id, *, locked=False):
     records = [r for r in ledger.payload["records"] if r.get("id") == record_id]
     require(len(records) == 1)
     record = records[0]
+    is_schedule_timeout = record.get("error") == _TIMEOUT_ERROR
+    require(control.paused is True or is_schedule_timeout, "PREAPPROVAL_PAUSE_REQUIRED")
     require(
         record.get("state") == "needs_attention"
-        and record.get("error") == "ARTICLE_REMOTE_CHANGED"
+        and record.get("error") in {"ARTICLE_REMOTE_CHANGED", _TIMEOUT_ERROR}
         and record.get("reserve_contract") == RESERVE_CONTRACT
         and record.get("variant_id") == variant.id
         and record.get("target_id") == target.id
@@ -506,6 +560,7 @@ def _capture(core, session, record_id, *, locked=False):
         and variant.config_hash == core.settings.hash
         and all(t.paused is True for t in session.scalars(select(Target)))
     )
+    timeout_proof = _schedule_timeout_proof(core, record, slot, bridge) if is_schedule_timeout else None
     require(
         remote is not None
         and remote.state == "draft"
@@ -517,8 +572,7 @@ def _capture(core, session, record_id, *, locked=False):
         and bridge.error is None
         and bridge.integration_id == target.options.get("postiz_integration_id")
         and bridge.target_id == target.id
-        and bridge.mutation_owner is None
-        and bridge.mutation_until == 0
+        and (timeout_proof is not None or (bridge.mutation_owner is None and bridge.mutation_until == 0))
     )
     require(
         list(
@@ -535,7 +589,13 @@ def _capture(core, session, record_id, *, locked=False):
         and not session.scalar(select(Approval.id).where(Approval.draft_id == variant.draft_id))
         and not session.scalar(select(Intent.id).where(Intent.draft_id == variant.draft_id))
     )
-    # Strict even for expired or NULL leases; never manufacture no-send from age.
+    # All other leases are still disqualifying, including expired or NULL leases.
+    bridge_leases = select(BridgePost.post_id).where(
+        or_(BridgePost.mutation_owner.is_not(None), BridgePost.mutation_until.is_(None),
+            BridgePost.mutation_until != 0)
+    )
+    if timeout_proof is not None:
+        bridge_leases = bridge_leases.where(BridgePost.post_id != bridge.post_id)
     checks = [
         select(Dispatch.id).where(
             or_(
@@ -546,13 +606,7 @@ def _capture(core, session, record_id, *, locked=False):
                 Dispatch.lease_until != 0,
             )
         ),
-        select(BridgePost.post_id).where(
-            or_(
-                BridgePost.mutation_owner.is_not(None),
-                BridgePost.mutation_until.is_(None),
-                BridgePost.mutation_until != 0,
-            )
-        ),
+        bridge_leases,
         select(Job.id).where(
             or_(
                 Job.state.not_in({"done", "failed", "cancelled"}),
@@ -652,6 +706,8 @@ def _capture(core, session, record_id, *, locked=False):
         "variant_history_hash": fingerprint([_view(v) for v in versions]),
         "files": _files(core, record, variant, session),
     }
+    if timeout_proof is not None:
+        snapshot["schedule_timeout"] = timeout_proof
     return snapshot, (control, ledger, record, slot, variant, target, remote, bridge)
 
 
@@ -1051,6 +1107,9 @@ def apply(core, record_id, *, operation_id, plan_hash, actor, reason, retire_con
             "draft_preserved": True,
             "observation_hashes": [fingerprint(x) for x in observations],
         }
+        if "schedule_timeout" in snapshot:
+            disposition["schedule_timeout"] = snapshot["schedule_timeout"]
+            bridge.mutation_owner, bridge.mutation_until = None, 0
         output.update(state="cancelled", cancelled_at=stamp, no_send_disposition=disposition)
         output["preparation_actions"] = [
             *output.get("preparation_actions", []),

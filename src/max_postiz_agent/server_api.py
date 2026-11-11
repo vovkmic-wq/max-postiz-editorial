@@ -14,6 +14,7 @@ from .article_cycle import HourlyArticleCycle
 from .config import AgentError
 from .hub_api import BridgeConnectInput, BridgeExchangeInput, BridgeMutationInput, BridgePostInput
 from .hub_models import Dispatch, Variant
+from .schedule_recovery import ScheduleOperation, ScheduleRecovery
 from .server_state import ServerState
 
 
@@ -214,5 +215,13 @@ def editorial_app(core, store=None):
         if value.expected_hash is not None or value.expected_post_id is not None:
             raise AgentError("BRIDGE_MUTATION_CAS_INVALID", 409)
         return core.bridge.mutation(value.identifiers, value.owner)
+
+    @app.post("/api/max-bridge/schedule/start", dependencies=[Depends(bridge_auth)])
+    def bridge_schedule_start(value: ScheduleOperation):
+        return ScheduleRecovery(core).start(value)
+
+    @app.post("/api/max-bridge/schedule/retire", dependencies=[Depends(bridge_auth)])
+    def bridge_schedule_retire(value: ScheduleOperation):
+        return ScheduleRecovery(core).authorize_retirement(value)
 
     return app

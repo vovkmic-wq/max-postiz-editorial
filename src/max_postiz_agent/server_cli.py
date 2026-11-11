@@ -92,6 +92,7 @@ def main(argv=None):
         else:
             import uvicorn
             from .hourly_reserve import PreparationState, ReserveServerCycle
+            from .schedule_recovery import ScheduleRecovery
             store.read()
             if DatabaseArticleLedger(HourlyArticleCycle(core)).load() is None:
                 raise AgentError("EDITORIAL_MIGRATION_REQUIRED", 409)
@@ -108,12 +109,15 @@ def main(argv=None):
                 # Разные экземпляры журнала: долгий prepare не владеет снимком отправителя.
                 controller = ReserveServerCycle(core, state=store)
                 preparer = ReserveServerCycle(core, state=PreparationState(store))
+                schedule_recovery = ScheduleRecovery(core)
 
                 def worker():
                     # Только этот поток выполняет внешние изменения Postiz/MAX.
                     while not stop.is_set():
-                        stage = "dispatch_tick"
+                        stage = "schedule_recovery"
                         try:
+                            schedule_recovery.run_once()
+                            stage = "dispatch_tick"
                             core.dispatch_tick()
                             # Отдельные согласования новых адресатов не наследуют
                             # MAX hourly policy; отправляет тот же владелец worker.

@@ -15,6 +15,7 @@ from .postiz_http_journal import PostizHttpJournal
 
 
 _ENDPOINTS = {'/posts', '/integrations', '/upload'}
+_MAX_SCHEDULE = '/max-schedule-operations'
 _UPSTREAM_CODES = {
     'MAX_BROWSER_CAS_INVALID', 'MAX_BROWSER_CAS_SCHEDULE_CHANGED', 'MAX_BROWSER_CAS_UNCONFIRMED',
     'MAX_BROWSER_MUTATION_BLOCKED', 'BRIDGE_EDIT_IN_PROGRESS', 'BRIDGE_REMOTE_CHANGED',
@@ -61,8 +62,11 @@ class PostizClient:
         self.client = httpx.Client(timeout=self.timeout,
                                    trust_env=False, follow_redirects=False, transport=transport)
         self.max_video = options.get("max_video_verified", False)
+        self.schedule_journal_enabled = os.getenv("MAX_POSTIZ_SCHEDULE_JOURNAL") == "1"
+        self._schedule_key = os.getenv("MAX_POSTIZ_BRIDGE_KEY", "")
 
-    def request(self, method, path, *, expected_cas_hash=None, expected_post_id=None, fresh_read=False, **kwargs):
+    def request(self, method, path, *, expected_cas_hash=None, expected_post_id=None, fresh_read=False,
+                schedule_journal=False, **kwargs):
         parsed = urlsplit(self.base)
         if not self.key or not self.base or parsed.scheme not in {"http", "https"}:
             raise AgentError("POSTIZ_NOT_CONFIGURED", 503)
@@ -71,6 +75,10 @@ class PostizClient:
         if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "postiz"}:
             raise AgentError("POSTIZ_HTTPS_REQUIRED")
         headers = {"Authorization": self.key}
+        if schedule_journal:
+            if not self._schedule_key or not path.startswith(_MAX_SCHEDULE + "/"):
+                raise AgentError("MAX_SCHEDULE_JOURNAL_NOT_CONFIGURED", 503)
+            headers["X-Max-Bridge-Key"] = self._schedule_key
         if fresh_read:
             if method != "GET":
                 raise AgentError("POSTIZ_FRESH_READ_INVALID")
@@ -86,6 +94,8 @@ class PostizClient:
         payload = kwargs.get('json')
         operation = payload.get('type') if method == 'POST' and path == '/posts' and isinstance(payload, dict) else None
         endpoint = path if path in _ENDPOINTS else '/posts/:id' if path.startswith('/posts/') else 'other'
+        if schedule_journal:
+            endpoint = _MAX_SCHEDULE
         event = {'at': datetime.now(UTC).isoformat(timespec='milliseconds'),
                  'method': method if method in {'GET', 'POST', 'DELETE'} else 'other', 'endpoint': endpoint,
                  'operation': operation if operation in ('draft', 'schedule') else None,
@@ -149,6 +159,28 @@ class PostizClient:
         if not isinstance(data, list):
             raise AgentError("POSTIZ_RESPONSE_INVALID")
         return data
+
+    def require_max_schedule_journal(self):
+        data = self.request("GET", _MAX_SCHEDULE + "/capabilities", fresh_read=True,
+                            schedule_journal=True, timeout=8)
+        if data != {"contract": "max-schedule-journal-v1"}:
+            raise AgentError("MAX_SCHEDULE_JOURNAL_UNAVAILABLE", 503)
+
+    def schedule_max_draft(self, operation):
+        self._max_schedule_write(operation, "", {"scheduled"}, timeout=25)
+
+    def retire_max_schedule(self, operation):
+        return self._max_schedule_write(operation, "/retire",
+            {"draft_preserved", "draft_restored", "draft_conflict"}, timeout=8)
+
+    def _max_schedule_write(self, operation, suffix, outcomes, *, timeout):
+        binding = operation.model_dump()
+        result = self.request("POST", _MAX_SCHEDULE + "/" + operation.operation_id + suffix,
+                              json=binding, schedule_journal=True, timeout=timeout)
+        if (not isinstance(result, dict) or result.get("operation") != binding
+                or not isinstance(result.get("outcome"), str) or result["outcome"] not in outcomes):
+            raise AgentError("POSTIZ_UNKNOWN", 503)
+        return result["outcome"]
 
     def integrations_fresh(self):
         data = self.request("GET", "/integrations", fresh_read=True)
