@@ -17,6 +17,13 @@ internal data class SavedLogin(val username: String, val password: String) {
     override fun toString() = "SavedLogin([protected])"
 }
 
+internal fun loginToRemember(username: String, password: String, savedUsername: String?): SavedLogin? {
+    val name = username.trim()
+    if (password.isEmpty() && name.isNotEmpty() && name == savedUsername) return null
+    require(name.isNotEmpty() && password.isNotEmpty()) { "Чтобы сохранить данные входа, укажите имя и пароль." }
+    return SavedLogin(name, password)
+}
+
 internal class SessionStore(context: Context) {
     private val preferences = context.getSharedPreferences("mobile-panel", Context.MODE_PRIVATE)
     private val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -47,10 +54,19 @@ internal class SessionStore(context: Context) {
     fun remembersLogin(profile: ConnectionProfile): Boolean =
         preferences.getBoolean("remember-" + hash(profile), preferences.contains("auth-" + hash(profile)))
 
-    fun rememberLogin(profile: ConnectionProfile, enabled: Boolean) {
-        val edit = preferences.edit().putBoolean("remember-" + hash(profile), enabled)
-        if (!enabled) edit.remove("auth-" + hash(profile)).remove("login-" + hash(profile))
-        check(edit.commit()) { "Не удалось сохранить выбор входа." }
+    fun rememberLogin(profile: ConnectionProfile, enabled: Boolean, login: SavedLogin?): SavedLogin? {
+        val suffix = hash(profile)
+        val loginKey = "login-$suffix"
+        val edit = preferences.edit().putBoolean("remember-$suffix", enabled)
+        val saved = if (enabled) login ?: loadLogin(profile) else null
+        if (!enabled) {
+            edit.remove("auth-$suffix").remove(loginKey)
+        } else if (login != null) {
+            val value = JSONObject().put("username", login.username).put("password", login.password)
+            edit.putString(loginKey, encryptedValue(loginKey, value.toString()))
+        }
+        check(edit.commit()) { "Не удалось сохранить данные входа." }
+        return saved
     }
 
     fun loadLogin(profile: ConnectionProfile): SavedLogin? = decrypt("login-" + hash(profile))?.let {
@@ -59,9 +75,6 @@ internal class SessionStore(context: Context) {
             SavedLogin(data.getString("username"), data.getString("password"))
         }.getOrNull()
     }
-
-    fun saveLogin(profile: ConnectionProfile, login: SavedLogin) = encrypt("login-" + hash(profile), JSONObject()
-        .put("username", login.username).put("password", login.password).toString())
 
     fun hasPin(): Boolean = preferences.contains(PIN)
     fun loadPin(): String? = decrypt(PIN)
@@ -94,13 +107,16 @@ internal class SessionStore(context: Context) {
         if (value == null) {
             edit.remove(name)
         } else {
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, key())
-            cipher.updateAAD(name.encodeToByteArray())
-            val encoded = (cipher.iv + cipher.doFinal(value.encodeToByteArray()))
-            edit.putString(name, Base64.encodeToString(encoded, Base64.NO_WRAP))
+            edit.putString(name, encryptedValue(name, value))
         }
         check(edit.commit()) { "Не удалось сохранить состояние приложения." }
+    }
+
+    private fun encryptedValue(name: String, value: String): String {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, key())
+        cipher.updateAAD(name.encodeToByteArray())
+        return Base64.encodeToString(cipher.iv + cipher.doFinal(value.encodeToByteArray()), Base64.NO_WRAP)
     }
 
     private fun decrypt(name: String): String? {

@@ -1,0 +1,4 @@
+# Apply after deployment/linux/compose.yaml, on the isolated stack first.
+services:
+  postiz:
+    image: max-postiz-linux:0.11.3-schedule-journal

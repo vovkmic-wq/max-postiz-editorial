@@ -16,6 +16,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
 from max_postiz_agent import preapproval_retirement as recovery
+from max_postiz_agent import mobile_domain
 from max_postiz_agent.config import AgentError
 from max_postiz_agent.db import Audit, Database, now
 from max_postiz_agent.db import Draft
@@ -255,8 +256,12 @@ def test_postgres_legacy_approval_serializes_with_first_retirement_claim(
         assert session.get(Audit, recovery._id(value.variant_id, "claim")) is None
     assert len(value.reads) == 2
 
-def test_mobile_owner_retires_only_proven_unsent_draft(retirement_pg):
+@pytest.mark.parametrize("timed_out_schedule", [False, True])
+def test_mobile_owner_retires_only_proven_unsent_draft(retirement_pg, timed_out_schedule, monkeypatch):
     value = retirement_pg
+    if timed_out_schedule:
+        checks.schedule_timeout(value)
+        monkeypatch.setattr(mobile_domain, "now", lambda: value.stamp[0])
     actor = "postiz:mobile:" + "a" * 32
 
     class Owner:
@@ -266,6 +271,9 @@ def test_mobile_owner_retires_only_proven_unsent_draft(retirement_pg):
     with TestClient(mobile_app(value.core.db, MobileDomain(value.core), Owner(),
                                environment="fixture", write_enabled=True),
                     headers={"Authorization": "Bearer fixture"}) as client:
+        detail = client.get("/mobile/v1/queue/" + value.variant_id)
+        assert detail.status_code == 200, detail.json()
+        assert "retire_preapproval_no_send" in detail.json()["available_actions"]
         response = client.post("/mobile/v1/operation-plans", json={
             "action": "retire_preapproval_no_send", "object_id": value.record_id,
         })

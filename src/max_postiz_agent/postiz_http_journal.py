@@ -1,5 +1,6 @@
 """Bounded local journal for redacted Postiz HTTP diagnostics."""
 
+import hashlib
 import json
 import logging
 import os
@@ -41,6 +42,31 @@ class PostizHttpJournal:
             if not self.warned:
                 self.warned = True
                 logging.getLogger(__name__).warning('POSTIZ_HTTP_JOURNAL_UNAVAILABLE')
+
+    def events_for_post(self, post_id):
+        digest = hashlib.sha256(post_id.encode()).hexdigest()
+        try:
+            events = []
+            with _THREAD_LOCK, profile_lock(private_path(self.root, _LOCK)):
+                for suffix in ('.2', '.1', ''):
+                    path = private_path(self.root, _NAME + suffix)
+                    if not path.exists():
+                        continue
+                    if not path.is_file():
+                        raise ValueError('Invalid journal file')
+                    with path.open('rb') as stream:
+                        raw = stream.read(MAX_BYTES + 1)
+                    if len(raw) > MAX_BYTES or (raw and not raw.endswith(b'\n')):
+                        raise ValueError('Invalid journal size or incomplete record')
+                    for line in raw.splitlines():
+                        event = json.loads(line)
+                        if not isinstance(event, dict):
+                            raise ValueError('Invalid journal record')
+                        if event.get('post_id_sha256') == digest:
+                            events.append(event)
+            return events
+        except (OSError, ValueError, AgentError) as exc:
+            raise AgentError('PREAPPROVAL_POSTIZ_JOURNAL_INVALID', 409) from exc
 
     def _write(self, line):
         current = private_path(self.root, _NAME)

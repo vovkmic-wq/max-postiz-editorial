@@ -92,11 +92,12 @@ internal class PanelViewModel(application: Application) : AndroidViewModel(appli
     }
 
     fun connect(profile: ConnectionProfile, token: String?, remember: Boolean, login: SavedLogin?,
-                copyPassword: ((String) -> Unit)?, openBrowser: (Intent) -> Unit) =
-        connect(profile, token, remember, login, fresh = copyPassword != null, copyPassword, openBrowser)
+                copyPassword: ((String) -> Unit)?, onLoginStored: (String?) -> Unit, openBrowser: (Intent) -> Unit) =
+        connect(profile, token, remember, login, fresh = login != null, copyPassword, onLoginStored, openBrowser)
 
     private fun connect(profile: ConnectionProfile, token: String?, remember: Boolean, login: SavedLogin?,
-                        fresh: Boolean, copyPassword: ((String) -> Unit)?, openBrowser: (Intent) -> Unit) {
+                        fresh: Boolean, copyPassword: ((String) -> Unit)?, onLoginStored: ((String?) -> Unit)?,
+                        openBrowser: (Intent) -> Unit) {
         runAction {
             if (profile.testLoopback) {
                 require(!token.isNullOrBlank() && token.length <= 4096 && token.none(Char::isWhitespace))
@@ -106,15 +107,16 @@ internal class PanelViewModel(application: Application) : AndroidViewModel(appli
             } else {
                 fixtureToken = null
                 val savedLogin = withContext(Dispatchers.IO) {
-                    storage.rememberLogin(profile, remember)
-                    if (remember && login != null) storage.saveLogin(profile, login)
-                    storage.loadLogin(profile)
+                    storage.rememberLogin(profile, remember, login)
                 }
+                onLoginStored?.invoke(savedLogin?.username)
                 if (remember && !fresh) {
                     try {
                         if (resumeAuthorized(profile)) return@runAction
                     } catch (_: SessionExpired) {
                         // Only an explicit sign-in may open the browser after expiration.
+                    } catch (error: ApiFailure) {
+                        if (error.status != 401) throw error
                     }
                 }
                 val (intent, attempt) = browser.start(profile, savedLogin?.username, remember)
@@ -141,7 +143,7 @@ internal class PanelViewModel(application: Application) : AndroidViewModel(appli
     fun reconnect(openBrowser: (Intent) -> Unit, copyPassword: ((String) -> Unit)? = null) {
         val profile = state.value.profile ?: return
         if (!profile.testLoopback) connect(profile, null, remembersLogin(profile), login = null,
-            fresh = true, copyPassword, openBrowser)
+            fresh = true, copyPassword, onLoginStored = null, openBrowser)
     }
 
     private suspend fun establish(profile: ConnectionProfile) {
@@ -437,6 +439,8 @@ internal class PanelViewModel(application: Application) : AndroidViewModel(appli
 
     private fun apiError(error: ApiFailure): String {
         val message = when {
+            error.code in setOf("PREAPPROVAL_POSTIZ_TIMEOUT_UNPROVEN", "PREAPPROVAL_POSTIZ_JOURNAL_INVALID",
+                "PREAPPROVAL_RETIREMENT_NOT_SAFE") -> blocker(error.code)
             error.code == "MOBILE_REAUTH_REQUIRED" -> "Для команды нужен свежий вход владельца."
             error.status == 401 -> "Сессия не принята. Войдите снова."
             error.status == 403 -> "У этой сессии нет права на действие."

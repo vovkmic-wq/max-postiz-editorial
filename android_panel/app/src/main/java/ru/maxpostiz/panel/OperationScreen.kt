@@ -54,7 +54,7 @@ internal fun PlanDialog(state: PanelState, model: PanelViewModel, plan: Operatio
                 Field("Действие", actionName(plan.effect) ?: status(plan.effect))
                 Field("План действует до", stamp(plan.expiresAt, state.zone))
                 if (plan.action == "retire_preapproval_no_send") {
-                    Notice("Черновик и история сохранятся. Старая запись будет закрыта для отправки.")
+                    Notice("Сервер сверит черновик в Postiz. Если проверка пройдёт, слот закроется, а черновик и история сохранятся.")
                 }
                 if (plan.action == "reconcile_dispatch") Notice("Сервер проверит результат прежней отправки.")
                 OutlinedTextField(reason, { reason = it }, label = { Text("Обоснование") }, singleLine = true,
@@ -109,6 +109,6 @@ internal fun actionName(value: String): String? = when (value) {
     "hold_item" -> "Заблокировать запись"
     "release_item_hold" -> "Снять блокировку"
     "reconcile_dispatch" -> "Сверить исход"
-    "retire_preapproval_no_send" -> "Закрыть без отправки"
+    "retire_preapproval_no_send" -> "Закрытие просроченного слота"
     else -> null
 }

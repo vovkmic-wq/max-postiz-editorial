@@ -154,7 +154,7 @@ class MainActivity : ComponentActivity() {
             afterPermission = null
         }
 
-        fun start(copy: Boolean) {
+        fun start() {
             message = null
             val profile = runCatching { ConnectionProfile.from(origin, issuer, clientId, fixture) }
                 .getOrElse { message = it.message; return }
@@ -162,21 +162,18 @@ class MainActivity : ComponentActivity() {
                 message = "Введите тестовый токен стенда."
                 return
             }
-            val name = username.trim()
-            if (!fixture && rememberLogin && (password.isNotEmpty() || name != savedUsername.orEmpty()) &&
-                (name.isBlank() || password.isEmpty())) {
-                message = "Чтобы сохранить данные входа, укажите имя и пароль."
-                return
-            }
-            val login = if (!fixture && rememberLogin && name.isNotBlank() && password.isNotEmpty()) {
-                SavedLogin(name, password)
+            val login = if (!fixture && rememberLogin) {
+                runCatching { loginToRemember(username, password, model.rememberedUsername(profile)) }
+                    .getOrElse { message = it.message; return }
             } else null
             val connect = {
                 model.connect(profile, token.trim(), rememberLogin, login,
-                    if (copy) ::copyPassword else null, openBrowser)
+                    if (!fixture && rememberLogin) ::copyPassword else null,
+                    onLoginStored = { name ->
+                        savedUsername = name
+                        password = ""
+                    }, openBrowser)
                 token = ""
-                password = ""
-                if (login != null) savedUsername = login.username
             }
             if ((BuildConfig.PRIVATE_LAN || local) && !fixture && Build.VERSION.SDK_INT >= 37 &&
                 checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
@@ -232,18 +229,23 @@ class MainActivity : ComponentActivity() {
                 }
                 Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("remember_login").toggleable(
                     value = rememberLogin, enabled = !state.busy, role = Role.Checkbox,
-                    onValueChange = { rememberLogin = it }), verticalAlignment = Alignment.CenterVertically) {
+                    onValueChange = {
+                        rememberLogin = it
+                        if (!it) password = ""
+                    }), verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = rememberLogin, onCheckedChange = null, enabled = !state.busy)
                     Text("Запомнить имя и пароль", Modifier.padding(start = 12.dp))
                 }
                 if (rememberLogin) {
+                    val passwordSaved = savedUsername != null && username.trim() == savedUsername
                     TextInput(username, { username = it.take(200) }, "Имя пользователя", "remember_username")
                     OutlinedTextField(password, { password = it.take(512) },
-                        label = { Text(if (savedUsername == null) "Пароль" else "Новый пароль (необязательно)") },
+                        label = { Text(if (passwordSaved) "Новый пароль (необязательно)" else "Пароль") },
                         visualTransformation = PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), singleLine = true,
                         modifier = Modifier.fillMaxWidth().testTag("remember_password"))
-                    Notice("Данные шифруются на телефоне. При новом входе имя подставится, а пароль можно вставить из буфера.")
+                    if (passwordSaved) Text("Пароль сохранён на телефоне.")
+                    Notice("Если откроется Keycloak, вставьте скопированный пароль в форму входа.")
                 }
                 if (Build.VERSION.SDK_INT >= 37 && !BuildConfig.PRIVATE_LAN) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
@@ -256,13 +258,7 @@ class MainActivity : ComponentActivity() {
             (message ?: state.error)?.let { Notice(it, true) }
             if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             Button(enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("connect"),
-                onClick = { start(false) }) { Text(if (fixture) "Подключить стенд" else "Войти") }
-            if (!fixture && rememberLogin && username.isNotBlank() &&
-                (password.isNotEmpty() || username.trim() == savedUsername)) {
-                OutlinedButton(onClick = { start(true) }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
-                    Text("Скопировать пароль и открыть вход")
-                }
-            }
+                onClick = ::start) { Text(if (fixture) "Подключить стенд" else "Войти") }
         }
     }
 

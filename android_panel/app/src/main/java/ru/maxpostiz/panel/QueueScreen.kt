@@ -155,6 +155,7 @@ internal fun status(value: String?): String? = when (value) {
     "fixture" -> "Данные тестового стенда"
     "unverified" -> "Без подтверждения"
     "retired_no_send" -> "Закрыто без отправки"
+    "record_cancelled_slot_missed_draft_preserved_no_send" -> "Закрыть слот и сохранить черновик"
     "accepted" -> "Принята"
     "running" -> "Выполняется"
     "succeeded" -> "Выполнена"
@@ -173,8 +174,10 @@ internal fun blocker(value: String): String = when (value) {
     "BROWSER_WORKER_CGROUP_UNAVAILABLE" -> "Контейнеру недоступна изоляция браузерного обработчика."
     "MOBILE_HOLD_DUE_ELAPSED" -> "Срок прошёл, блокировка сохранена."
     "MOBILE_ITEM_HELD" -> "Действует ручная блокировка."
-    "ARTICLE_RECONCILIATION_REQUIRED" -> "Нужно сверить исход отправки."
+    "ARTICLE_RECONCILIATION_REQUIRED" -> "Нужно сверить состояние слота."
     "ARTICLE_REMOTE_CHANGED" -> "Данные записи в Postiz изменились."
+    "PREAPPROVAL_POSTIZ_TIMEOUT_UNPROVEN", "PREAPPROVAL_POSTIZ_JOURNAL_INVALID", "PREAPPROVAL_RETIREMENT_NOT_SAFE" ->
+        "Недостаточно доказательств для закрытия. Слот остаётся заблокированным."
     "BRIDGE_EDIT_IN_PROGRESS" -> "Серверная операция ещё выполняется."
     "MOBILE_POSTIZ_LINK_UNVERIFIED" -> "Связь с записью Postiz требует проверки."
     else -> value

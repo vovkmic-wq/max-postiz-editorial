@@ -16,7 +16,7 @@ services:
       retries: 15
 
   mobile-fixture:
-    image: max-postiz-mobile-fixture:0.15.3
+    image: max-postiz-mobile-fixture:0.15.5
     build:
       context: ../..
       dockerfile: deployment/mobile/Dockerfile

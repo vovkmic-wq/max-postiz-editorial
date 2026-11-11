@@ -50,8 +50,8 @@ android {
         applicationId = "ru.maxpostiz.panel"
         minSdk = 33
         targetSdk = 37
-        versionCode = 7
-        versionName = "0.1.6"
+        versionCode = 9
+        versionName = "0.1.8"
         manifestPlaceholders["appAuthRedirectScheme"] = "https"
         manifestPlaceholders["mobileRedirectHost"] = redirectHost
         buildConfigField("String", "REDIRECT_URI", "\"$redirectUri\"")

@@ -468,17 +468,27 @@ def publish(cycle, record, ledger, reviewed_hash, due_at):
         core._check_schedule_limits(session, variant, target, due, automatic_policy=policy)
         link = session.scalar(select(BridgePost).where(BridgePost.variant_id == variant.id))
         post_id = link.post_id if link else None
+    journal = None
+    if assigned and post_id and core.postiz.schedule_journal_enabled:
+        from .schedule_recovery import ScheduleOperation, plan
+
+        journal = plan(core, record, assigned, before)
+        record["schedule_journal"] = journal
     record.update(state="automatic_scheduling", automatic_slot=slot, due_at=due)
     cycle._save(ledger)
     try:
         if post_id:
-            # Postiz's MaxBrowserMutationGuard owns the one end-to-end lease.
-            # Taking another lease here makes its nested /mutation/start fail.
-            core.postiz.reschedule_existing(post_id, before["body"], due,
-                **({"expected_media": before["media"], "expected_remote_hash": before["metadata"]["postiz_hash"]}
-                   if illustrated_presentation(record.get("presentation_contract")) else {}))
-            # The guard releases asynchronously on HTTP finish. Only observe;
-            # never expire or unlock an uncertain mutation to obtain permission.
+            if journal is not None:
+                operation = ScheduleOperation.model_validate(journal["operation"])
+                core.postiz.schedule_max_draft(operation)
+                core.bridge.mutation([post_id], release=operation.operation_id)
+            else:
+                # The native guard owns the single end-to-end lease.
+                core.postiz.reschedule_existing(post_id, before["body"], due,
+                    **({"expected_media": before["media"], "expected_remote_hash": before["metadata"]["postiz_hash"]}
+                       if illustrated_presentation(record.get("presentation_contract")) else {}))
+            # Native scheduling releases asynchronously on HTTP finish.
+            # Both paths require the lease to be absent before approval.
             deadline = time.monotonic() + 5
             while True:
                 with core.db.session() as session:

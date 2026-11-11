@@ -1,6 +1,8 @@
 """Native preapproval retirement preserves history and never performs Send."""
 
 import copy
+from datetime import datetime, timezone
+import hashlib
 import json
 from uuid import uuid4
 from types import SimpleNamespace
@@ -14,6 +16,7 @@ from max_postiz_agent import preapproval_retirement as recovery
 from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.db import Audit, Base, Draft, Intent, Job
 from max_postiz_agent.hub_models import (
+    BridgePost,
     RemoteDraft,
     Target,
     TargetApproval,
@@ -27,6 +30,7 @@ from max_postiz_agent.server_models import (
 )
 from max_postiz_agent.server_api import editorial_app
 from max_postiz_agent.service import Service
+from max_postiz_agent.postiz_http_journal import PostizHttpJournal
 
 pytest_plugins = ["test_illustrated_article_flow"]
 
@@ -172,6 +176,66 @@ def check_retire(value):
 
 def test_retirement_is_atomic_preserves_every_history_table(retirement_case):
     check_retire(retirement_case)
+
+
+def schedule_timeout(value, *, status=504, late=True):
+    value.stamp[0] += 600
+    with value.core.db.session.begin() as session:
+        slot = session.get(PublicationSlot, value.slot_id)
+        bridge = session.scalar(select(BridgePost).where(BridgePost.variant_id == value.variant_id))
+        started = slot.due_at - 100
+        bridge.updated_at = started + (71 if late else 1)
+        bridge.mutation_owner = str(uuid4())
+        bridge.mutation_until = bridge.updated_at + 300
+        ledger = session.get(EditorialLedger, "hourly")
+        payload = copy.deepcopy(ledger.payload)
+        record = next(r for r in payload["records"] if r["id"] == value.record_id)
+        record.update(error="POSTIZ_UNKNOWN", postiz_id=bridge.post_id, due_at=slot.due_at)
+        ledger.payload = payload
+        # The project can remain in RUN while the exact blocked destination is paused.
+        from max_postiz_agent.server_models import EditorialControl
+
+        session.get(EditorialControl, "main").paused = False
+        post_digest = hashlib.sha256(bridge.post_id.encode()).hexdigest()
+    PostizHttpJournal(value.core.settings.root).append({
+        "at": datetime.fromtimestamp(started, timezone.utc).isoformat(),
+        "method": "POST", "endpoint": "/posts", "operation": "schedule",
+        "post_id_sha256": post_digest, "http_status": status, "outcome": "http_error",
+        "error_code": "POSTIZ_UNKNOWN", "stage": "response", "cas": "missing",
+        "elapsed_ms": 61184, "read_timeout_s": 75,
+    })
+
+
+def test_closes_expired_504_slot_and_releases_only_its_late_lease(retirement_case):
+    value = retirement_case
+    schedule_timeout(value)
+    before = snapshot(value.core)
+    proposal = plan(value)
+    assert snapshot(value.core) == before
+    result = apply(value, proposal)
+    after = snapshot(value.core)
+    assert result["state"] == "retired_no_send"
+    assert result["disposition"]["schedule_timeout"]["http_status"] == 504
+    assert {key for key in before if before[key] != after[key]} == {
+        "editorial_article_ledger", "publication_slots", "audit_events", "hub_bridge_posts"
+    }
+    bridge = after["hub_bridge_posts"][0]
+    assert bridge["mutation_owner"] is None and bridge["mutation_until"] == 0
+    assert bridge["remote_state"] == "DRAFT" and bridge["active"] is True
+    slot = next(row for row in after["publication_slots"] if row["id"] == value.slot_id)
+    assert slot["state"] == "missed" and slot["active_target"] is None
+    assert not after["hub_dispatches"] and not after["hub_approvals"]
+    assert len(value.events) == value.model_count
+
+
+@pytest.mark.parametrize("kwargs", [{"status": 502}, {"late": False}])
+def test_timeout_without_matching_504_and_late_lease_stays_blocked(retirement_case, kwargs):
+    value = retirement_case
+    schedule_timeout(value, **kwargs)
+    before = snapshot(value.core)
+    with pytest.raises(AgentError):
+        plan(value)
+    assert snapshot(value.core) == before and not value.reads
 
 
 def check_replay(value):
