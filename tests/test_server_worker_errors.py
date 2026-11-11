@@ -124,14 +124,23 @@ def test_generic_catches_log_before_unchanged_runtime_error_update():
         assert "last_error={'code': code}" in ast.unparse(handler)
 
 
-@pytest.mark.parametrize("failed_stage", ["dispatch_tick", "platform_publish_due", "controller", "preparation", "agent"])
-def test_actual_worker_loops_keep_error_codes_and_shutdown(monkeypatch, tmp_path, caplog, failed_stage):
+@pytest.mark.parametrize(("failed_stage", "journal_enabled", "tracked"), [
+    ("dispatch_tick", False, False),
+    ("platform_publish_due", False, False),
+    ("controller", False, False),
+    ("preparation", False, False),
+    ("agent", False, False),
+    ("schedule_recovery", True, False),
+    ("schedule_recovery", False, True),
+])
+def test_actual_worker_loops_keep_error_codes_and_shutdown(
+        monkeypatch, tmp_path, caplog, failed_stage, journal_enabled, tracked):
     import asyncio
     from contextlib import contextmanager
     import threading
 
     import uvicorn
-    from max_postiz_agent import hourly_reserve
+    from max_postiz_agent import hourly_reserve, schedule_recovery
 
     observed = threading.Event()
     errors = []
@@ -164,6 +173,8 @@ def test_actual_worker_loops_keep_error_codes_and_shutdown(monkeypatch, tmp_path
         publish_due=lambda **kw: maybe_fail("platform_publish_due"),
         close=lambda: closed.append(True),
     )
+    if journal_enabled:
+        core.postiz = SimpleNamespace(schedule_journal_enabled=True)
     application = SimpleNamespace(router=SimpleNamespace(), state=SimpleNamespace())
 
     def fake_cycle(*args, **kwargs):
@@ -179,7 +190,11 @@ def test_actual_worker_loops_keep_error_codes_and_shutdown(monkeypatch, tmp_path
     monkeypatch.setattr(server_cli, "build", lambda *a, **kw: core)
     monkeypatch.setattr(server_cli, "ServerState", lambda core: Store())
     monkeypatch.setattr(server_cli, "HourlyArticleCycle", lambda core: object())
-    monkeypatch.setattr(server_cli, "DatabaseArticleLedger", lambda cycle: SimpleNamespace(load=lambda: {}))
+    ledger = {"records": [{"schedule_journal": {"operation": "fixture"}}]} if tracked else {}
+    monkeypatch.setattr(server_cli, "DatabaseArticleLedger", lambda cycle: SimpleNamespace(load=lambda: ledger))
+    if failed_stage == "schedule_recovery":
+        monkeypatch.setattr(schedule_recovery, "ScheduleRecovery",
+                            lambda core: SimpleNamespace(run_once=lambda: maybe_fail("schedule_recovery")))
     monkeypatch.setattr(server_cli, "editorial_app", lambda *a: application)
     monkeypatch.setattr(hourly_reserve, "ReserveServerCycle", fake_cycle)
     monkeypatch.setattr(uvicorn, "run", serve)

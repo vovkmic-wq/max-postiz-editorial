@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 
 from .article_cycle import HourlyArticleCycle
@@ -24,7 +24,7 @@ def _log_unexpected_exception(exc, stage):
         kind = type(exc).__name__
         if not identifier.fullmatch(kind):
             kind = "Exception"
-        stages = {"dispatch_tick", "platform_publish_due", "controller", "preparation"}
+        stages = {"schedule_recovery", "dispatch_tick", "platform_publish_due", "controller", "preparation"}
         frames = []
         trace = exc.__traceback__
         for _ in range(64):
@@ -94,30 +94,37 @@ def main(argv=None):
             from .hourly_reserve import PreparationState, ReserveServerCycle
             from .schedule_recovery import ScheduleRecovery
             store.read()
-            if DatabaseArticleLedger(HourlyArticleCycle(core)).load() is None:
-                raise AgentError("EDITORIAL_MIGRATION_REQUIRED", 409)
-            if args.api_only:
-                uvicorn.run(editorial_app(core, store), host=args.host, port=args.port,
-                            access_log=False, log_level="warning")
-                return
-            with store.worker_lock() as acquired:
+            worker_lock = nullcontext(True) if args.api_only else store.worker_lock()
+            with worker_lock as acquired:
                 if not acquired:
                     raise AgentError("EDITORIAL_WORKER_ALREADY_RUNNING", 409)
+                ledger = DatabaseArticleLedger(HourlyArticleCycle(core)).load()
+                if ledger is None:
+                    raise AgentError("EDITORIAL_MIGRATION_REQUIRED", 409)
                 app = editorial_app(core, store)
+                if args.api_only:
+                    uvicorn.run(app, host=args.host, port=args.port, access_log=False, log_level="warning")
+                    return
                 app.state.worker_mode = "autonomous"
                 stop = threading.Event()
                 # Разные экземпляры журнала: долгий prepare не владеет снимком отправителя.
                 controller = ReserveServerCycle(core, state=store)
                 preparer = ReserveServerCycle(core, state=PreparationState(store))
-                schedule_recovery = ScheduleRecovery(core)
+                postiz = getattr(core, "postiz", None)
+                # Завершение уже записанной операции доступно после отключения новой постановки.
+                recovery_enabled = (getattr(postiz, "schedule_journal_enabled", False)
+                                    or any(record.get("schedule_journal") for record in ledger.get("records", [])))
+                schedule_recovery = ScheduleRecovery(core) if recovery_enabled else None
 
                 def worker():
                     # Только этот поток выполняет внешние изменения Postiz/MAX.
                     while not stop.is_set():
-                        stage = "schedule_recovery"
+                        stage = "dispatch_tick"
                         try:
-                            schedule_recovery.run_once()
-                            stage = "dispatch_tick"
+                            if schedule_recovery is not None:
+                                stage = "schedule_recovery"
+                                schedule_recovery.run_once()
+                                stage = "dispatch_tick"
                             core.dispatch_tick()
                             # Отдельные согласования новых адресатов не наследуют
                             # MAX hourly policy; отправляет тот же владелец worker.
