@@ -27,6 +27,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
@@ -129,7 +130,7 @@ class MainActivity : ComponentActivity() {
 
     @Suppress("DEPRECATION")
     private fun deviceConfirmation(keyguard: KeyguardManager): Intent? =
-        keyguard.createConfirmDeviceCredentialIntent("Сброс PIN MAX Postiz", "Подтвердите блокировку телефона.")
+        keyguard.createConfirmDeviceCredentialIntent("Сброс ПИН-кода панели", "Подтвердите блокировку телефона.")
 
     @Composable
     private fun ConnectionScreen(state: PanelState, openBrowser: (Intent) -> Unit) {
@@ -183,7 +184,7 @@ class MainActivity : ComponentActivity() {
         }
 
         PageColumn(Modifier.systemBarsPadding().padding(top = 32.dp)) {
-            Text("MAX Postiz", style = MaterialTheme.typography.headlineLarge)
+            Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineLarge)
             Text("Подключение к шлюзу", style = MaterialTheme.typography.titleLarge)
             if (!BuildConfig.PRIVATE_LAN && state.profiles.isNotEmpty()) {
                 ChoiceMenu("Сохранённые серверы", state.profiles.map { it.origin to it }) { profile ->
@@ -221,11 +222,11 @@ class MainActivity : ComponentActivity() {
                 OutlinedTextField(token, { token = it }, label = { Text("Тестовый токен") },
                     visualTransformation = PasswordVisualTransformation(), singleLine = true,
                     modifier = Modifier.fillMaxWidth().testTag("fixture_token"))
-                Text("Подключение через локальный туннель adb.")
+                Text("Подключение к стенду через локальный туннель.")
             } else {
                 if (!BuildConfig.PRIVATE_LAN || details) {
-                    TextInput(issuer, { issuer = it }, "Издатель OIDC", "oidc_issuer", KeyboardType.Uri, BuildConfig.PRIVATE_LAN)
-                    TextInput(clientId, { clientId = it }, "ID клиента OIDC", "oidc_client", readOnly = BuildConfig.PRIVATE_LAN)
+                    TextInput(issuer, { issuer = it }, "Адрес сервера входа", "oidc_issuer", KeyboardType.Uri, BuildConfig.PRIVATE_LAN)
+                    TextInput(clientId, { clientId = it }, "Идентификатор приложения", "oidc_client", readOnly = BuildConfig.PRIVATE_LAN)
                 }
                 Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("remember_login").toggleable(
                     value = rememberLogin, enabled = !state.busy, role = Role.Checkbox,
@@ -245,7 +246,7 @@ class MainActivity : ComponentActivity() {
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), singleLine = true,
                         modifier = Modifier.fillMaxWidth().testTag("remember_password"))
                     if (passwordSaved) Text("Пароль сохранён на телефоне.")
-                    Notice("Если откроется Keycloak, вставьте скопированный пароль в форму входа.")
+                    Notice("Если откроется страница входа, вставьте в неё скопированный пароль.")
                 }
                 if (Build.VERSION.SDK_INT >= 37 && !BuildConfig.PRIVATE_LAN) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,

@@ -34,12 +34,12 @@ internal data class ConnectionProfile(val origin: String, val issuer: String, va
             require(address.rawPath.isNullOrEmpty() || address.rawPath == "/") { "Введите адрес шлюза без пути." }
             if (fixture) {
                 require(BuildConfig.DEBUG && address.scheme == "http" && address.host == "127.0.0.1" && address.port > 0) {
-                    "Стенд подключается к 127.0.0.1 через adb reverse."
+                    "Стенд подключается через локальный туннель к 127.0.0.1."
                 }
                 return ConnectionProfile(address.toString().trimEnd('/'), "", "")
             }
             val identity = parseHttpsOrFixture(issuer.trim(), false)
-            require(clientId.trim().isNotEmpty()) { "Укажите ID клиента OIDC." }
+            require(clientId.trim().isNotEmpty()) { "Укажите идентификатор приложения." }
             return ConnectionProfile(address.toString().trimEnd('/'), identity.toString(), clientId.trim())
         }
 
@@ -49,7 +49,7 @@ internal data class ConnectionProfile(val origin: String, val issuer: String, va
                 "Проверьте адрес сервера."
             }
             require(uri.scheme == "https" || fixture && BuildConfig.DEBUG && uri.scheme == "http") {
-                "Для сервера нужен HTTPS."
+                "Укажите защищённый адрес, начинающийся с https://."
             }
             require(uri.port == -1 || uri.port in 1..65535) { "Проверьте порт сервера." }
             return uri
@@ -117,11 +117,11 @@ internal data class QueueItem(
     }
 }
 
-internal data class Target(val id: String, val label: String, val platform: String?, val paused: Boolean,
+internal data class Target(val id: String, val platform: String?, val paused: Boolean,
                            val enabled: Boolean, val actions: Set<String>, val blockers: Set<String>) {
     companion object {
         fun parse(value: JSONObject) = Target(
-            value.getString("id"), value.string("label") ?: value.getString("id"), value.string("platform"),
+            value.getString("id"), value.string("platform"),
             value.optBoolean("paused", true), value.optBoolean("enabled", false), value.strings("available_actions"),
             value.strings("blocked_reasons"),
         )
@@ -203,7 +203,7 @@ internal class MobileApi(private val profile: ConnectionProfile, private val tok
     ))
 
     private fun receipt(id: String, value: JSONObject): Receipt {
-        if (value.getString("operation_id") != id) throw IOException("Шлюз вернул другой ID операции.")
+        if (value.getString("operation_id") != id) throw IOException("Шлюз вернул другой идентификатор операции.")
         return Receipt(id, value.getString("state"), value.string("code"), value.optJSONObject("result"))
     }
 
