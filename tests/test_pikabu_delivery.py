@@ -5,11 +5,15 @@ import html
 import io
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import count
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 
+from max_postiz_agent import pikabu_browser_worker
 from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.pikabu_browser import PikabuBrowser
 from max_postiz_agent.pikabu_browser_worker import (
@@ -165,7 +169,13 @@ def test_public_parser_never_ignores_extra_image_or_text(post, extra, code):
 
 
 @pytest.fixture
-def browser_fixture(tmp_path, post):
+def browser_fixture(tmp_path, post, request, monkeypatch):
+    if getattr(request, "param", None) != "real_clock":
+        # Semantic browser checks exercise the same guard with a deterministic
+        # authorization clock. The expiry test explicitly uses real time.
+        clock = count(0.0, 0.01)
+        monkeypatch.setattr(pikabu_browser_worker, "time",
+                            SimpleNamespace(time=time.time, monotonic=clock.__next__))
     state = {"posts": 0, "uploads": 0, "readbacks": 0, "wrong_body": False, "bad_image": False,
              "wrong_account": False, "hang_after_click": False, "requests": [],
              "selected_community": False, "community_value": False,
@@ -1052,8 +1062,8 @@ def test_revocation_during_slow_final_dom_guard_is_authorized_again_before_publi
     assert state["posts"] == state["uploads"] == 0
 
 
+@pytest.mark.parametrize("browser_fixture", ["real_clock"], indirect=True)
 def test_slow_atomic_final_capture_expires_before_native_publish(tmp_path, post, browser_fixture, monkeypatch):
-    import time
     import max_postiz_agent.pikabu_browser_worker as worker
     page, origin, options, state = browser_fixture
     post["media"] = []

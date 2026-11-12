@@ -256,12 +256,14 @@ def test_postgres_legacy_approval_serializes_with_first_retirement_claim(
         assert session.get(Audit, recovery._id(value.variant_id, "claim")) is None
     assert len(value.reads) == 2
 
-@pytest.mark.parametrize("timed_out_schedule", [False, True])
-def test_mobile_owner_retires_only_proven_unsent_draft(retirement_pg, timed_out_schedule, monkeypatch):
+@pytest.mark.parametrize("schedule_case", ["preapproval", "historic_504", "current_504"])
+def test_mobile_owner_retires_only_proven_unsent_draft(retirement_pg, schedule_case, monkeypatch):
     value = retirement_pg
-    if timed_out_schedule:
+    if schedule_case != "preapproval":
         checks.schedule_timeout(value)
         monkeypatch.setattr(mobile_domain, "now", lambda: value.stamp[0])
+    if schedule_case == "current_504":
+        checks.bind_current_draft(value)
     actor = "postiz:mobile:" + "a" * 32
 
     class Owner:
