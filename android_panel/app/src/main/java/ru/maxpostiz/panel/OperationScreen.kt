@@ -21,7 +21,7 @@ internal fun OperationStatus(state: PanelState, model: PanelViewModel, id: Strin
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("Команда", style = MaterialTheme.typography.titleMedium)
             Text(status(receipt?.state) ?: "Ожидается ответ шлюза")
-            Field("ID", id)
+            Field("Идентификатор", id)
             Field("Результат", status(result?.string("outcome") ?: result?.string("state")))
             Field("Доказательство", status(result?.string("evidence_kind")))
             receipt?.code?.let { Notice(blocker(it), true) }
@@ -29,7 +29,7 @@ internal fun OperationStatus(state: PanelState, model: PanelViewModel, id: Strin
                 OutlinedButton(onClick = model::checkStatus, enabled = !state.busy) { Text("Проверить команду") }
                 if (state.canResubmit && !state.reauth && state.pending?.isPlanCurrent() == true) {
                     OutlinedButton(onClick = model::submitSameCommand, enabled = !state.busy) {
-                        Text("Отправить с тем же ID")
+                        Text("Повторить тот же запрос")
                     }
                 }
             } else {
@@ -44,13 +44,20 @@ internal fun PlanDialog(state: PanelState, model: PanelViewModel, plan: Operatio
     var reason by rememberSaveable(plan.id) {
         mutableStateOf(if (plan.action == "reconcile_dispatch") "Сверка неизвестного исхода" else "")
     }
+    val objectName = when (plan.action) {
+        "pause_project", "resume_project" -> "Весь проект"
+        "pause_target", "resume_target" -> targetName(plan.objectId,
+            state.targets.find { it.id == plan.objectId }?.platform)
+        else -> plan.objectId
+    }
     AlertDialog(
         onDismissRequest = model::cancelPlan,
         title = { Text(actionName(plan.action) ?: "Подтвердить действие") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Field("Сервер", state.capabilities?.environment)
-                Field("Объект", plan.objectId)
+                Field("Сервер", state.capabilities?.let { environmentName(it.environment, state.profile?.testLoopback == true) })
+                Field("Адрес сервера", state.profile?.origin)
+                Field("Объект", objectName)
                 Field("Действие", actionName(plan.effect) ?: status(plan.effect))
                 Field("План действует до", stamp(plan.expiresAt, state.zone))
                 if (plan.action == "retire_preapproval_no_send") {

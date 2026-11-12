@@ -314,7 +314,7 @@ internal class PanelViewModel(application: Application) : AndroidViewModel(appli
 
     private fun statusMissing(canResubmit: Boolean): Boolean {
         mutable.update {
-            it.copy(canResubmit = canResubmit, error = "Шлюз пока не подтвердил команду. Проверьте тот же ID.")
+            it.copy(canResubmit = canResubmit, error = "Шлюз пока не подтвердил команду. Проверьте её квитанцию.")
         }
         return false
     }
@@ -415,7 +415,7 @@ internal class PanelViewModel(application: Application) : AndroidViewModel(appli
                 val message = when (error) {
                     is ApiFailure -> apiError(error)
                     is SessionExpired -> "Срок входа истёк. Войдите снова."
-                    is javax.net.ssl.SSLException -> "Проверьте сертификат и HTTPS-адрес шлюза."
+                    is javax.net.ssl.SSLException -> "Проверьте сертификат и защищённый адрес шлюза."
                     is IllegalArgumentException -> "Проверьте параметры подключения."
                     else -> "Нет свежего ответа. Проверьте доступ к шлюзу или повторите чтение."
                 }
@@ -439,9 +439,6 @@ internal class PanelViewModel(application: Application) : AndroidViewModel(appli
 
     private fun apiError(error: ApiFailure): String {
         val message = when {
-            error.code in setOf("PREAPPROVAL_POSTIZ_TIMEOUT_UNPROVEN", "PREAPPROVAL_POSTIZ_JOURNAL_INVALID",
-                "PREAPPROVAL_RETIREMENT_NOT_SAFE") -> blocker(error.code)
-            error.code == "MOBILE_REAUTH_REQUIRED" -> "Для команды нужен свежий вход владельца."
             error.status == 401 -> "Сессия не принята. Войдите снова."
             error.status == 403 -> "У этой сессии нет права на действие."
             error.status == 409 -> "Состояние или план изменились. Обновите карточку."
@@ -449,7 +446,8 @@ internal class PanelViewModel(application: Application) : AndroidViewModel(appli
             error.status >= 500 -> "Шлюз или его источник данных недоступен."
             else -> "Шлюз отклонил запрос."
         }
-        return listOfNotNull(message, error.code, error.correlationId).joinToString(" · ")
+        return listOfNotNull(blocker(error.code, message), error.correlationId?.let { "Номер запроса $it" })
+            .joinToString(" · ")
     }
 
     private companion object {
