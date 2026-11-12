@@ -17,6 +17,7 @@ from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.db import Audit, Base, Draft, Intent, Job
 from max_postiz_agent.hub_models import (
     BridgePost,
+    DispatchAttempt,
     RemoteDraft,
     Target,
     TargetApproval,
@@ -206,9 +207,29 @@ def schedule_timeout(value, *, status=504, late=True):
     })
 
 
-def test_closes_expired_504_slot_and_releases_only_its_late_lease(retirement_case):
+def bind_current_draft(value, *, corrupt_plaintext=False):
+    with value.core.db.session.begin() as session:
+        variant = session.get(Variant, value.variant_id)
+        draft = session.get(RemoteDraft, variant.id)
+        draft.synced_revision = variant.revision
+        assert draft.remote_hash == fingerprint({"body": variant.body})
+        if corrupt_plaintext:
+            draft.remote_hash = fingerprint({"body": "changed"})
+        ledger = session.get(EditorialLedger, "hourly")
+        payload = copy.deepcopy(ledger.payload)
+        record = next(r for r in payload["records"] if r["id"] == value.record_id)
+        target = session.get(Target, variant.target_id)
+        record["prepared_hash"] = fingerprint(value.core.snapshot(variant, target))
+        assert record["prepared_hash"] != record["reserve_prepared_hash"]
+        ledger.payload = payload
+
+
+@pytest.mark.parametrize("current_draft_revision", [False, True])
+def test_closes_expired_504_slot_and_releases_only_its_late_lease(retirement_case, current_draft_revision):
     value = retirement_case
     schedule_timeout(value)
+    if current_draft_revision:
+        bind_current_draft(value)
     before = snapshot(value.core)
     proposal = plan(value)
     assert snapshot(value.core) == before
@@ -234,6 +255,18 @@ def test_timeout_without_matching_504_and_late_lease_stays_blocked(retirement_ca
     schedule_timeout(value, **kwargs)
     before = snapshot(value.core)
     with pytest.raises(AgentError):
+        plan(value)
+    assert snapshot(value.core) == before and not value.reads
+
+
+@pytest.mark.parametrize("proven_timeout", [False, True])
+def test_current_draft_requires_proven_timeout_and_exact_plaintext(retirement_case, proven_timeout):
+    value = retirement_case
+    if proven_timeout:
+        schedule_timeout(value)
+    bind_current_draft(value, corrupt_plaintext=proven_timeout)
+    before = snapshot(value.core)
+    with pytest.raises(AgentError, match="PREAPPROVAL_RETIREMENT_NOT_SAFE"):
         plan(value)
     assert snapshot(value.core) == before and not value.reads
 
@@ -708,6 +741,55 @@ def test_retained_old_abandoned_photo_does_not_resolve_unknown_send(retirement_c
     dispatch.state = "unknown"
     with pytest.raises(AgentError):
         recovery._retained_abandoned_image(session, dispatch, ".jpg", raw)
+
+
+@pytest.mark.parametrize("corrupted", [None, "missing_audit", "attempt", "slot", "record", "journal"])
+def test_archived_unknown_browser_journal_requires_original_owner_disposition(retirement_case, corrupted):
+    request, journal, dispatch = historical_journal(retirement_case, False)
+    dispatch.state, dispatch.error = "cancelled", "OWNER_ABANDONED_UNVERIFIED_DELIVERY"
+    dispatch.owner, dispatch.lease_until, dispatch.verified = None, 0, False
+    dispatch.external_id, dispatch.permalink, dispatch.due_at = None, None, 1.0
+    dispatch.snapshot_hash = fingerprint({"content": dispatch.snapshot, "due_at": dispatch.due_at})
+    journal.pop("delivery")
+    journal.update(state="unknown", phase="receipt_reload")
+    attempt = SimpleNamespace(id=str(uuid4()), result="unknown")
+    preserved = {
+        "contract": "owner-retire-unverified-max-delivery-2331-v1",
+        "original_unknown_attempt_id": attempt.id,
+        "original_external_result": "UNKNOWN",
+        "historical_no_send_proved": False,
+        "verified_delivery": False,
+        "permanent_no_retry": True,
+        "source_remains_ever_used": True,
+        "archive_sha256": "1" * 64,
+        "external_evidence_sha256": "2" * 64,
+    }
+    slot = SimpleNamespace(id=str(uuid4()), record_id=str(uuid4()), dispatch_id=request,
+                           state="missed", active_target=None, delivered_at=None, error=dispatch.error)
+    audit = SimpleNamespace(details={**preserved, "dispatch_id": request, "slot_id": slot.id,
+                                     "record_id": slot.record_id, "original_attempt_preserved": True})
+    record = {"id": slot.record_id, "state": "cancelled", "dispatch_id": request, "publication_slot_id": slot.id,
+              "original_external_result": "UNKNOWN", "permanent_no_retry": True,
+              "source_remains_ever_used": True, "owner_abandonment": dict(preserved)}
+    if corrupted == "attempt":
+        attempt.id = str(uuid4())
+    if corrupted == "slot":
+        slot.active_target = "max_test"
+    if corrupted == "record":
+        record["owner_abandonment"]["verified_delivery"] = True
+    if corrupted == "journal":
+        journal["snapshot_hash"] = "0" * 64
+    session = SimpleNamespace(
+        scalars=lambda query: ([attempt] if query.column_descriptions[0]["entity"] is DispatchAttempt
+                               else [] if corrupted == "missing_audit" else [audit]),
+        get=lambda model, _key: slot if model is PublicationSlot else SimpleNamespace(payload={"records": [record]}),
+    )
+    if corrupted:
+        with pytest.raises(AgentError):
+            recovery._validate_journal(retirement_case.core, session, request, journal, dispatch)
+    else:
+        recovery._validate_journal(retirement_case.core, session, request, journal, dispatch)
+        assert journal["state"] == "unknown" and attempt.result == "unknown" and dispatch.verified is False
 
 
 @pytest.mark.parametrize(

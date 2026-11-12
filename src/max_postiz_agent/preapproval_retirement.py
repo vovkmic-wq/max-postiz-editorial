@@ -227,36 +227,100 @@ def _files(core, record, variant, session):
     return {"evidence": evidence, "journals": receipts}
 
 
-def _retained_abandoned_image(session, dispatch, suffix, raw):
-    """Preserve an already abandoned historical attachment; never resolve its send."""
-    attempts = (
-        list(
-            session.scalars(
-                select(DispatchAttempt).where(DispatchAttempt.dispatch_id == dispatch.id)
-            )
-        )
-        if dispatch is not None
-        else []
-    )
-    snapshot = dispatch.snapshot if dispatch is not None else {}
-    media = snapshot.get("media", [])
+def _abandoned_attempt(session, dispatch):
+    require(dispatch is not None, "PREAPPROVAL_JOURNAL_UNCORRELATED")
+    snapshot = dispatch.snapshot
     require(
-        dispatch is not None
-        and dispatch.state == "cancelled"
+        dispatch.state == "cancelled"
         and dispatch.error == "OWNER_ABANDONED_UNVERIFIED_DELIVERY"
         and dispatch.owner is None
         and dispatch.lease_until == 0
         and dispatch.verified is False
         and dispatch.snapshot_hash == fingerprint({"content": snapshot, "due_at": dispatch.due_at})
         and snapshot.get("platform") == "max"
-        and snapshot.get("route") == "max_browser"
-        and len(attempts) == 1
-        and attempts[0].result == "unknown"
-        and suffix == ".jpg"
+        and snapshot.get("route") == "max_browser",
+        "PREAPPROVAL_JOURNAL_UNCORRELATED",
+    )
+    attempts = list(
+        session.scalars(select(DispatchAttempt).where(DispatchAttempt.dispatch_id == dispatch.id))
+    )
+    require(len(attempts) == 1 and attempts[0].result == "unknown", "PREAPPROVAL_JOURNAL_UNCORRELATED")
+    return attempts[0]
+
+
+def _retained_abandoned_image(session, dispatch, suffix, raw):
+    """Preserve an already abandoned historical attachment; never resolve its send."""
+    _abandoned_attempt(session, dispatch)
+    media = dispatch.snapshot.get("media", [])
+    require(
+        suffix == ".jpg"
         and len(media) == 1
         and media[0].get("mime") == "image/jpeg"
         and hashlib.sha256(raw).hexdigest() == media[0].get("sha256"),
         "PREAPPROVAL_JOURNAL_UNCORRELATED",
+    )
+
+
+def _validate_archived_unknown(session, dispatch, value):
+    """Verify the archived owner decision while retaining its unknown delivery."""
+    attempt = _abandoned_attempt(session, dispatch)
+    audits = list(
+        session.scalars(select(Audit).where(
+            Audit.entity == dispatch.id,
+            Audit.actor == "owner_operational_exception",
+            Audit.action == "owner_abandoned_unverified_delivery",
+        ))
+    )
+    code = "PREAPPROVAL_JOURNAL_INVALID"
+    require(len(audits) == 1, code)
+    details = audits[0].details
+    preserved = {
+        "contract": "owner-retire-unverified-max-delivery-2331-v1",
+        "original_unknown_attempt_id": attempt.id,
+        "original_external_result": "UNKNOWN",
+        "historical_no_send_proved": False,
+        "verified_delivery": False,
+        "permanent_no_retry": True,
+        "source_remains_ever_used": True,
+    }
+    require(
+        value.get("delivery") is None
+        and dispatch.external_id in (None, "")
+        and dispatch.permalink in (None, "")
+        and details.get("dispatch_id") == dispatch.id
+        and details.get("original_attempt_preserved") is True
+        and fingerprint({key: details.get(key) for key in preserved}) == fingerprint(preserved)
+        and all(re.fullmatch(r"[a-f0-9]{64}", str(details.get(key, "")))
+                for key in ("archive_sha256", "external_evidence_sha256")),
+        code,
+    )
+    slot = session.get(PublicationSlot, details.get("slot_id"))
+    ledger = session.get(EditorialLedger, LEDGER_ID)
+    records = [record for record in ledger.payload["records"]
+               if record.get("id") == details.get("record_id")] if ledger else []
+    require(
+        slot is not None
+        and slot.record_id == details.get("record_id")
+        and slot.dispatch_id == dispatch.id
+        and slot.state == "missed"
+        and slot.active_target is None
+        and slot.delivered_at is None
+        and slot.error == dispatch.error
+        and len(records) == 1,
+        code,
+    )
+    record = records[0]
+    owner = record.get("owner_abandonment") or {}
+    require(
+        record.get("state") == "cancelled"
+        and record.get("dispatch_id") == dispatch.id
+        and record.get("publication_slot_id") == slot.id
+        and record.get("original_external_result") == "UNKNOWN"
+        and record.get("permanent_no_retry") is True
+        and record.get("source_remains_ever_used") is True
+        and fingerprint({key: owner.get(key) for key in preserved}) == fingerprint(preserved)
+        and all(owner.get(key) == details[key] for key in ("archive_sha256", "external_evidence_sha256")),
+        code,
     )
 
 
@@ -280,23 +344,26 @@ def _validate_journal(core, session, request_id, value, dispatch):
         historical, request_id, snapshot, snapshot["destination"]
     )
     require(
-        dispatch.state == "published"
-        and dispatch.verified is True
-        and value.get("chat_id") == expected["chat_id"]
+        value.get("chat_id") == expected["chat_id"]
         and value.get("text") == expected["text"]
         and value.get("attachment") is bool(expected["attachment"])
         and value.get("attachment_type")
-        == (expected["attachment"]["type"] if expected["attachment"] else None)
-        and value.get("delivery", {}).get("state") == "confirmed"
-        and value.get("delivery", {}).get("external_id") == dispatch.external_id
-        and session.scalar(
-            select(DispatchAttempt.id).where(
-                DispatchAttempt.dispatch_id == request_id, DispatchAttempt.result == "published"
-            )
-        )
-        is not None,
+        == (expected["attachment"]["type"] if expected["attachment"] else None),
         "PREAPPROVAL_JOURNAL_INVALID",
     )
+    archived = value.get("contract") == "browser-send-journal-v1" and value.get("state") == "unknown"
+    if not archived:
+        require(
+            value.get("state") == "confirmed"
+            and dispatch.state == "published"
+            and dispatch.verified is True
+            and value.get("delivery", {}).get("state") == "confirmed"
+            and value.get("delivery", {}).get("external_id") == dispatch.external_id
+            and session.scalar(select(DispatchAttempt.id).where(
+                DispatchAttempt.dispatch_id == request_id, DispatchAttempt.result == "published"
+            )) is not None,
+            "PREAPPROVAL_JOURNAL_INVALID",
+        )
     # The two historical native formats predate dispatch_snapshot_hash. Their
     # exact payload is still reconstructed from the immutable dispatch snapshot.
     if "contract" not in value:
@@ -369,7 +436,6 @@ def _validate_journal(core, session, request_id, value, dispatch):
     require(
         not set(value) - allowed
         and value.get("contract") == "browser-send-journal-v1"
-        and value.get("state") == "confirmed"
         and value.get("send_started") is True
         and value.get("config_hash") == historical.hash
         and value.get("snapshot_hash") == fingerprint(snapshot)
@@ -380,18 +446,11 @@ def _validate_journal(core, session, request_id, value, dispatch):
         and payload == {**expected, **presentation, "dispatch_snapshot_hash": fingerprint(snapshot)}
         and value.get("presentation") == presentation
         and all(payload.get(k) == v for k, v in expected.items())
-        and payload.get("dispatch_snapshot_hash") == fingerprint(snapshot)
-        and dispatch.state == "published"
-        and dispatch.verified is True
-        and value.get("delivery", {}).get("external_id") == dispatch.external_id
-        and session.scalar(
-            select(DispatchAttempt.id).where(
-                DispatchAttempt.dispatch_id == request_id, DispatchAttempt.result == "published"
-            )
-        )
-        is not None,
+        and payload.get("dispatch_snapshot_hash") == fingerprint(snapshot),
         "PREAPPROVAL_JOURNAL_INVALID",
     )
+    if archived:
+        _validate_archived_unknown(session, dispatch, value)
 
 
 def _schedule_timeout_proof(core, record, slot, bridge):
@@ -561,12 +620,18 @@ def _capture(core, session, record_id, *, locked=False):
         and all(t.paused is True for t in session.scalars(select(Target)))
     )
     timeout_proof = _schedule_timeout_proof(core, record, slot, bridge) if is_schedule_timeout else None
+    current_draft = (
+        timeout_proof is not None
+        and remote is not None
+        and remote.synced_revision == variant.revision
+        and remote.remote_hash == fingerprint({"body": variant.body})
+    )
     require(
         remote is not None
         and remote.state == "draft"
         and remote.external_id == bridge.post_id
         and remote.correlation
-        and remote.synced_revision == variant.revision - 1
+        and (remote.synced_revision == variant.revision - 1 or current_draft)
         and bridge.remote_state == "DRAFT"
         and bridge.active is True
         and bridge.error is None
@@ -676,8 +741,9 @@ def _capture(core, session, record_id, *, locked=False):
     current_snapshot = core.snapshot(variant, target)
     current_version = next(v.payload for v in versions if v.revision == variant.revision)
     require(
-        fingerprint(prepared) == record.get("prepared_hash") == record.get("reserve_prepared_hash")
-        and prepared.get("revision") == remote.synced_revision
+        fingerprint(prepared) == record.get("reserve_prepared_hash")
+        and record.get("prepared_hash") == fingerprint(current_snapshot if current_draft else prepared)
+        and prepared.get("revision") == versions[0].revision
         and current_version == current_snapshot,
         "PREAPPROVAL_PREPARED_HISTORY_CHANGED",
     )
