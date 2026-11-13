@@ -19,7 +19,10 @@ RUNNER = runpy.run_path(str(Path(__file__).resolve().parents[1] / "deployment/mo
 
 
 @pytest.fixture
-def copy_monitor(tmp_path):
+def copy_monitor(tmp_path, monkeypatch):
+    # This fixture uses SQLite; an unrelated PostgreSQL test URL must not be
+    # mistaken for a connection configured for the isolated monitor runtime.
+    monkeypatch.delenv("TEST_DATABASE_URL", raising=False)
     root = tmp_path / "monitor"
     root.mkdir()
     mark_isolated(root, tmp_path / "source")
