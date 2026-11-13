@@ -28,9 +28,72 @@ LOCKS = (
     "requirements-browser.lock",
     "requirements-deployment.lock",
 )
-WHEEL_CASES = ("nasa_links_v1", "science_mailto_isolation")
+WHEEL_CASES = (
+    "nasa_links_v1",
+    "science_mailto_isolation",
+    "readback_runtime_api",
+    "readback_wheel_proof",
+)
+WHEEL_PROOF_PROBE = r"""
+import contextlib, hashlib, io, json, os, runpy, sys, sysconfig
+from pathlib import Path
+site, archive, verifier, repository, build_source = (Path(p).resolve() for p in sys.argv[1:])
+forbidden_roots = (repository / 'src', repository / 'scripts', build_source)
+def audit(event, args):
+    if (event in {'subprocess.Popen', 'os.system', 'os.fork', 'os.forkpty',
+                  'socket.getaddrinfo', 'socket.gethostbyname', 'socket.gethostbyaddr', 'socket.getnameinfo'}
+            or event.startswith(('os.exec', 'os.spawn', 'os.posix_spawn', 'os.startfile',
+                                 'socket.connect', 'socket.bind', 'socket.send'))):
+        raise AssertionError('Wheel proof cannot access network or start processes')
+    if event == 'open' and isinstance(args[0], (str, bytes)):
+        path = Path(os.fsdecode(args[0])).resolve()
+        if any(path.is_relative_to(p) for p in forbidden_roots):
+            raise AssertionError('Wheel proof cannot read repository/build source')
+sys.addaudithook(audit)
+# The editable development distribution is deliberately excluded: this process
+# checks the fresh wheel alone, and does not import application dependencies.
+development_sites = {Path(sysconfig.get_path(name)).resolve() for name in ('purelib', 'platlib')}
+sys.path[:] = [p for p in sys.path if Path(p).resolve() not in development_sites]
+sys.path.insert(0, str(site))
+verify = runpy.run_path(str(verifier))['verify_installed_wheel']
+digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+proof = verify(archive, digest)
+assert proof['sha256'] == digest and proof['runtime_files_verified'] > 0
+try:
+    verify(archive, '0' * 64 if digest != '0' * 64 else '1' * 64)
+except ValueError as exc:
+    assert str(exc) == 'WHEEL_SHA256_MISMATCH'
+else:
+    raise AssertionError('Incorrect wheel digest accepted')
+target = site / 'max_postiz_agent' / '__init__.py'
+original = target.read_bytes()
+try:
+    target.write_bytes(original + b'\n# tampered for isolated check\n')
+    try:
+        verify(archive, digest)
+    except ValueError as exc:
+        assert str(exc) == 'INSTALLED_PACKAGE_BYTES_MISMATCH'
+    else:
+        raise AssertionError('Modified installed package accepted')
+finally:
+    target.write_bytes(original)
+assert 'max_postiz_agent' not in sys.modules
+sys.path.insert(0, str(verifier.parent))
+sys.argv = [str(verifier.with_name('readback_max.py')), '--help']
+help_output = io.StringIO()
+try:
+    with contextlib.redirect_stdout(help_output):
+        runpy.run_path(sys.argv[0], run_name='__main__')
+except SystemExit as exc:
+    assert exc.code == 0
+else:
+    raise AssertionError('Readback help did not exit')
+assert '--wheel-sha256' in help_output.getvalue()
+assert 'max_postiz_agent' not in sys.modules
+print(json.dumps({'contract': 'installed-readback-wheel-proof-v1', 'passed': True}))
+"""
 WHEEL_PROBE = r"""
-import json, os, socket, subprocess, sys
+import json, os, runpy, socket, subprocess, sys
 from pathlib import Path
 wheel = Path(sys.argv[1]).resolve()
 repository, build_source = (Path(p).resolve() for p in sys.argv[3:5])
@@ -95,12 +158,17 @@ except AgentError as exc:
     assert exc.code == 'ARTICLE_SOURCE_LINK_INVALID'
 else:
     raise AssertionError('Foreign mailto accepted')
+readback = Path(sys.argv[5]).resolve()
+assert readback.is_relative_to(wheel)
+sys.path.insert(0, str(readback.parent))
+readback_module = runpy.run_path(str(readback))
+readback_module['load_verified_application'](sys.argv[2])
 for name, module in tuple(sys.modules.items()):
     if name == 'max_postiz_agent' or name.startswith('max_postiz_agent.'):
         owned(module)
 assert not attempted, 'Forbidden capability was attempted and swallowed'
 print(json.dumps({'contract': 'installed-wheel-extractor-probe-v1',
-                  'passed': ['nasa_links_v1', 'science_mailto_isolation'],
+                  'passed': ['nasa_links_v1', 'science_mailto_isolation', 'readback_runtime_api'],
                   'server_nasa_origin': server_nasa.__file__,
                   'extractor_origin': legacy.__file__, 'network_or_process_calls': 0}))
 """
@@ -287,6 +355,7 @@ def wheel_sources(root: Path) -> dict[str, bytes]:
         timeout=30,
     )
     names = set(completed.stdout.decode("utf-8").split("\0")) - {""}
+    names.update(("scripts/readback_wheel_proof.py", "scripts/readback_max.py"))
     package_paths = list((root / "src/max_postiz_agent").rglob("*"))
     if any(path.is_symlink() for path in package_paths):
         raise ValueError("Symlink in installed-wheel package source")
@@ -358,11 +427,18 @@ def installed_wheel(root: Path, directory: Path, xml: Path) -> int:
         if len(wheels) != 1:
             raise ValueError("Expected exactly one built wheel")
         wheel = wheels[0]
+        readback_members = {}
         with zipfile.ZipFile(wheel) as archive:
             infos = archive.infolist()
             names = [info.filename for info in infos]
             if len(names) != len(set(names)) or sum(i.file_size for i in infos) > 64 * 1024 * 1024:
                 raise ValueError("Invalid installed-wheel archive bound or duplicate member")
+            for script in ("readback_max.py", "readback_wheel_proof.py"):
+                suffix = ".data/data/share/max-postiz/" + script
+                matches = [name for name in names if name.endswith(suffix)]
+                if len(matches) != 1 or archive.read(matches[0]) != before["scripts/" + script]:
+                    raise ValueError("Missing or changed readback script in wheel")
+                readback_members[script] = matches[0]
             for info in infos:
                 name = PurePosixPath(info.filename)
                 if (
@@ -381,6 +457,36 @@ def installed_wheel(root: Path, directory: Path, xml: Path) -> int:
                 else:
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_bytes(archive.read(info))
+        verifier = extracted / readback_members["readback_wheel_proof.py"]
+        proof_process = subprocess.run(
+            [
+                sys.executable,
+                "-X",
+                "utf8",
+                "-I",
+                "-B",
+                "-c",
+                WHEEL_PROOF_PROBE,
+                str(extracted),
+                str(wheel.resolve()),
+                str(verifier.resolve()),
+                str(root),
+                str(source),
+            ],
+            cwd=directory,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=60,
+        )
+        (directory / "proof.stdout.log").write_bytes(proof_process.stdout)
+        (directory / "proof.stderr.log").write_bytes(proof_process.stderr)
+        if proof_process.returncode:
+            print(proof_process.stderr.decode("utf-8", errors="backslashreplace"), flush=True)
+            raise ValueError("Installed-wheel readback proof failed")
+        proof = json.loads(proof_process.stdout)
+        if proof != {"contract": "installed-readback-wheel-proof-v1", "passed": True}:
+            raise ValueError("Invalid installed-wheel readback proof result")
         completed = subprocess.run(
             [
                 sys.executable,
@@ -394,6 +500,7 @@ def installed_wheel(root: Path, directory: Path, xml: Path) -> int:
                 configuration(root)["project"]["version"],
                 str(root),
                 str(source),
+                str(extracted / readback_members["readback_max.py"]),
             ],
             cwd=directory,
             stdout=subprocess.PIPE,
@@ -414,7 +521,7 @@ def installed_wheel(root: Path, directory: Path, xml: Path) -> int:
         probe = json.loads(completed.stdout)
         if (
             probe.get("contract") != "installed-wheel-extractor-probe-v1"
-            or probe.get("passed") != list(WHEEL_CASES)
+            or probe.get("passed") != list(WHEEL_CASES[:-1])
             or probe.get("network_or_process_calls") != 0
         ):
             raise ValueError("Invalid installed-wheel probe result")
@@ -423,6 +530,7 @@ def installed_wheel(root: Path, directory: Path, xml: Path) -> int:
         outcome.update(
             status="passed",
             probe=probe,
+            readback_proof=proof,
             wheel_sha256=hashlib.sha256(wheel.read_bytes()).hexdigest(),
             source_files=len(before),
             source_hash=hashlib.sha256(
@@ -498,7 +606,9 @@ class Checks:
         return result
 
 
-def run(root: Path, *, postgres: bool) -> int:
+def run(root: Path, *, postgres: bool, test_timeout: int = 7200) -> int:
+    if type(test_timeout) is not int or not 7200 <= test_timeout <= 21600:
+        raise ValueError("Full pytest timeout must be between 7200 and 21600 seconds")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     directory = root / "data/check-runs" / (stamp + "-" + uuid.uuid4().hex[:8])
     directory.mkdir(parents=True)
@@ -592,7 +702,7 @@ def run(root: Path, *, postgres: bool) -> int:
                 "-o",
                 "faulthandler_timeout=120",
             ],
-            timeout=7200,
+            timeout=test_timeout,
         )
         if xml.is_file():
             try:
@@ -658,9 +768,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Require dedicated TEST_DATABASE_URL and PostgreSQL tests",
     )
+    parser.add_argument(
+        "--test-timeout",
+        type=int,
+        default=7200,
+        help="Full pytest time limit in seconds (7200–21600, default: 7200)",
+    )
     parser.add_argument("--installed-wheel", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--junitxml", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if not 7200 <= args.test_timeout <= 21600:
+        parser.error("--test-timeout must be between 7200 and 21600 seconds")
     target = interpreter(ROOT)
     if Path(sys.prefix).resolve() != (ROOT / ".venv").resolve():
         if not target.is_file():
@@ -691,7 +809,7 @@ def main(argv: list[str] | None = None) -> int:
         return installed_wheel(ROOT, directory, args.junitxml.resolve())
     if args.junitxml is not None:
         parser.error("--junitxml is internal to the installed-wheel stage")
-    return run(ROOT, postgres=args.postgres)
+    return run(ROOT, postgres=args.postgres, test_timeout=args.test_timeout)
 
 
 if __name__ == "__main__":

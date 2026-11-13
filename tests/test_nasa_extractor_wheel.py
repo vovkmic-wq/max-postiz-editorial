@@ -18,6 +18,9 @@ def installed_wheel(tmp_path_factory):
     source = directory / "build-source"
     source.mkdir()
     shutil.copy2(ROOT / "pyproject.toml", source / "pyproject.toml")
+    (source / "scripts").mkdir()
+    for name in ("readback_max.py", "readback_wheel_proof.py"):
+        shutil.copy2(ROOT / "scripts" / name, source / "scripts" / name)
     shutil.copytree(
         ROOT / "src",
         source / "src",

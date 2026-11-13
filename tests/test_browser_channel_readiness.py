@@ -279,3 +279,25 @@ def test_read_identity_last_check_rejects_changed_or_ambiguous_channel(
     with pytest.raises(AgentError, match="^" + code + "$"):
         browser_runtime.ensure_channel(page, settings, "-123", require_publish=False)
     unchanged(page, requests)
+
+
+def test_independent_readback_opens_and_rechecks_channel_without_composer(channel, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("readback_channel_test", scripts / "readback_max.py")
+    readback = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(readback)
+    monkeypatch.setattr(readback, "ensure_channel", browser_runtime.ensure_channel, raising=False)
+    settings, page, requests = channel
+    route(page, html(editor=False))
+    readback.readback_ensure_channel(page, settings, "-123")
+    page.reload(wait_until="domcontentloaded", timeout=5000)
+    readback.readback_ensure_channel(page, settings, "-123", navigate=False)
+    assert requests == ["https://web.max.ru/-123", "https://web.max.ru/-123"]
+    assert page.evaluate("window.sendCalls") == 0
+    page.evaluate("history.replaceState(null,'','/-456')")
+    with pytest.raises(AgentError, match="BROWSER_WRONG_CHANNEL"):
+        readback.readback_ensure_channel(page, settings, "-123", navigate=False)

@@ -2,6 +2,8 @@
 
 import importlib.util
 import json
+import shutil
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,6 +38,8 @@ def checkout(tmp_path, monkeypatch):
     (tmp_path / "tests/test_sample.py").write_text("def test_sample(): pass\n")
     (tmp_path / "scripts").mkdir()
     (tmp_path / "scripts/check.py").touch()
+    (tmp_path / "scripts/readback_wheel_proof.py").write_text("# test verifier")
+    (tmp_path / "scripts/readback_max.py").write_text("# test readback")
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nversion="1.2.3"\nrequires-python=">=3.12"\n'
         '[tool.max-postiz.check]\nformat-paths=["scripts/check.py"]\n'
@@ -263,12 +267,17 @@ def test_unified_check_exit_code_reflects_real_test_result(checkout, monkeypatch
 
 
 @pytest.mark.parametrize(
-    "suite_seconds, expected",
-    [(3601, 0), (7201, 1)],
-    ids=["long_complete_suite", "suite_exceeds_bounded_budget"],
+    "suite_seconds, budget, explicit, expected",
+    [
+        (3601, 7200, False, 0),
+        (7201, 7200, False, 1),
+        (7201, 14400, True, 0),
+        (14401, 14400, True, 1),
+    ],
+    ids=["default_success", "default_timeout", "extended_success", "extended_timeout"],
 )
 def test_full_suite_budget_preserves_long_success_and_bounded_timeout(
-    checkout, monkeypatch, suite_seconds, expected
+    checkout, monkeypatch, suite_seconds, budget, explicit, expected
 ):
     clock = SimpleNamespace(now=0.0)
     executed = {}
@@ -291,7 +300,8 @@ def test_full_suite_budget_preserves_long_success_and_bounded_timeout(
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(check.subprocess, "run", execute)
-    assert check.run(checkout, postgres=False) == expected
+    options = {"test_timeout": budget} if explicit else {}
+    assert check.run(checkout, postgres=False, **options) == expected
     report = json.loads(
         next((checkout / "data/check-runs").glob("*/report.json")).read_text(encoding="utf-8")
     )
@@ -310,7 +320,7 @@ def test_full_suite_budget_preserves_long_success_and_bounded_timeout(
     stages = {stage["name"]: stage for stage in report["stages"]}
     assert all(stage["timeout_seconds"] == executed[name] for name, stage in stages.items())
     assert (
-        executed["tests"] == 7200
+        executed["tests"] == budget
         and executed["browser"] == 60
         and executed["installed-wheel"] == 300
     )
@@ -320,7 +330,7 @@ def test_full_suite_budget_preserves_long_success_and_bounded_timeout(
         if name not in {"tests", "browser", "installed-wheel"}
     )
     assert all(stage["status"] == "passed" for name, stage in stages.items() if name != "tests")
-    assert stages["tests"]["seconds"] == min(suite_seconds, 7200)
+    assert stages["tests"]["seconds"] == min(suite_seconds, budget)
     if expected == 0:
         assert stages["tests"]["status"] == "passed" and report["tests"]["passed"] == 1
     else:
@@ -432,9 +442,36 @@ def test_launcher_uses_this_checkouts_venv_and_preserves_failure_code(checkout, 
         return SimpleNamespace(returncode=7)
 
     monkeypatch.setattr(check.subprocess, "run", execute)
-    assert check.main(["--postgres"]) == 7
-    assert calls[0][0][0] == str(target) and calls[0][0][-1] == "--postgres"
+    assert check.main(["--postgres", "--test-timeout", "14400"]) == 7
+    assert calls[0][0][0] == str(target)
+    assert calls[0][0][-3:] == ["--postgres", "--test-timeout", "14400"]
     assert calls[0][1]["cwd"] == checkout
+
+
+@pytest.mark.parametrize("value", [None, "7200", "14400", "21600"])
+def test_cli_passes_full_suite_budget_to_run(checkout, monkeypatch, value):
+    monkeypatch.setattr(check, "ROOT", checkout)
+    monkeypatch.setattr(check.sys, "prefix", str(checkout / ".venv"))
+    calls = []
+    monkeypatch.setattr(check, "run", lambda root, **kwargs: calls.append((root, kwargs)) or 0)
+    args = ["--postgres"] + (["--test-timeout", value] if value is not None else [])
+    assert check.main(args) == 0
+    assert calls == [(checkout, {"postgres": True, "test_timeout": int(value or "7200")})]
+
+
+@pytest.mark.parametrize("value", ["7199", "21601", "-1", "0", "abc", "7200.5"])
+def test_cli_rejects_invalid_test_budgets_before_starting_work(monkeypatch, value):
+    monkeypatch.setattr(check, "run", lambda *args, **kwargs: pytest.fail("must not run"))
+    with pytest.raises(SystemExit) as error:
+        check.main(["--test-timeout", value])
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("value", [7199, 21601, True, "14400"])
+def test_run_rejects_invalid_test_budgets_before_creating_report(checkout, value):
+    with pytest.raises(ValueError, match="between 7200 and 21600"):
+        check.run(checkout, postgres=False, test_timeout=value)
+    assert not (checkout / "data/check-runs").exists()
 
 
 def test_browser_failure_blocks_tests_but_still_reports_other_stages(checkout, monkeypatch):
@@ -482,7 +519,7 @@ def test_installed_wheel_failure_blocks_editable_suite(checkout, monkeypatch):
 @pytest.mark.parametrize(
     "damage", [None, "missing", "skipped", "failure", "error", "duplicate", "wrong_name"]
 )
-def test_installed_wheel_report_requires_both_semantic_cases(tmp_path, damage):
+def test_installed_wheel_report_requires_all_semantic_cases(tmp_path, damage):
     names = list(check.WHEEL_CASES)
     if damage == "missing":
         names.pop()
@@ -497,7 +534,7 @@ def test_installed_wheel_report_requires_both_semantic_cases(tmp_path, damage):
     path = tmp_path / "wheel.xml"
     path.write_text("<testsuite>" + "".join(cases) + "</testsuite>")
     if damage is None:
-        assert check.installed_wheel_summary(path)["passed"] == 2
+        assert check.installed_wheel_summary(path)["passed"] == len(check.WHEEL_CASES)
     else:
         with pytest.raises(ValueError, match="installed-wheel cases"):
             check.installed_wheel_summary(path)
@@ -545,6 +582,8 @@ def test_wheel_build_context_preserves_declared_metadata_and_new_module_not_cach
         "pyproject.toml",
         "README.md",
         "LICENSE",
+        "scripts/readback_wheel_proof.py",
+        "scripts/readback_max.py",
         "src/max_postiz_agent/__init__.py",
         "src/max_postiz_agent/nasa_extractor.py",
     }
@@ -559,6 +598,51 @@ def test_wheel_build_context_refuses_traversal_instead_of_copying_private_files(
     )
     with pytest.raises(ValueError, match="Unsafe or missing"):
         check.wheel_sources(checkout)
+
+
+@pytest.mark.parametrize("version", ["0.15.6", "99.17.42"])
+def test_readback_wheel_gate_verifies_multiple_versions_offline(tmp_path, version):
+    site = tmp_path / "site"
+    site.mkdir()
+    wheel = tmp_path / f"max_postiz_agent-{version}-py3-none-any.whl"
+    files = {
+        "max_postiz_agent/__init__.py": f'__version__ = "{version}"\n',
+        "max_postiz_agent/browser_worker.py": "# package member\n",
+        f"max_postiz_agent-{version}.dist-info/METADATA": (
+            f"Metadata-Version: 2.1\nName: max-postiz-agent\nVersion: {version}\n\n"
+        ),
+    }
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+            path = site / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content.encode())
+    root = Path(__file__).resolve().parents[1]
+    verifier = tmp_path / "readback_wheel_proof.py"
+    shutil.copyfile(root / "scripts/readback_wheel_proof.py", verifier)
+    shutil.copyfile(root / "scripts/readback_max.py", tmp_path / "readback_max.py")
+    result = check.subprocess.run(
+        [
+            check.sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            check.WHEEL_PROOF_PROBE,
+            str(site),
+            str(wheel),
+            str(verifier),
+            str(root),
+            str(tmp_path / "build-source"),
+        ],
+        cwd=tmp_path,
+        stdout=check.subprocess.PIPE,
+        stderr=check.subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert json.loads(result.stdout)["passed"] is True
 
 
 @pytest.mark.parametrize(
