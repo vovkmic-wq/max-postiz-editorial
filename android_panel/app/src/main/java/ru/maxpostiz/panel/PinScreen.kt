@@ -7,6 +7,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -35,18 +36,18 @@ internal fun PinScreen(state: AccessState, submit: (String, String) -> Unit, res
         }
     }
     PageColumn(Modifier.systemBarsPadding().imePadding().padding(top = 24.dp)) {
-        Text("MAX Postiz", style = MaterialTheme.typography.headlineLarge)
+        Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineLarge)
         Text(if (state.configured) "Разблокировать панель" else "Настройте защиту панели",
             style = MaterialTheme.typography.headlineSmall)
-        Notice(if (state.configured) "Введите PIN приложения из четырёх цифр."
-               else "Придумайте PIN из четырёх цифр. Он будет запрашиваться перед входом в панель.")
-        PinInput("PIN-код", "local_pin", pin, { pin = it }, !state.busy && seconds == 0L, apply)
-        if (!state.configured) PinInput("Повторите PIN-код", "local_pin_confirmation", confirm,
+        Notice(if (state.configured) "Введите ПИН-код приложения из четырёх цифр."
+               else "Придумайте ПИН-код из четырёх цифр. Он будет запрашиваться перед входом в панель.")
+        PinInput("ПИН-код", "local_pin", pin, { pin = it }, !state.busy && seconds == 0L, apply)
+        if (!state.configured) PinInput("Повторите ПИН-код", "local_pin_confirmation", confirm,
             { confirm = it }, !state.busy, apply)
         state.message?.let { Notice(it, error = true) }
         if (seconds > 0) Notice("Следующая попытка через $seconds сек.", error = true)
         Button(onClick = apply, enabled = ready, modifier = Modifier.fillMaxWidth().testTag("local_pin_submit")) {
-            Text(if (state.configured) "Разблокировать" else "Сохранить PIN")
+            Text(if (state.configured) "Разблокировать" else "Сохранить ПИН-код")
         }
         if (state.configured && reset != null) {
             TextButton(onClick = reset, enabled = !state.busy) { Text("Сбросить через защиту телефона") }

@@ -55,7 +55,7 @@ internal class LocalAccess(application: Application) : AndroidViewModel(applicat
         val state = mutable.value
         if (state.busy || !validPin(pin)) return
         if (!state.configured && pin != confirmation) {
-            mutable.value = state.copy(message = "PIN-коды различаются. Введите их снова.")
+            mutable.value = state.copy(message = "ПИН-коды различаются. Введите их снова.")
             return
         }
         run {
@@ -93,7 +93,7 @@ internal class LocalAccess(application: Application) : AndroidViewModel(applicat
         }
         val failed = attempts.failed(now)
         save(salt, hash, failed)
-        return AccessState(configured = true, message = "Неверный PIN-код.", retryAt = failed.retryAt)
+        return AccessState(configured = true, message = "Неверный ПИН-код.", retryAt = failed.retryAt)
     }
 
     private fun save(salt: ByteArray, hash: ByteArray, attempts: PinAttempts) = store.savePin(JSONObject()

@@ -14,6 +14,7 @@ import androidx.compose.ui.unit.dp
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -21,8 +22,8 @@ import java.time.format.DateTimeFormatter
 internal fun Queue(state: PanelState, model: PanelViewModel) {
     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         val current = state.targets.find { it.id == state.target }
-        ChoiceMenu(current?.let { "${platform(it.platform)} · ${it.label}" } ?: "Все адресаты",
-            listOf("Все адресаты" to null) + state.targets.map { "${platform(it.platform)} · ${it.label}" to it.id },
+        ChoiceMenu(current?.let { targetName(it.id, it.platform) } ?: "Все адресаты",
+            listOf("Все адресаты" to null) + state.targets.map { targetName(it.id, it.platform) to it.id },
             enabled = !state.busy, onSelect = model::filterTarget)
         FilterChip(selected = state.reviewOnly, enabled = !state.busy,
             onClick = { model.filterReview(!state.reviewOnly) }, label = { Text("Требуют сверки") },
@@ -35,7 +36,7 @@ internal fun Queue(state: PanelState, model: PanelViewModel) {
             Text(day.format(dayFormat), Modifier.padding(top = 12.dp))
             TextButton(onClick = { model.calendarOffset(1) }, enabled = !state.busy) { Text("Вперёд") }
         }
-        state.calendarProblem?.let { Notice("Часть данных Postiz недоступна · $it") }
+        state.calendarProblem?.let { Notice("Часть расписания недоступна. ${blocker(it)}") }
     }
     if (state.items.isEmpty() && !state.busy) Text("Записей по этим условиям нет.")
     state.items.forEach { item ->
@@ -47,7 +48,7 @@ internal fun Queue(state: PanelState, model: PanelViewModel) {
                     Text(targetLabel(item, state))
                     stamp(item.scheduledAt, state.zone)?.let { Text(it) }
                     val currentStatus = listOfNotNull(item.dispatchState, item.postizState, item.editorialState)
-                        .distinct().map(::status).joinToString(" · ")
+                        .mapNotNull(::status).distinct().joinToString(" · ")
                     if (currentStatus.isNotEmpty()) Text(currentStatus)
                     if (item.needsReview) Text("Требуется сверка", color = MaterialTheme.colorScheme.error)
                     if ("MOBILE_ITEM_HELD" in item.blockers) Text("Ручная блокировка")
@@ -74,7 +75,7 @@ internal fun Detail(item: QueueItem, state: PanelState, model: PanelViewModel) {
             put("retire_preapproval_no_send", item.recordId != null)
         }
     }
-    CommandCard("Команды записи", commands, state, item.blockers.firstOrNull()?.let(::blocker)) { action ->
+    CommandCard("Команды записи", commands, state, item.blockers.firstOrNull()?.let { blocker(it) }) { action ->
         val id = when (action) {
             "reconcile_dispatch" -> item.dispatchId
             "retire_preapproval_no_send" -> item.recordId
@@ -86,7 +87,7 @@ internal fun Detail(item: QueueItem, state: PanelState, model: PanelViewModel) {
         Notice("Для этой записи пока нет попытки отправки, которую можно сверить из панели.")
     }
     Field("По времени проекта", stamp(item.scheduledAt, state.zone))
-    Field("UTC", item.scheduledAt)
+    Field("Всемирное время", stamp(item.scheduledAt, ZoneOffset.UTC))
     Field("Редакция", status(item.editorialState))
     Field("Postiz", status(item.postizState))
     Field("Отправка", status(item.dispatchState))
@@ -104,7 +105,7 @@ internal fun Detail(item: QueueItem, state: PanelState, model: PanelViewModel) {
     attempts.forEach {
         HorizontalDivider()
         Text(listOfNotNull(stamp(it.string("created_at"), state.zone), status(it.string("result")),
-            it.string("error")).joinToString(" · "))
+            it.string("error")?.let { code -> blocker(code) }).joinToString(" · "))
     }
     var technical by remember(item.id) { mutableStateOf(false) }
     TextButton(onClick = { technical = !technical }) {
@@ -113,72 +114,18 @@ internal fun Detail(item: QueueItem, state: PanelState, model: PanelViewModel) {
     if (technical) {
         Field("Версия", item.revision)
         Field("Снимок", item.snapshotHash)
-        Field("ID записи", item.id)
-        Field("ID отправки", item.dispatchId)
-        Field("ID Postiz", item.details.string("postiz_id"))
+        Field("Идентификатор записи", item.id)
+        Field("Идентификатор отправки", item.dispatchId)
+        Field("Идентификатор в Postiz", item.details.string("postiz_id"))
     }
 }
 
 private val dayFormat = DateTimeFormatter.ofPattern("dd.MM.yyyy")
-private val timeFormat = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm XXX")
+private val timeFormat = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm xxx")
 
 internal fun stamp(value: String?, zone: ZoneId): String? = value?.let {
-    runCatching { Instant.parse(it).atZone(zone).format(timeFormat) }.getOrDefault(it)
+    runCatching { Instant.parse(it).atZone(zone).format(timeFormat) }.getOrNull()
 }
 
 private fun targetLabel(item: QueueItem, state: PanelState): String =
-    state.targets.find { it.id == item.targetId }?.let { "${platform(it.platform)} · ${it.label}" }
-        ?: item.targetId ?: "Адресат не указан"
-
-internal fun platform(value: String?): String = when (value?.lowercase()) {
-    "max" -> "MAX"
-    "telegram" -> "Telegram"
-    "vk", "vkontakte" -> "ВКонтакте"
-    "pikabu" -> "Пикабу"
-    else -> value ?: "Площадка"
-}
-
-internal fun status(value: String?): String? = when (value) {
-    "sending" -> "Идёт отправка"
-    "unknown", "blocked_unknown" -> "Исход неизвестен"
-    "needs_attention" -> "Требуется проверка"
-    "review_pending" -> "На проверке редакции"
-    "paused" -> "На паузе"
-    "idle" -> "Ожидает задания"
-    "scheduled", "QUEUE" -> "В расписании"
-    "draft", "DRAFT" -> "Черновик"
-    "published", "PUBLISHED" -> "Опубликовано"
-    "verified", "confirmed", "delivered", "delivery_confirmed" -> "Доставка подтверждена"
-    "proof_insufficient" -> "Доказательств недостаточно"
-    "independent_readback" -> "Независимая сверка"
-    "api_receipt" -> "Ответ API"
-    "fixture" -> "Данные тестового стенда"
-    "unverified" -> "Без подтверждения"
-    "retired_no_send" -> "Закрыто без отправки"
-    "record_cancelled_slot_missed_draft_preserved_no_send" -> "Закрыть слот и сохранить черновик"
-    "accepted" -> "Принята"
-    "running" -> "Выполняется"
-    "succeeded" -> "Выполнена"
-    "blocked" -> "Заблокирована"
-    "failed", "ERROR" -> "Ошибка"
-    "pending" -> "Ожидает выполнения"
-    "cancelled" -> "Отменено"
-    "missed" -> "Слот закрыт"
-    "owner" -> "Владелец"
-    "operator" -> "Оператор"
-    "viewer" -> "Просмотр"
-    else -> value
-}
-
-internal fun blocker(value: String): String = when (value) {
-    "BROWSER_WORKER_CGROUP_UNAVAILABLE" -> "Контейнеру недоступна изоляция браузерного обработчика."
-    "MOBILE_HOLD_DUE_ELAPSED" -> "Срок прошёл, блокировка сохранена."
-    "MOBILE_ITEM_HELD" -> "Действует ручная блокировка."
-    "ARTICLE_RECONCILIATION_REQUIRED" -> "Нужно сверить состояние слота."
-    "ARTICLE_REMOTE_CHANGED" -> "Данные записи в Postiz изменились."
-    "PREAPPROVAL_POSTIZ_TIMEOUT_UNPROVEN", "PREAPPROVAL_POSTIZ_JOURNAL_INVALID", "PREAPPROVAL_RETIREMENT_NOT_SAFE" ->
-        "Недостаточно доказательств для закрытия. Слот остаётся заблокированным."
-    "BRIDGE_EDIT_IN_PROGRESS" -> "Серверная операция ещё выполняется."
-    "MOBILE_POSTIZ_LINK_UNVERIFIED" -> "Связь с записью Postiz требует проверки."
-    else -> value
-}
+    targetName(item.targetId, state.targets.find { it.id == item.targetId }?.platform)

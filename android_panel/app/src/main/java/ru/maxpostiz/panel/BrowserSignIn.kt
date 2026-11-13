@@ -52,6 +52,7 @@ internal class BrowserSignIn(private val context: Context) : AutoCloseable {
                 "openid offline_access" else "openid")
             .setPrompt("login")
             .setLoginHint(loginHint)
+            .setUiLocales("ru")
             .setAdditionalParameters(mapOf("max_age" to "0"))
             .build()
         check(request.codeVerifierChallengeMethod == "S256" && !request.nonce.isNullOrBlank())

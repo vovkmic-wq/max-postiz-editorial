@@ -10,6 +10,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -22,8 +23,8 @@ internal fun PanelScreen(state: PanelState, model: PanelViewModel, openBrowser: 
         topBar = {
             TopAppBar(title = {
                 Column {
-                    Text("MAX Postiz")
-                    Text(if (state.profile?.testLoopback == true) "Стенд · ${caps.environment}" else caps.environment,
+                    Text(stringResource(R.string.app_name))
+                    Text(environmentName(caps.environment, state.profile?.testLoopback == true),
                         style = MaterialTheme.typography.labelMedium)
                 }
             }, actions = {
@@ -93,11 +94,13 @@ private fun Overview(state: PanelState, model: PanelViewModel) {
     val reserve = state.reserve
     val caps = requireNotNull(state.capabilities)
     val paused = overview?.optBoolean("paused", true)
+    val phase = overview?.string("phase")
+    val preparation = overview?.optJSONObject("preparation")
     val action = if (paused == true) "resume_project" else "pause_project"
     Button(onClick = { model.select(Section.Queue) }, enabled = !state.busy,
         modifier = Modifier.fillMaxWidth()) { Text("Открыть очередь") }
     CommandCard("Управление проектом", mapOf(action to (action in overview?.strings("available_actions").orEmpty())),
-        state, overview?.strings("blocked_reasons")?.firstOrNull()?.let(::blocker)) { model.plan(it, "main") }
+        state, overview?.strings("blocked_reasons")?.firstOrNull()?.let { blocker(it) }) { model.plan(it, "main") }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(when {
@@ -105,13 +108,17 @@ private fun Overview(state: PanelState, model: PanelViewModel) {
                 overview.optBoolean("paused", true) -> "Проект на паузе"
                 else -> "Проект работает"
             }, style = MaterialTheme.typography.titleLarge)
-            Field("Состояние", status(overview?.string("phase")))
+            Field("Состояние", status(phase))
+            if (phase == "waiting_dispatch") {
+                Field("Ближайший слот", stamp(reserve?.string("next_delivery_at"), state.zone))
+            }
             Field("Обновление сервера", stamp(overview?.string("observed_at"), state.zone))
             Field("Сигнал отправителя", stamp(overview?.string("heartbeat_at"), state.zone))
-            Field("Сигнал подготовки", stamp(overview?.optJSONObject("preparation")?.string("heartbeat_at"), state.zone))
+            Field("Сигнал подготовки", stamp(preparation?.string("heartbeat_at"), state.zone))
             Field("Следующий проход", stamp(overview?.string("next_run_at"), state.zone))
-            Field("Неясные отправки", overview?.string("unresolved_dispatches"))
+            Field("Отправки с неизвестным исходом", overview?.string("unresolved_dispatches"))
             Field("Резерв", reserve?.let { "${it.optInt("ready")} из ${it.optInt("target")}" })
+            Field("Подготовка резерва", status(preparation?.string("phase")))
             Field("Последняя доставка", stamp(reserve?.string("last_delivered_at"), state.zone))
             Field("Шлюз", listOfNotNull(caps.version, caps.role?.let(::status)).joinToString(" · "))
             overview?.strings("blocked_reasons").orEmpty().forEach { Text(blocker(it)) }
@@ -121,7 +128,7 @@ private fun Overview(state: PanelState, model: PanelViewModel) {
     state.targets.forEach { target ->
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("${platform(target.platform)} · ${target.label}", style = MaterialTheme.typography.titleMedium)
+                Text(targetName(target.id, target.platform), style = MaterialTheme.typography.titleMedium)
                 Text(if (!target.enabled) "Отключён" else if (target.paused) "На паузе" else "Активен")
                 target.blockers.forEach { Text(blocker(it)) }
                 val targetAction = if (target.paused) "resume_target" else "pause_target"
@@ -141,14 +148,14 @@ private fun Audit(state: PanelState) {
     state.history.forEach { entry ->
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(actionName(entry.string("action") ?: "") ?: entry.string("action") ?: "Операция",
+                Text(actionName(entry.string("action") ?: "") ?: "Действие не распознано",
                     style = MaterialTheme.typography.titleMedium)
                 Field("Статус", status(entry.string("state")))
                 Field("Время", stamp(entry.string("updated_at") ?: entry.string("created_at"), state.zone))
                 Field("Оператор", entry.string("actor"))
-                Field("ID", entry.string("operation_id") ?: entry.string("id"))
+                Field("Идентификатор", entry.string("operation_id") ?: entry.string("id"))
                 Field("Причина", entry.string("reason"))
-                Field("Код", entry.string("code"))
+                entry.string("code")?.let { Notice(blocker(it)) }
             }
         }
     }
