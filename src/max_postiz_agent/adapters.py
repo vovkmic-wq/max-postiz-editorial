@@ -358,16 +358,45 @@ class MaxAPI:
                 return Delivery("retry_wait", retry_after=delay)
             # Обрабатываем ветвь при условии: response.status_code != 200.
             if response.status_code != 200:
-                return Delivery("unknown")
+                return Delivery(
+                    "unknown",
+                    evidence={
+                        "failure_code": f"MAX_HTTP_{response.status_code}",
+                        "transport_phase": "publish_response",
+                        "http_status": response.status_code,
+                    },
+                )
             message = response.json().get("message", {})
             mid = message.get("body", {}).get("mid")
             # Обрабатываем ветвь при условии: not mid.
             if not mid:
-                return Delivery("unknown")
+                return Delivery(
+                    "unknown",
+                    evidence={
+                        "failure_code": "MAX_RESPONSE_MISSING_MESSAGE_ID",
+                        "transport_phase": "publish_response",
+                        "http_status": response.status_code,
+                    },
+                )
             return Delivery("confirmed", str(mid), message.get("url"))
         # Обрабатываем (AgentError, ValueError, TypeError) и выбираем допустимый исход.
-        except (AgentError, ValueError, TypeError):
-            return Delivery("unknown")
+        except AgentError as exc:
+            return Delivery(
+                "unknown",
+                evidence={
+                    "failure_code": exc.code,
+                    "transport_phase": "publish_request",
+                },
+            )
+        except (ValueError, TypeError) as exc:
+            return Delivery(
+                "unknown",
+                evidence={
+                    "failure_code": "MAX_RESPONSE_INVALID",
+                    "transport_phase": "publish_response",
+                    "exception_type": type(exc).__name__,
+                },
+            )
 
     # Операция messages: адаптеры внешних сервисов и безопасная обработка результатов отправки.
     def messages(self, chat_id, **params):
