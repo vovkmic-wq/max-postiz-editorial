@@ -17,6 +17,7 @@ from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.db import Audit, Base, Draft, Intent, Job
 from max_postiz_agent.hub_models import (
     BridgePost,
+    Dispatch,
     DispatchAttempt,
     RemoteDraft,
     Target,
@@ -790,6 +791,86 @@ def test_archived_unknown_browser_journal_requires_original_owner_disposition(re
     else:
         recovery._validate_journal(retirement_case.core, session, request, journal, dispatch)
         assert journal["state"] == "unknown" and attempt.result == "unknown" and dispatch.verified is False
+
+
+@pytest.mark.parametrize("backend", ["reserve_controller", "postgres_reserve"])
+def test_owner_archived_preparing_journal_preserves_unknown_and_blocks_mutation(request, backend):
+    from max_postiz_agent.browser_worker import _request_record, _snapshot_request
+    from max_postiz_agent.unknown_delivery import OWNER_ACTION, OWNER_CONTRACT, OWNER_ERROR, retirement_id
+
+    value = request.getfixturevalue(backend)
+    value.controller.prepare_once()
+    value.controller.run_once()
+    record = value.cycle._load()["records"][0]
+    dispatch_id = record["dispatch_id"]
+    with value.core.db.session.begin() as session:
+        dispatch = session.get(Dispatch, dispatch_id)
+        attempt_id = str(uuid4())
+        settings = value.core.settings
+        start_at = dispatch.due_at + 1
+        content = copy.deepcopy(dispatch.snapshot)
+        base, presentation = _snapshot_request(settings, dispatch_id, content, content["destination"])
+        payload = {**base, **presentation, "dispatch_snapshot_hash": fingerprint(content)}
+        journal = {**_request_record(settings, payload),
+                   "contract": "browser-send-journal-v1", "state": "preparing", "phase": "session",
+                   "send_started": False, "started_at": start_at}
+        raw = json.dumps(journal, ensure_ascii=False).encode()
+        journal_hash = hashlib.sha256(raw).hexdigest()
+        slot = session.get(PublicationSlot, record["publication_slot_id"])
+        approval = session.get(TargetApproval, dispatch.approval_id)
+        bridge = session.scalar(select(BridgePost).where(BridgePost.variant_id == dispatch.variant_id))
+        details = {
+            "contract": OWNER_CONTRACT,
+            "variant_id": dispatch.variant_id,
+            "slot_id": slot.id,
+            "record_id": slot.record_id,
+            "dispatch_id": dispatch_id,
+            "original_unknown_attempt_id": attempt_id,
+            "original_attempt_preserved": True,
+            "original_external_result": "UNKNOWN",
+            "historical_no_send_proved": False,
+            "verified_delivery": False,
+            "permanent_no_retry": True,
+            "source_remains_ever_used": True,
+            "browser_journal_sha256": journal_hash,
+        }
+        dispatch.state, dispatch.error, dispatch.attempts = "cancelled", OWNER_ERROR, 1
+        approval.revoked = True
+        slot.state, slot.error, slot.active_target = "missed", OWNER_ERROR, None
+        bridge.active, bridge.error, bridge.remote_state = False, OWNER_ERROR, "ERROR"
+        ledger = session.get(EditorialLedger, "hourly")
+        output = copy.deepcopy(ledger.payload)
+        output["records"][0].update(state="cancelled", original_external_result="UNKNOWN",
+                                    permanent_no_retry=True, source_remains_ever_used=True,
+                                    owner_abandonment=copy.deepcopy(details))
+        ledger.payload = output
+        session.add(DispatchAttempt(id=attempt_id, dispatch_id=dispatch_id, result="unknown", created_at=start_at+1))
+        audit_id = retirement_id(dispatch.variant_id)
+        session.add(Audit(id=audit_id, actor="owner_operational_exception", action=OWNER_ACTION,
+                          entity=dispatch_id, details=details, at=start_at+2))
+    journal_path = settings.root / "data/browser-publications" / (dispatch_id + ".json")
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_bytes(raw)
+    with value.core.db.session() as session:
+        dispatch = session.get(Dispatch, dispatch_id)
+        recovery._validate_journal(value.core, session, dispatch_id, journal, dispatch, raw_sha256=journal_hash)
+        assert recovery.mutation_blocked(session, dispatch.variant_id)
+        assert value.core.bridge._blocked_post(session, record["postiz_id"]) == dispatch.variant_id
+        with pytest.raises(AgentError, match="PREAPPROVAL_JOURNAL_INVALID"):
+            recovery._validate_journal(value.core, session, dispatch_id, journal, dispatch, raw_sha256="0"*64)
+        assert session.get(DispatchAttempt, attempt_id).result == "unknown"
+        assert dispatch.verified is False and journal_path.read_bytes() == raw
+    with value.core.db.session.begin() as session:
+        # Alter both copies to ensure cross-comparison alone cannot certify a historical no-send.
+        audit = session.get(Audit, audit_id)
+        audit.details = {**audit.details, "historical_no_send_proved": True}
+        ledger = session.get(EditorialLedger, "hourly")
+        output = copy.deepcopy(ledger.payload)
+        output["records"][0]["owner_abandonment"] = copy.deepcopy(audit.details)
+        ledger.payload = output
+    with value.core.db.session() as session, pytest.raises(AgentError, match="PREAPPROVAL_JOURNAL_INVALID"):
+        recovery._validate_journal(value.core, session, dispatch_id, journal, session.get(Dispatch, dispatch_id),
+                                   raw_sha256=journal_hash)
 
 
 @pytest.mark.parametrize(

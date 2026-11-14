@@ -152,8 +152,19 @@ class ReserveServerCycle(ServerCycle):
             raise AgentError("ARTICLE_AUTOMATIC_POLICY_REQUIRED", 409)
         active, leased = self._inventory()
         slots = self.reserve.status(policy["target_id"])["active"]
-        if leased or any(d["state"] in {"sending", "unknown"} for d in active):
+        if leased or any(d["state"] == "sending" for d in active):
             return self._phase("blocked", last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
+        if any(d["state"] == "unknown" for d in active):
+            from .unknown_delivery import release_finished_unknown
+
+            try:
+                closed = release_finished_unknown(self.reserve, self.cycle, policy["target_id"], ledger["records"])
+            except AgentError as exc:
+                if exc.code not in {"ARTICLE_RECONCILIATION_REQUIRED", "BROWSER_FINISHED_PRECLICK_PROOF_INVALID"}:
+                    raise
+                return self._phase("blocked", last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
+            return self._phase("reconciling", record_id=closed["record_id"], slot_id=closed["id"],
+                slot_state="missed", last_error=None)
         if slots:
             if len(slots) != 1:
                 raise AgentError("ARTICLE_RESERVE_ASSIGNMENT_LOST", 409)

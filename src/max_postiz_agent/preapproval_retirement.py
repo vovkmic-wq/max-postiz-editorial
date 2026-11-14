@@ -95,7 +95,10 @@ def _id(variant_id, stage):
 
 
 def mutation_blocked(session, variant_id):
-    return session.get(Audit, _id(variant_id, "claim")) is not None
+    from .unknown_delivery import retirement_audit
+
+    return (session.get(Audit, _id(variant_id, "claim")) is not None
+            or retirement_audit(session, variant_id) is not None)
 
 
 def assert_mutable(session, variant_id):
@@ -103,9 +106,11 @@ def assert_mutable(session, variant_id):
 
 
 def draft_mutation_blocked(session, draft_id):
+    from .unknown_delivery import AUTOMATIC_ACTION, OWNER_ACTION
+
     # Legacy installations may have only the base Service tables. No recovery
     # claim means there is no new fence to resolve through optional Hub tables.
-    if session.scalar(select(Audit.id).where(Audit.action == CLAIM).limit(1)) is None:
+    if session.scalar(select(Audit.id).where(Audit.action.in_({CLAIM, AUTOMATIC_ACTION, OWNER_ACTION})).limit(1)) is None:
         return False
     return any(
         mutation_blocked(session, variant_id)
@@ -218,7 +223,8 @@ def _files(core, record, variant, session):
             require(intent is None or intent.draft_id != variant.draft_id)
             if path.suffix == ".json":
                 _validate_journal(
-                    core, session, request_id, _decode(raw, "PREAPPROVAL_JOURNAL_INVALID"), dispatch
+                    core, session, request_id, _decode(raw, "PREAPPROVAL_JOURNAL_INVALID"), dispatch,
+                    raw_sha256=hashlib.sha256(raw).hexdigest(),
                 )
             else:
                 if not (journal / (request_id + ".json")).is_file():
@@ -324,9 +330,10 @@ def _validate_archived_unknown(session, dispatch, value):
     )
 
 
-def _validate_journal(core, session, request_id, value, dispatch):
+def _validate_journal(core, session, request_id, value, dispatch, *, raw_sha256=None):
     from types import SimpleNamespace
     from .browser_worker import _snapshot_request, read_preclick_failure
+    from .unknown_delivery import validate_retained_journal
 
     require(dispatch is not None and isinstance(value, dict), "PREAPPROVAL_JOURNAL_UNCORRELATED")
     snapshot = dispatch.snapshot
@@ -339,6 +346,8 @@ def _validate_journal(core, session, request_id, value, dispatch):
         read_preclick_failure(
             historical, request_id, snapshot=snapshot, chat_id=snapshot["destination"]
         )
+        return
+    if value.get("state") == "preparing" and validate_retained_journal(historical, session, dispatch, raw_sha256, value):
         return
     expected, presentation = _snapshot_request(
         historical, request_id, snapshot, snapshot["destination"]

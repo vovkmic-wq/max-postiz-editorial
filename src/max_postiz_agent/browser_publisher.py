@@ -3,13 +3,125 @@
 
 import hashlib
 import json
+import math
 import os
+import re
 import subprocess
 import sys
+import time
+import uuid
 
 from .adapters import Delivery
-from .browser_worker import read_preclick_failure
-from .config import AgentError, fingerprint, inside
+from .browser_worker import PUBLISHER_INVOCATION_FIELD, _request_record, _snapshot_request, read_preclick_failure, save
+from .config import AgentError, fingerprint, inside, parse_json
+
+
+FINISHED_PRECLICK_CONTRACT = "browser-publisher-finished-preclick-v1"
+_FINISHED_PRECLICK_INVALID = "BROWSER_FINISHED_PRECLICK_PROOF_INVALID"
+
+
+def _proof_path(settings, directory, request_id):
+    from .server_route_admin import plain
+
+    if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id):
+        raise ValueError("request ID")
+    return plain(settings.root, f"data/{directory}/{request_id}.json")
+
+
+def _read_proof(path, limit):
+    partial = path.with_suffix(".new")
+    if partial.exists() or partial.is_symlink() or partial.is_junction() or not path.is_file():
+        raise ValueError("proof file")
+    with path.open("rb") as stream:
+        raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError("proof size")
+    value = parse_json(raw.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("proof object")
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def _preparing_started_at(settings, journal, payload, publisher_invocation_id):
+    started_at = journal.get("started_at")
+    expected = {
+        **_request_record(settings, payload),
+        "contract": "browser-send-journal-v1",
+        "state": "preparing",
+        "send_started": False,
+        "phase": "session",
+        "started_at": started_at,
+        PUBLISHER_INVOCATION_FIELD: publisher_invocation_id,
+    }
+    if (not isinstance(publisher_invocation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", publisher_invocation_id)
+            or type(started_at) not in {int, float} or not math.isfinite(started_at) or started_at <= 0
+            or journal.get("send_started") is not False or journal != expected):
+        raise ValueError("initial journal")
+    return started_at
+
+
+def _ordered_stamps(invoked_at, started_at, finished_at):
+    return (all(type(stamp) in {int, float} and math.isfinite(stamp) for stamp in (invoked_at, started_at, finished_at))
+            and 0 < invoked_at <= started_at <= finished_at)
+
+
+def _save_finished_preclick(settings, payload, publisher_invocation_id, invoked_at, finished_at, completion):
+    request_id = payload["request_id"]
+    try:
+        journal_path = _proof_path(settings, "browser-publications", request_id)
+        journal, journal_sha256 = _read_proof(journal_path, 8_388_608)
+        authorized = journal["request_payload"]
+        snapshot_hash = authorized.get("dispatch_snapshot_hash")
+        if (not isinstance(snapshot_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", snapshot_hash)
+                or any(authorized.get(name) != value for name, value in payload.items())):
+            return
+        started_at = _preparing_started_at(settings, journal, authorized, publisher_invocation_id)
+        if not _ordered_stamps(invoked_at, started_at, finished_at):
+            return
+        path = _proof_path(settings, "browser-publisher-receipts", request_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save(path, {
+            "contract": FINISHED_PRECLICK_CONTRACT,
+            "request_id": request_id,
+            "config_hash": settings.hash,
+            "snapshot_hash": snapshot_hash,
+            PUBLISHER_INVOCATION_FIELD: publisher_invocation_id,
+            "journal_sha256": journal_sha256,
+            "invoked_at": invoked_at,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "completion": completion,
+        }, exclusive=True)
+    except (AgentError, OSError, ValueError, TypeError, KeyError, AttributeError):
+        # Без exact proof исход остаётся unknown, как и до этой проверки.
+        return
+
+
+def read_finished_preclick_receipt(settings, request_id, *, snapshot, chat_id=None):
+    """Локальное доказательство: завершившийся процесс не дошёл до intent отправки."""
+    try:
+        path = _proof_path(settings, "browser-publisher-receipts", request_id)
+        receipt, sha256 = _read_proof(path, 4096)
+        fields = {"contract", "request_id", "config_hash", "snapshot_hash", PUBLISHER_INVOCATION_FIELD,
+                  "journal_sha256", "invoked_at", "started_at", "finished_at", "completion"}
+        snapshot_hash = fingerprint(snapshot)
+        if (set(receipt) != fields or receipt["contract"] != FINISHED_PRECLICK_CONTRACT
+                or receipt["request_id"] != request_id or receipt["config_hash"] != settings.hash
+                or receipt["snapshot_hash"] != snapshot_hash
+                or receipt["completion"] not in {"exited", "timed_out_reaped"}):
+            raise ValueError("publisher receipt")
+        expected, presentation = _snapshot_request(settings, request_id, snapshot,
+                                                   snapshot["destination"] if chat_id is None else chat_id)
+        payload = {**expected, **presentation, "dispatch_snapshot_hash": snapshot_hash}
+        journal_path = _proof_path(settings, "browser-publications", request_id)
+        journal, journal_sha256 = _read_proof(journal_path, 8_388_608)
+        started_at = _preparing_started_at(settings, journal, payload, receipt[PUBLISHER_INVOCATION_FIELD])
+        if (receipt["journal_sha256"] != journal_sha256 or receipt["started_at"] != started_at
+                or not _ordered_stamps(receipt["invoked_at"], receipt["started_at"], receipt["finished_at"])):
+            raise ValueError("journal receipt mismatch")
+        return {"receipt": receipt, "sha256": sha256, "journal_sha256": journal_sha256}
+    except (AgentError, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise AgentError(_FINISHED_PRECLICK_INVALID) from exc
 
 
 # Адаптер публикации через собственный браузерный профиль проекта.
@@ -26,20 +138,37 @@ class BrowserMax:
 
     # Выполняем ограниченный запрос и проверяем формат ответа.
     def call(self, action, **payload):
+        request = {"action": action, "config_hash": self.settings.hash, **payload}
+        invocation_id = uuid.uuid4().hex if action == "publish" else None
+        worker_request = {**request, PUBLISHER_INVOCATION_FIELD: invocation_id} if invocation_id else request
+        invoked_at = time.time()
         # Выполняем операцию с отдельной обработкой возможных ошибок.
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "max_postiz_agent.browser_worker", "--root", str(self.settings.root)],
-                input=json.dumps({"action": action, "config_hash": self.settings.hash, **payload}, ensure_ascii=True),
+                input=json.dumps(worker_request, ensure_ascii=True),
                 text=True, capture_output=True,
                 timeout=self.settings.app["max"]["browser"].get("operation_timeout_seconds", 120) + 60,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 check=False,
             )
-            value = json.loads(result.stdout)
-        # Обрабатываем (OSError, subprocess.TimeoutExpired, ValueError) и выбираем допустимый исход.
-        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        except subprocess.TimeoutExpired as exc:
+            # На POSIX subprocess.run сначала завершает и дожидается процесса.
+            if invocation_id is not None and os.name == "posix":
+                _save_finished_preclick(self.settings, request, invocation_id, invoked_at, time.time(),
+                                        "timed_out_reaped")
             raise AgentError("BROWSER_OPERATION_UNCONFIRMED") from exc
+        except (OSError, ValueError) as exc:
+            raise AgentError("BROWSER_OPERATION_UNCONFIRMED") from exc
+        finished_at = time.time()
+        try:
+            value = json.loads(result.stdout)
+        except ValueError as exc:
+            if invocation_id is not None and result.returncode != 0 and not result.stdout:
+                _save_finished_preclick(self.settings, request, invocation_id, invoked_at, finished_at, "exited")
+            raise AgentError("BROWSER_OPERATION_UNCONFIRMED") from exc
+        if invocation_id is not None and value == {"state": "unknown"}:
+            _save_finished_preclick(self.settings, request, invocation_id, invoked_at, finished_at, "exited")
         # Обрабатываем ветвь при условии: not isinstance(value, dict).
         if not isinstance(value, dict):
             raise AgentError("BROWSER_OPERATION_UNCONFIRMED")

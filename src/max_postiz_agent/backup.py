@@ -20,7 +20,7 @@ from .db import Channel, Intent, Job
 def runtime_files(root):
     # Переносим журналы отправки и оригиналы, но исключаем cookies, ключи и API-кэш.
     for directory in ("data/image-ranking", "data/image-schedule",
-                      "data/browser-publications", "data/browser-corrections"):
+                      "data/browser-publications", "data/browser-publisher-receipts", "data/browser-corrections"):
         # Последовательно обрабатываем элементы: inside(root, directory).rglob('*').
         for path in inside(root, directory).rglob("*"):
             relative = path.relative_to(root).as_posix()
@@ -37,7 +37,8 @@ def portable_name(name):
     return name in {"database.json", "TOPIC.md", "config/sources.json", "config/app.json",
                     "config/image_sources.json", "config/image_channels.json", "config/holidays.json", "config/comfy/workflow.json", "config/publishing.json", "config/reddit_intake.json"} or name.startswith((
                         "media/", "data/image-ranking/", "data/image-schedule/",
-                        "data/browser-publications/", "data/browser-corrections/", "data/archive/", "data/exports/"))
+                        "data/browser-publications/", "data/browser-publisher-receipts/",
+                        "data/browser-corrections/", "data/archive/", "data/exports/"))
 
 
 # Запрещаем включение значений ключей в переносимые настройки.
