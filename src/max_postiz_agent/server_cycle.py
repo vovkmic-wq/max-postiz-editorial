@@ -8,6 +8,7 @@ import math
 
 from sqlalchemy import select
 
+from .source_adapters import REGISTRY
 from .article_attribution import illustrated_presentation
 from .article_cycle import HourlyArticleCycle
 from .automatic_policy import automatic_evidence
@@ -91,9 +92,9 @@ class ServerCycle:
             failures = []
             for current in policies:
                 if (illustrated_presentation(current.get("presentation_contract"))
-                        and current["source_id"] not in {"noirlab_iotw", "esahubble_potw"}):
-                    # В этом формате пока доказаны только собственные JPEG
-                    # двух научных источников; NASA-текст не теряем из-за
+                        and current["source_id"] not in REGISTRY):
+                    # Иллюстрации допускаются только для явных адаптеров;
+                    # NASA-текст не теряем из-за
                     # отсутствия отдельного разрешения на конкретное фото.
                     continue
                 self.state.assert_running()

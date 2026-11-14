@@ -1,0 +1,5 @@
+{
+  "title_selector": "div[id$=\"Panel_Title\"] h1",
+  "body_selector": "div[id$=\"Panel_odyText\"]",
+  "date_selector": "time[datetime]"
+}

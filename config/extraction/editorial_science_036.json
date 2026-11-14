@@ -1,0 +1,5 @@
+{
+  "title_selector": ".post-banner h1",
+  "body_selector": "div.article",
+  "date_selector": "time[datetime]"
+}

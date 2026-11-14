@@ -11,25 +11,11 @@ import re
 from urllib.parse import urlsplit
 
 from .config import AgentError, fingerprint, parse_json
+from .source_adapters import REGISTRY
 
 IMAGE_SOURCE_PROOF_CONFLICT = "ARTICLE_IMAGE_SOURCE_PROOF_CONFLICT"
 
-_SOURCES = {
-    "noirlab_iotw": {
-        "id": "noirlab_iotw", "host": "noirlab.edu",
-        "path": r"/public/images/iotw[0-9]{4}[a-z]/",
-        "rights_evidence": "https://noirlab.edu/public/copyright/",
-        "rights_text_sha256": "b07b25ddc7ef6e54dae494fec6f2a76b0b32cbc770e1c5bb25f8bd5b076b88f0",
-        "attribution": "CC BY 4.0",
-    },
-    "esahubble_potw": {
-        "id": "esahubble_potw", "host": "esahubble.org",
-        "path": r"/images/potw[0-9]{4}[a-z]/",
-        "rights_evidence": "https://esahubble.org/copyright/",
-        "rights_text_sha256": "2651482536d414ad5fb300eab4c4fa7ae80e7836ee1b2cfb6ae08c643905d552",
-        "attribution": "CC BY 4.0",
-    },
-}
+_SOURCES = {name: adapter.SPEC for name, adapter in REGISTRY.items()}
 
 
 def source_spec(source_id):
