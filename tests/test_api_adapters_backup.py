@@ -156,6 +156,12 @@ def test_max_delivery_classification(service, monkeypatch, status, state):
     publisher = MaxAPI(service.settings, transport=httpx.MockTransport(handle))
     delivery = publisher.publish("-123", "Текст")
     assert delivery.state == state and len(calls) == 1
+    if status == 500:
+        assert delivery.evidence == {
+            "failure_code": "MAX_HTTP_500",
+            "transport_phase": "publish_response",
+            "http_status": 500,
+        }
     # Обрабатываем ветвь при условии: status == 429.
     if status == 429:
         assert delivery.retry_after == 12
@@ -172,7 +178,31 @@ def test_max_timeout_is_unknown(service, monkeypatch):
         raise httpx.ReadTimeout("unsafe detail", request=request)
 
     publisher = MaxAPI(service.settings, transport=httpx.MockTransport(handle))
-    assert publisher.publish("-123", "Текст").state == "unknown"
+    delivery = publisher.publish("-123", "Текст")
+    assert delivery.state == "unknown"
+    assert delivery.evidence == {
+        "failure_code": "MAX_TRANSPORT_UNKNOWN",
+        "transport_phase": "publish_request",
+    }
+    publisher.close()
+
+
+# Проверяем сценарий: MAX ответил без устойчивого идентификатора сообщения.
+def test_max_missing_message_id_is_unknown_with_evidence(service, monkeypatch):
+    service.settings.app["max"]["adapter_mode"] = "live"
+    monkeypatch.setenv("MAX_BOT_TOKEN", "test-token")
+
+    def handle(request):
+        return httpx.Response(200, json={"message": {"body": {}}})
+
+    publisher = MaxAPI(service.settings, transport=httpx.MockTransport(handle))
+    delivery = publisher.publish("-123", "Текст")
+    assert delivery.state == "unknown"
+    assert delivery.evidence == {
+        "failure_code": "MAX_RESPONSE_MISSING_MESSAGE_ID",
+        "transport_phase": "publish_response",
+        "http_status": 200,
+    }
     publisher.close()
 
 
