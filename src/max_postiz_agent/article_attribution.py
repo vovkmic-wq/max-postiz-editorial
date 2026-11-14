@@ -2,9 +2,10 @@
 
 from .article_sources import source_id_for_url
 from .config import AgentError
+from .source_adapters import REGISTRY, adapter_for
 
 CC_BY_URL = "https://creativecommons.org/licenses/by/4.0/"
-TEXT_CREDITS = {"noirlab_iotw": "NOIRLab", "esahubble_potw": "ESA/Hubble"}
+TEXT_CREDITS = {name: adapter.TEXT_CREDIT for name, adapter in REGISTRY.items()}
 ILLUSTRATED_PRESENTATION_CONTRACT = "article-illustrated-v1"
 CURRENT_ILLUSTRATED_PRESENTATION_CONTRACT = "article-illustrated-v2"
 ILLUSTRATED_PRESENTATION_CONTRACTS = frozenset({
@@ -45,7 +46,7 @@ def article_footer(url, *, presentation_contract=None, image_credit=None):
         # Legacy и illustrated-v1 воспроизводятся по прежней точной подписи.
         footer += "\nАрхивный научный материал."
     if presentation:
-        return footer + "\nПеревод и адаптация.\nИзображение: " + image_credit
+        return footer + "\n" + adapter_for(source_id).ADAPTATION_NOTICE + "\nИзображение: " + image_credit
     return footer + "\nМашинный перевод на русский и автоматическая редактура."
 
 

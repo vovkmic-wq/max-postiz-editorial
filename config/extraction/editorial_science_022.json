@@ -1,0 +1,5 @@
+{
+  "title_selector": "section.maincontent h2",
+  "body_selector": "section.maincontent",
+  "date_selector": "time[datetime]"
+}

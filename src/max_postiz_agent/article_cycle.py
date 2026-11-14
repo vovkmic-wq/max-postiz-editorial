@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
+from .source_adapters import REGISTRY
 from .adapters import OpenCode
 from .article_attribution import article_footer, illustrated_presentation
 from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT, REFERENCE_CONTRACTS
@@ -317,7 +318,7 @@ class HourlyArticleCycle:
 
     def _article(self, article, policy, source, target):
         from .article_sources import source_spec, validate_source_url
-        if policy["source_id"] in {"noirlab_iotw", "esahubble_potw"}:
+        if policy["source_id"] in REGISTRY:
             spec = source_spec(policy["source_id"])
             if (policy["allowed_hosts"] != [spec["host"]]
                     or policy["rights_evidence"] != spec["rights_evidence"]

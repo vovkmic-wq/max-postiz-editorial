@@ -22,12 +22,12 @@ from .article_attribution import CC_BY_URL, ILLUSTRATED_PRESENTATION_CONTRACT, i
 from .article_sources import IMAGE_SOURCE_PROOF_CONFLICT, source_spec, validate_source_url
 from .config import AgentError, fingerprint, inside
 from .media import inspect_image
+from .source_adapters import REGISTRY
 
 CONTRACT = ILLUSTRATED_PRESENTATION_CONTRACT
 MAX_BYTES = 10 * 1024 * 1024
 MAX_PROOF_BYTES = 20 * 1024 * 1024
-HOSTS = {'noirlab_iotw': ('storage.noirlab.edu', '/media/archives/images/'),
-         'esahubble_potw': ('cdn.esahubble.org', '/archives/images/')}
+HOSTS = {name: adapter.IMAGE_HOST for name, adapter in REGISTRY.items()}
 _PERSON = re.compile(r'\b(?:portrait|selfie|group photograph|group photo|team photo|people|person|visitors|students|astronauts?)\b', re.I)
 PART_BYTES = 8192
 MAX_PARTS = (MAX_BYTES + PART_BYTES - 1) // PART_BYTES
@@ -126,17 +126,20 @@ def _write(path, value):
             os.close(fd)
 
 
-def _download(url, destination, claim_path, *, transport=None):
+def _download(url, destination, claim_path, *, transport=None, request_mode='ranges-v1'):
     """Ограниченный HTTP Range с If-Match, без повторов потерянного диапазона.
 
     Отдельные диапазоны позволяют передать официальный файл при обрывах
     длинных соединений. 403/429 не снимаются сменой соединения или URL.
     """
     started = time.monotonic()
+    _require(request_mode in {'ranges-v1', 'full-v1'}, 'ARTICLE_IMAGE_DOWNLOAD_REQUIRED')
 
     def part(start, stop, etag=None, total=None):
         _require(time.monotonic() - started < 180, 'ARTICLE_IMAGE_SOURCE_UNAVAILABLE')
-        headers = {'Range': f'bytes={start}-{stop}', 'Accept-Encoding': 'identity'}
+        headers = {'Accept-Encoding': 'identity'}
+        if request_mode == 'ranges-v1':
+            headers['Range'] = f'bytes={start}-{stop}'
         if etag is not None:
             headers['If-Match'] = etag
         _write(claim_path.with_name(claim_path.name + f'.part-{start}.local.json'),
@@ -146,6 +149,7 @@ def _download(url, destination, claim_path, *, transport=None):
             with client.stream('GET', url, headers=headers) as response:
                 _require(response.status_code not in {401, 403, 429}, 'ARTICLE_IMAGE_SOURCE_BLOCKED')
                 _require(response.status_code in {200, 206}, 'ARTICLE_IMAGE_SOURCE_UNAVAILABLE')
+                _require(request_mode != 'full-v1' or response.status_code == 200, 'ARTICLE_IMAGE_RANGE_INVALID')
                 _require(response.headers.get('content-type', '').split(';')[0].strip() == 'image/jpeg', 'ARTICLE_IMAGE_FORMAT_INVALID')
                 ranged = response.status_code == 206
                 if ranged:
@@ -168,7 +172,7 @@ def _download(url, destination, claim_path, *, transport=None):
                 _require(not ranged or len(raw) == limit, 'ARTICLE_IMAGE_RANGE_INVALID')
                 return bytes(raw), length, tag
 
-    first, total, etag = part(0, PART_BYTES - 1)
+    first, total, etag = part(0, MAX_BYTES - 1 if request_mode == 'full-v1' else PART_BYTES - 1)
     pieces = [{'start': 0, 'bytes': len(first), 'sha256': _sha(first)}]
     with destination.open('xb') as output:
         output.write(first)
@@ -229,6 +233,11 @@ def image_candidate(source_id, url, page_html):
             selected = expected
             break
     _require(selected is not None, 'ARTICLE_IMAGE_DOWNLOAD_REQUIRED')
+    primary_image_url = getattr(REGISTRY[source_id], 'primary_image_url', None)
+    if primary_image_url is not None:
+        selected = primary_image_url(selected)
+        return {'image_url': selected, 'credit': credit, 'credit_links': credit_links,
+                'image_request_mode': 'full-v1'}
     return {'image_url': selected, 'credit': credit, 'credit_links': credit_links}
 
 
@@ -336,7 +345,8 @@ def prepare_article_image(core, article, record, policy, *, transport=None):
     _write(claim_path, {'input': binding_input, 'started_at': time.time(), 'automatic_retry': False})
     temporary = directory / (record['id'] + '.part')
     try:
-        download = _download(candidate['image_url'], temporary, claim_path, transport=transport)
+        download = _download(candidate['image_url'], temporary, claim_path, transport=transport,
+                             request_mode=candidate.get('image_request_mode', 'ranges-v1'))
         raw = temporary.read_bytes()
         media_dir = inside(core.settings.root, core.settings.app['media_dir'])
         media_dir.mkdir(parents=True, exist_ok=True)
@@ -395,6 +405,8 @@ def validate_article_image(core, record, variant=None):
     claim_keys = ('contract', 'record_id', 'input_hash', 'policy_hash', 'source_id', 'source_url',
                   'source_proof', 'source_proof_sha256', 'page_sha256', 'rights_sha256',
                   'rights_text_sha256', 'rights_evidence', 'license', 'image_url', 'credit', 'credit_links')
+    if 'image_request_mode' in proof:
+        claim_keys += ('image_request_mode',)
     _require(isinstance(claim, dict) and claim.get('input') == {k: proof.get(k) for k in claim_keys})
     source_path = inside(core.settings.root, proof['source_proof'])
     _require(source_path.is_file() and source_path.is_relative_to(inside(core.settings.root, 'data/server-sources'))
@@ -404,6 +416,7 @@ def validate_article_image(core, record, variant=None):
     _, checked, candidate = _source_proof(core, source_proof['article'], record['source_id'],
                                           pinned_path=source_path)
     _require(candidate['image_url'] == proof.get('image_url') and candidate['credit'] == proof.get('credit')
+             and candidate.get('image_request_mode') == proof.get('image_request_mode')
              and checked == source_proof
              and checked['hashes']['page'] == proof.get('page_sha256')
              and checked['hashes']['rights'] == proof.get('rights_sha256'))
@@ -417,6 +430,7 @@ def validate_article_image(core, record, variant=None):
     _require(isinstance(download, dict) and download.get('contract') in {'image-http-ranges-v1', 'image-http-full-v1'}
              and download.get('bytes') == info['bytes'] and isinstance(download.get('parts'), list)
              and 0 < len(download['parts']) <= MAX_PARTS)
+    _require(proof.get('image_request_mode') != 'full-v1' or download['contract'] == 'image-http-full-v1')
     raw = inside(core.settings.root, media['path']).read_bytes()
     ranged = download['contract'] == 'image-http-ranges-v1'
     if ranged:
@@ -436,7 +450,8 @@ def validate_article_image(core, record, variant=None):
         part_path = claim_path.with_name(claim_path.name + f'.part-{at}.local.json')
         _require(part_path.is_file() and not part_path.is_symlink())
         _require(json.loads(part_path.read_text(encoding='utf-8')) == {
-            'start': at, 'stop': PART_BYTES - 1 if at == 0 else min(at + PART_BYTES - 1, len(raw) - 1),
+            'start': at, 'stop': (MAX_BYTES - 1 if proof.get('image_request_mode') == 'full-v1'
+                                 else PART_BYTES - 1 if at == 0 else min(at + PART_BYTES - 1, len(raw) - 1)),
             'etag': download['etag'] if at else None, 'automatic_retry': False})
         at += part['bytes']
     _require(at == len(raw))

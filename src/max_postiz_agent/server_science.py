@@ -20,29 +20,11 @@ from .article_attribution import illustrated_presentation
 from .article_sources import source_spec, validate_source_url
 from .config import AgentError, fingerprint, inside
 from .db import Cursor
+from .source_adapters import REGISTRY, adapter_for
 from .reddit import text_hash
 from .server_nasa import MAX_BYTES, _exclusions, _grams, _parser, _used_narratives
 
-ADAPTERS = {
-    "noirlab_iotw": {
-        "catalog": "/public/images/iotw/",
-        "pages": r"/public/images/iotw/page/([1-9][0-9]{0,3})/",
-        "kind": "Image of the Week",
-        "publisher": "NOIRLab",
-        "rights_labels": {"Usage of NOIRLab Images and Videos", "Copyright"},
-        "newsletter_url": "https://noirlab.edu/public/subscribe-media/",
-        "newsletter_label": "Are you a journalist? Subscribe to the NOIRLab Media Newsletter.",
-    },
-    "esahubble_potw": {
-        "catalog": "/images/potw/",
-        "pages": r"/images/potw/page/([1-9][0-9]{0,3})/",
-        "kind": "Picture of the Week",
-        "publisher": "ESA/Hubble",
-        "rights_labels": {"Usage of ESA/Hubble Images and Videos", "Copyright"},
-        "newsletter_url": "https://esahubble.org/press/mailinglist",
-        "newsletter_label": "Are you a journalist? Subscribe to the ESA/Hubble Media Newsletter.",
-    },
-}
+ADAPTERS = {name: adapter.CATALOG for name, adapter in REGISTRY.items()}
 MONTHS = {
     name: index
     for index, name in enumerate(
@@ -156,12 +138,19 @@ def _release_day(value):
 def _unsupported_image_card(spec, literal, url):
     """Отсеять чистую ссылку другого image-раздела, не разрешая её загрузку."""
     parsed = urlsplit(url)
-    prefix = "/public/images/" if spec["id"] == "noirlab_iotw" else "/images/"
+    prefix = adapter_for(spec["id"]).IMAGE_SECTION
     return (parsed.scheme == "https" and parsed.netloc == spec["host"]
         and not parsed.query and not parsed.fragment
         and url == "https://" + spec["host"] + parsed.path
         and not any(part in {".", ".."} for part in urlsplit(literal).path.split("/"))
         and re.fullmatch(re.escape(prefix) + r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*/", parsed.path) is not None)
+
+
+def _catalog_path(source_id, page):
+    adapter = ADAPTERS[source_id]
+    if page == 1:
+        return adapter["catalog"]
+    return adapter.get("page_template", adapter["catalog"] + "page/{page}/").format(page=page)
 
 
 def _catalog(raw, source_id, page, rejected=None):
@@ -197,13 +186,18 @@ def _catalog(raw, source_id, page, rejected=None):
             except AgentError as exc:
                 if exc.code != "ARTICLE_SOURCE_URL_INVALID":
                     raise
-                if not _unsupported_image_card(spec, literal, url):
+                excluded = getattr(adapter_for(source_id), "excluded_catalog_url", lambda _: False)
+                specific_exclusion = excluded(url) and not any(
+                    part in {".", ".."} for part in urlsplit(literal).path.split("/")
+                )
+                if not _unsupported_image_card(spec, literal, url) and not specific_exclusion:
                     raise AgentError("SCIENCE_SOURCE_CATALOG_INVALID", 503) from exc
                 # Это только отказ карточки. Точный whitelist статьи/прав не
                 # меняется, detail/медиа по этой ссылке никогда не запрашиваются.
                 if rejected is not None:
                     rejected.append({"literal_href": literal, "url": url,
-                        "reason": "ARTICLE_SOURCE_URL_INVALID", "classification": "unsupported_image_card"})
+                        "reason": "ARTICLE_SOURCE_URL_INVALID", "classification": (
+                            "unsupported_source_card" if specific_exclusion else "unsupported_image_card")})
                 continue
             items.append(
                 {
@@ -242,8 +236,8 @@ def _catalog_rejection_proof(core, source_id, page, raw, rejected):
     if not rejected:
         return
     hashed = hashlib.sha256(raw).hexdigest()
-    spec, adapter = source_spec(source_id), ADAPTERS[source_id]
-    catalog_path = adapter["catalog"] if page == 1 else adapter["catalog"] + f"page/{page}/"
+    spec = source_spec(source_id)
+    catalog_path = _catalog_path(source_id, page)
     proof = {"contract": "science-catalog-rejections-v1", "source_id": source_id,
         "page": page, "catalog_url": "https://" + spec["host"] + catalog_path,
         "catalog_sha256": hashed, "rejected": rejected, "catalog_html": raw.decode("utf-8")}
@@ -313,17 +307,7 @@ def _article(raw, source_id, item, extractor):
             break
         if node.name == "div" and "archive-image" in node.get("class", []):
             continue
-        if source_id == "noirlab_iotw" and node.name == "p":
-            sections.append(str(node))
-        elif (
-            source_id == "esahubble_potw"
-            and node.name == "div"
-            and set(node.attrs) == {"style"}
-            and node.get("style") == "margin-top: 10px"
-            and node.find("p", recursive=False)
-        ):
-            # Полный текст включает Image description и авторский Links; это
-            # часть оригинала. Ни одна указанная в нём ссылка не запрашивается.
+        if adapter_for(source_id).narrative_node(node):
             sections.append(str(node))
         else:
             raise AgentError("ARTICLE_SOURCE_NARRATIVE_REQUIRED")
@@ -384,6 +368,9 @@ def _article(raw, source_id, item, extractor):
         raise AgentError("ARTICLE_SOURCE_RIGHTS_REVIEW_REQUIRED")
     rights_links[0].decompose()
     for anchor in rights_box.find_all("a"):
+        if adapter_for(source_id).known_notice(anchor):
+            anchor.decompose()
+            continue
         if not (
             set(anchor.attrs) == {"href"}
             and not anchor.find(True)
@@ -678,7 +665,7 @@ def select_science_article(
 
         for _ in range(3):
             page = next_page
-            path = adapter["catalog"] if page == 1 else adapter["catalog"] + f"page/{page}/"
+            path = _catalog_path(source_id, page)
             catalog_raw = get("https://" + spec["host"] + path)
             rejected_cards = []
             items, following = _catalog(catalog_raw, source_id, page, rejected=rejected_cards)

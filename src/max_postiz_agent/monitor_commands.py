@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 import httpx
 from sqlalchemy import select
 
+from .source_adapters import REGISTRY
 from .article_cycle import HourlyArticleCycle
 from .article_reserve import ready_for_policy
 from .config import AgentError, fingerprint
@@ -248,7 +249,7 @@ def refill_preflight(core, desired=6, *, check_services=False, diagnostic_servic
                 from .article_attribution import illustrated_presentation
                 candidates = [value for value in cycle._policies()
                     if not illustrated_presentation(value.get("presentation_contract"))
-                    or value["source_id"] in {"noirlab_iotw", "esahubble_potw"}]
+                    or value["source_id"] in REGISTRY]
             except AgentError:
                 candidates = []
         failures = []
@@ -264,7 +265,7 @@ def refill_preflight(core, desired=6, *, check_services=False, diagnostic_servic
         else:
             for code in failures or ["MONITOR_SOURCE_RIGHTS_REQUIRED"]:
                 block(code)
-    if not any(value.get("id") in {"nasa_svs_articles", "noirlab_iotw", "esahubble_potw"}
+    if not any(value.get("id") in ({"nasa_svs_articles"} | REGISTRY.keys())
                and value.get("enabled") is True and value.get("rights", {}).get("verified") is True
                for value in core.settings.sources.get("sources", [])):
         block("MONITOR_SOURCE_RIGHTS_REQUIRED")

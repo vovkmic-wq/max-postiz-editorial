@@ -1,0 +1,5 @@
+{
+  "title_selector": ".docs .titles h3",
+  "body_selector": ".docs",
+  "date_selector": "time[datetime]"
+}
