@@ -21,6 +21,7 @@ ILLUSTRATED_CONTRACT = "article-illustrated-v1"
 _PRESENTATION_FIELDS = ("presentation_contract", "illustration_proof_hash", "illustration_dimensions",
                         "title_text", "title_format")
 PRECLICK_CONTRACT = "browser-preclick-failure-v1"
+PUBLISHER_INVOCATION_FIELD = "publisher_invocation_id"
 _PRECLICK_PHASES = {"session", "channel", "composer", "attachment_snapshot", "attachment_upload",
                     "composer_fill", "composer_ready", "title_format", "authorization", "send_intent"}
 
@@ -744,7 +745,7 @@ def reconcile(settings, chat_id, request_id):
 
 
 # Выполняем отправку и возвращаем подтверждённый либо неопределённый результат.
-def publish(settings, payload, *, authorize_before_click=None):
+def publish(settings, payload, *, authorize_before_click=None, publisher_invocation_id=None):
     request_id, _chat_id, text = payload["request_id"], payload["chat_id"], payload["text"]
     # Обрабатываем ветвь при условии: not isinstance(text, str) or not text.strip() or len(text) > 4000.
     if not isinstance(text, str) or not text.strip() or len(text) > 4000:
@@ -781,8 +782,13 @@ def publish(settings, payload, *, authorize_before_click=None):
         return {"state": "unknown"}
     state = {**_request_record(settings, payload), "contract": "browser-send-journal-v1",
              "state": "preparing", "send_started": False, "phase": "session", "started_at": time.time()}
+    initial = state
+    if publisher_invocation_id is not None:
+        if not isinstance(publisher_invocation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", publisher_invocation_id):
+            raise AgentError("BROWSER_REQUEST_ID_INVALID")
+        initial = {**state, PUBLISHER_INVOCATION_FIELD: publisher_invocation_id}
     try:
-        save(path, state, exclusive=True)
+        save(path, initial, exclusive=True)
     except OSError:
         # Запрос уже занят другим процессом или частичным журналом; повторно браузер не открываем.
         return {"state": "unknown"}
@@ -950,8 +956,10 @@ def main():
             result = inspect(settings, payload["chat_id"])
         # Обрабатываем ветвь при условии: action == 'publish'.
         elif action == "publish":
+            publisher_invocation_id = payload.pop(PUBLISHER_INVOCATION_FIELD, None)
             authorize(settings, payload)
-            result = publish(settings, payload, authorize_before_click=lambda: authorize(settings, payload))
+            result = publish(settings, payload, authorize_before_click=lambda: authorize(settings, payload),
+                             publisher_invocation_id=publisher_invocation_id)
         # Обрабатываем ветвь при условии: action == 'reconcile'.
         elif action == "reconcile":
             result = reconcile(settings, payload["chat_id"], payload["request_id"])

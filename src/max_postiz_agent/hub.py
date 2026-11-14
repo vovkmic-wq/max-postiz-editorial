@@ -1024,7 +1024,10 @@ class HubService(Service):
         else:
             raise AgentError("MANUAL_RECONCILIATION_REQUIRED", 409)
         with self.db.session.begin() as s:
-            row = s.get(Dispatch, ident)
+            self._variant(s, d.variant_id, True)
+            row = s.scalar(select(Dispatch).where(Dispatch.id == ident).with_for_update())
+            if row is None or row.state != d.state or row.snapshot_hash != d.snapshot_hash:
+                raise AgentError("DISPATCH_NOT_RECONCILABLE", 409)
             row.state = "published" if result.state == "confirmed" else result.state
             row.external_id, row.permalink = result.external_id, result.permalink
             row.verified = result.state == "confirmed"

@@ -1,4 +1,6 @@
+import io
 import json
+import zipfile
 
 import httpx
 import pytest
@@ -210,14 +212,23 @@ def test_max_missing_message_id_is_unknown_with_evidence(service, monkeypatch):
 def test_encrypted_backup_and_restore(service, project, tmp_path):
     key = Fernet.generate_key()
     path = tmp_path / "state.enc"
+    receipt = "data/browser-publisher-receipts/dispatch-one.json"
+    source = service.settings.root / receipt
+    source.parent.mkdir()
+    receipt_bytes = b'{"contract":"browser-publisher-finished-preclick-v1"}'
+    source.write_bytes(receipt_bytes)
     digest = backup(service, path, key)
     assert len(digest) == 64 and "Нейро" not in path.read_bytes().decode("ascii")
+    with zipfile.ZipFile(io.BytesIO(Fernet(key).decrypt(path.read_bytes()))) as archive:
+        assert archive.read(receipt) == receipt_bytes
+    source.unlink()
     settings = service.settings
     db = Database(settings, url="sqlite:///" + (tmp_path / "restored.db").as_posix())
     db.initialize()
     target = Service(settings, db)
     manifest = restore(target, path, key)
     assert manifest["schema_version"] == "1.0"
+    assert source.read_bytes() == receipt_bytes
     # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
     with db.session() as session:
         assert session.get(Channel, "main").paused

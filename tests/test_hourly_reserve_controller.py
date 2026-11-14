@@ -1,5 +1,6 @@
 """Резерв: настоящие локальные транзакции, фиктивные модели и внешние сервисы."""
 import copy
+import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -14,10 +15,10 @@ from sqlalchemy import create_engine, text
 from max_postiz_agent.article_quality import ArticleQuality
 from max_postiz_agent.adapters import Delivery
 from max_postiz_agent.article_reserve import ArticleReserveStore
-from max_postiz_agent.config import AgentError
-from max_postiz_agent.db import Base, Database, uid
+from max_postiz_agent.config import AgentError, fingerprint
+from max_postiz_agent.db import Audit, Base, Database, uid
 from max_postiz_agent.hourly_reserve import ReserveServerCycle
-from max_postiz_agent.hub_models import Dispatch, RemoteDraft, TargetApproval
+from max_postiz_agent.hub_models import Dispatch, DispatchAttempt, RemoteDraft, Target, TargetApproval, Variant
 from max_postiz_agent.server_models import PublicationSlot
 from max_postiz_agent.server_state import DatabaseArticleLedger, ServerState
 from test_automatic_policy import Model
@@ -200,6 +201,123 @@ def test_unbound_delivery_unknown_blocks_before_selecting_source(reserve_control
     assert result["phase"] == "blocked"
     assert value.store.active_preparation() is None
     assert len(value.model_calls) == 1
+
+
+@pytest.mark.parametrize("backend", ["reserve_controller", "postgres_reserve"])
+def test_finished_unknown_is_quarantined_and_only_next_article_is_sent(request, backend, monkeypatch):
+    from max_postiz_agent.browser_publisher import (
+        PUBLISHER_INVOCATION_FIELD,
+        _save_finished_preclick,
+    )
+    from max_postiz_agent.browser_worker import _request_record, _snapshot_request, save
+    from max_postiz_agent.preapproval_retirement import _validate_journal
+    from max_postiz_agent.unknown_delivery import AUTOMATIC_ACTION, retirement_id
+
+    value = request.getfixturevalue(backend)
+    monkeypatch.setattr("max_postiz_agent.unknown_delivery.now", lambda: value.stamp[0])
+    value.controller.prepare_once()
+    value.controller.run_once()
+    first = value.cycle._load()["records"][0]
+    stamp = first["due_at"] + 1
+    value.stamp[0] = stamp
+    first_dispatch = first["dispatch_id"]
+    config = value.core.settings
+    with value.core.db.session() as session:
+        original_snapshot = session.get(Dispatch, first_dispatch).snapshot
+
+    request_payload, presentation = _snapshot_request(
+        config, first_dispatch, original_snapshot, original_snapshot["destination"])
+    original_payload = {**request_payload, **presentation,
+                        "dispatch_snapshot_hash": fingerprint(original_snapshot)}
+    invocation = "1" * 32
+    journal = config.root / "data/browser-publications" / (first_dispatch + ".json")
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    save(journal, {**_request_record(config, original_payload), "contract": "browser-send-journal-v1",
+                   "state": "preparing", "phase": "session", "send_started": False,
+                   "started_at": stamp - 0.5, PUBLISHER_INVOCATION_FIELD: invocation}, exclusive=True)
+    journal_before = journal.read_bytes()
+    _save_finished_preclick(config, request_payload, invocation, stamp - 0.75, stamp - 0.25, "exited")
+    sent = []
+
+    def publish(_chat_id, _text, _attachment=None, *, request_id):
+        sent.append(request_id)
+        return Delivery("unknown") if request_id == first_dispatch else Delivery("confirmed", "next-message")
+
+    monkeypatch.setattr(value.core.publisher, "publish", publish)
+    monkeypatch.setattr(value.core.postiz, "get_post_fresh", value.core.postiz.get_post)
+    value.core.publisher.mode = "browser"
+    assert value.core.dispatch_tick() == 0
+    with value.core.db.session() as session:
+        initial_attempt = session.query(DispatchAttempt).one()
+        original_attempt = (initial_attempt.id, initial_attempt.created_at, initial_attempt.result, initial_attempt.error)
+
+    post = value.posts[first["postiz_id"]]
+    assert value.controller.run_once()["phase"] == "blocked"
+    post["state"] = "ERROR"
+    post["releaseId"] = "possible-delivery"
+    assert value.controller.run_once()["phase"] == "blocked"
+    del post["releaseId"]
+
+    def changed_revision(post_id):
+        value.state.control("pause", value.state.read()["revision"], "test-owner")
+        value.state.control("start", value.state.read()["revision"], "test-owner")
+        return value.core.postiz.get_post(post_id)
+
+    monkeypatch.setattr(value.core.postiz, "get_post_fresh", changed_revision)
+    assert value.controller.run_once()["phase"] == "blocked"
+
+    def changed_proof(post_id):
+        journal.write_bytes(journal_before + b" ")
+        return value.core.postiz.get_post(post_id)
+
+    monkeypatch.setattr(value.core.postiz, "get_post_fresh", changed_proof)
+    assert value.controller.run_once()["phase"] == "blocked"
+    journal.write_bytes(journal_before)
+    monkeypatch.setattr(value.core.postiz, "get_post_fresh", value.core.postiz.get_post)
+    assert value.controller.run_once()["slot_state"] == "missed"
+    archived = value.cycle._load()["records"][0]
+    assert archived["state"] == "cancelled" and archived["original_external_result"] == "UNKNOWN"
+    assert archived["permanent_no_retry"] and archived["source_remains_ever_used"] and len(value.writes) == 1
+    assert archived["url"] == first["url"] and archived["original_hash"] == first["original_hash"]
+    assert journal.read_bytes() == journal_before
+    assert value.store.status()["active"] == []
+    with value.core.db.session() as session:
+        dispatch = session.get(Dispatch, first_dispatch)
+        attempt = session.query(DispatchAttempt).one()
+        assert (attempt.id, attempt.created_at, attempt.result, attempt.error) == original_attempt
+        assert dispatch.attempts == 1 and not dispatch.verified and dispatch.snapshot == original_snapshot
+        assert session.get(TargetApproval, dispatch.approval_id).revoked is True
+        audit = session.get(Audit, retirement_id(first["variant_id"]))
+        assert audit.action == AUTOMATIC_ACTION
+        _validate_journal(value.core, session, first_dispatch, json.loads(journal_before), dispatch,
+                          raw_sha256=hashlib.sha256(journal_before).hexdigest())
+        with pytest.raises(AgentError, match="PREAPPROVAL_JOURNAL_INVALID"):
+            _validate_journal(value.core, session, first_dispatch, json.loads(journal_before), dispatch,
+                              raw_sha256="0" * 64)
+
+    post["content"] += " Отправка этой статьи должна остаться заблокированной."
+    value.core.bridge.sync(force=True)
+    with value.core.db.session() as session:
+        variant = session.get(Variant, first["variant_id"])
+        target = session.get(Target, variant.target_id)
+        assert value.core.snapshot(variant, target) == original_snapshot
+        with pytest.raises(AgentError, match="PREAPPROVAL_RETIRED_OR_RECONCILING"):
+            value.core.approve_hourly_policy(variant.id, variant.revision, fingerprint(original_snapshot), stamp + 3600)
+
+    value.posts[first["postiz_id"]]["content"] = original_snapshot["body"]
+    second = {**value.article, "url": "https://science.example.org/article/next/",
+              "original": value.article["original"] + " A second observation."}
+    value.controller.selector = lambda *_args, **kwargs: (
+        copy.deepcopy(second) if len(kwargs["ledger"]["records"]) == 1 else None)
+    value.controller.prepare_once()
+    assert value.controller.run_once()["phase"] == "waiting_dispatch"
+    next_record = value.cycle._load()["records"][1]
+    assert next_record["due_at"] // 3600 > first["due_at"] // 3600
+    value.stamp[0] = next_record["due_at"] + 1
+    assert value.core.dispatch_tick() == 1
+    assert value.core.dispatch_tick() == 0
+    assert sent == [first_dispatch, next_record["dispatch_id"]]
+    assert len(value.writes) == 2
 
 
 def test_changed_evidence_never_creates_remote_draft(reserve_controller):

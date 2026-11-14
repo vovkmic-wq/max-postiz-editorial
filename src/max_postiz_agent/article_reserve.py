@@ -8,6 +8,7 @@ import hashlib
 import math
 import re
 from collections import Counter
+from contextlib import nullcontext
 from decimal import Decimal
 from uuid import NAMESPACE_URL, uuid5
 
@@ -211,8 +212,8 @@ class ArticleReserveStore:
                 return self.require_preparation(claim, record_id, active=active, session=own)
         return _claim_view(self._preparation(session, claim, record_id, active=active))
 
-    def preparation_only_unknown(self, target_id, records, *, cycle):
-        """Разрешить местную подготовку при одном связанном unknown отправителя."""
+    def preparation_only_unknown(self, target_id, records, *, cycle, session=None):
+        """Найти одну связанную отправку с unknown и проверенным исходным материалом."""
         from .article_repair_cycle import AutomaticArticleRepair
         from .automatic_policy import POLICY_ACTOR
 
@@ -222,7 +223,7 @@ class ArticleReserveStore:
             if not ok:
                 raise AgentError(code, 409)
 
-        with self.core.db.session() as session:
+        with (self.core.db.session() if session is None else nullcontext(session)) as session:
             require(not session.scalar(select(Dispatch.id).where(
                 (Dispatch.state == "sending") | Dispatch.owner.is_not(None)
                 | (Dispatch.lease_until != 0) | Dispatch.lease_until.is_(None)).limit(1)))
