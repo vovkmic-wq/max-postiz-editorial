@@ -11,7 +11,7 @@ from sqlalchemy import select, text
 from .article_sources import registered_policies
 from .automatic_policy import automatic_evidence
 from .config import AgentError, fingerprint, validate_schema
-from .db import Draft, DraftRevision, now
+from .db import ConfigVersion, Draft, DraftRevision, now
 from .hub_models import BridgePost, Dispatch, Target, TargetApproval
 from .mobile_store import MobileOperation
 from .server_cycle import TERMINAL
@@ -145,6 +145,13 @@ def migrate_ready(cycle, candidate, *, expected_config_hash, expected_control_re
                     for r in ledger.payload["records"]
                 )
             )
+            for settings in (previous, candidate):
+                snapshot = copy.deepcopy({"topic": settings.topic, "sources": settings.sources})
+                saved = session.get(ConfigVersion, settings.hash)
+                if saved is None:
+                    session.add(ConfigVersion(id=settings.hash, snapshot=snapshot))
+                else:
+                    require(saved.snapshot == snapshot)
             payload = copy.deepcopy(ledger.payload)
             targets = {t.id: t for t in session.scalars(select(Target).with_for_update())}
             configured = {t["id"]: t for t in core.publishing["targets"]}

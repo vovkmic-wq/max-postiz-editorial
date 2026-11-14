@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import select
 
 from max_postiz_agent.config import AgentError
-from max_postiz_agent.db import Audit, DraftRevision
+from max_postiz_agent.db import Audit, ConfigVersion, DraftRevision
 from max_postiz_agent.hub_models import Target, TargetApproval, VariantRevision
 from max_postiz_agent.source_activation import migrate_ready
 
@@ -69,6 +69,12 @@ def exercise_ready_rebind(v):
     assert v.model_calls == models and not v.writes
     assert database_state(v.core)["editorial_preparation_claims"] == claims_before
     with v.core.db.session() as s:
+        configuration = s.get(ConfigVersion, v.core.settings.hash)
+        assert configuration is not None
+        assert configuration.snapshot == {
+            "topic": v.core.settings.topic,
+            "sources": v.core.settings.sources,
+        }
         assert len(list(s.scalars(select(VariantRevision)))) == 2
         assert len(list(s.scalars(select(DraftRevision)))) == 2
         assert not list(s.scalars(select(TargetApproval)))
