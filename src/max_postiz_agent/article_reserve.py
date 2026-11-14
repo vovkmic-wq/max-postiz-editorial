@@ -211,6 +211,84 @@ class ArticleReserveStore:
                 return self.require_preparation(claim, record_id, active=active, session=own)
         return _claim_view(self._preparation(session, claim, record_id, active=active))
 
+    def preparation_only_unknown(self, target_id, records, *, cycle):
+        """Разрешить местную подготовку при одном связанном unknown отправителя."""
+        from .article_repair_cycle import AutomaticArticleRepair
+        from .automatic_policy import POLICY_ACTOR
+
+        code = "ARTICLE_RECONCILIATION_REQUIRED"
+
+        def require(ok):
+            if not ok:
+                raise AgentError(code, 409)
+
+        with self.core.db.session() as session:
+            require(not session.scalar(select(Dispatch.id).where(
+                (Dispatch.state == "sending") | Dispatch.owner.is_not(None)
+                | (Dispatch.lease_until != 0) | Dispatch.lease_until.is_(None)).limit(1)))
+            require(not session.scalar(select(BridgePost.variant_id).where(
+                BridgePost.mutation_owner.is_not(None) | (BridgePost.mutation_until != 0)
+                | BridgePost.mutation_until.is_(None)).limit(1)))
+            unknown = list(session.scalars(select(Dispatch).where(Dispatch.state == "unknown").limit(2)))
+            if not unknown:
+                return None
+            require(len(unknown) == 1)
+            dispatch = unknown[0]
+            require(not session.scalar(select(Dispatch.id).where(
+                Dispatch.id != dispatch.id, Dispatch.state.in_(ACTIVE)).limit(1)))
+            require(not session.scalar(select(RemoteDraft.variant_id).where(
+                RemoteDraft.state.in_({"creating", "unknown"})).limit(1)))
+            target = session.get(Target, target_id)
+            variant = session.get(Variant, dispatch.variant_id)
+            approval = session.get(TargetApproval, dispatch.approval_id)
+            slot = session.scalar(select(PublicationSlot).where(PublicationSlot.active_target == target_id))
+            require(target and variant and approval and slot)
+            require(not session.scalar(select(PublicationSlot.id).where(
+                PublicationSlot.id != slot.id, PublicationSlot.active_target.is_not(None)).limit(1)))
+            snapshot = dispatch.snapshot
+            require(isinstance(snapshot, dict) and isinstance(slot.binding, dict))
+            metadata = snapshot.get("metadata")
+            require(isinstance(metadata, dict) and target.enabled
+                and target.platform == snapshot.get("platform") == "max"
+                and target.route == snapshot.get("route") == "max_browser"
+                and target.id == variant.target_id == snapshot.get("target_id") == slot.target_id
+                and target.destination == snapshot.get("destination") and target.destination
+                and snapshot.get("variant_id") == variant.id == approval.variant_id
+                and snapshot.get("revision") == dispatch.revision == variant.revision == approval.revision
+                and not approval.revoked and approval.actor == POLICY_ACTOR
+                and dispatch.snapshot_hash == approval.snapshot_hash
+                    == fingerprint({"content": snapshot, "due_at": dispatch.due_at})
+                and slot.dispatch_id == dispatch.id and slot.state in {"pending", "blocked_unknown"}
+                and _stamp(slot.due_at) and slot.due_at == dispatch.due_at == approval.scheduled_at
+                and slot.delivered_at is None and not dispatch.verified
+                and dispatch.external_id is None and dispatch.permalink is None and dispatch.attempts == 1)
+            attempts = list(session.scalars(select(DispatchAttempt).where(
+                DispatchAttempt.dispatch_id == dispatch.id).limit(2)))
+            require(len(attempts) == 1 and attempts[0].result == "unknown"
+                and attempts[0].error == dispatch.error)
+            matches = [record for record in records if record.get("id") == slot.record_id]
+            require(len(matches) == 1)
+            record = matches[0]
+            require(record.get("state") in {"pending", "unknown"}
+                and record.get("dispatch_id") == dispatch.id and record.get("variant_id") == variant.id
+                and record.get("due_at") == slot.due_at
+                and not record.get("model_result_unknown") and not record.get("protocol_guard")
+                and {key: record.get(key) for key in _IDENTITY} == slot.binding
+                and slot.text_hash == record.get("reserve_prepared_hash")
+                and metadata.get("machine_review_evidence_hash") == slot.evidence_hash
+                and metadata.get("origin") == "hourly_article_test" and metadata.get("approval_mode") == "automatic"
+                and metadata.get("record_id") == record["id"] and metadata.get("policy_hash") == record.get("policy_hash")
+                and metadata.get("reserve_contract") == RESERVE_CONTRACT
+                and metadata.get("reserve_binding_hash") == record.get("reserve_binding_hash"))
+            try:
+                claim = cycle._reserve_record(record, session=session)
+                AutomaticArticleRepair(cycle).assert_complete(record, session)
+            except (AgentError, OSError, ValueError, KeyError, TypeError) as exc:
+                raise AgentError(code, 409) from exc
+            preparation = session.get(EditorialPreparationClaim, claim["id"])
+            require(preparation.state == "quality_ready" and preparation.error is None)
+            return record["id"]
+
     def bind_preparation(self, claim, record_id):
         if not isinstance(record_id, str) or not record_id:
             raise AgentError("ARTICLE_RESERVE_CLAIM_LOST", 409)

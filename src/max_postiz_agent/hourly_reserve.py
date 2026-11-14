@@ -304,14 +304,20 @@ class ReserveServerCycle(ServerCycle):
                            for key in ("id", "token", "control_revision"))
                     or not self._quarantine_completed_review(original_claim, record)):
                 return self._phase("blocked", last_error={"code": "ARTICLE_RESERVE_PREPARATION_ACTIVE"})
-        active, leased = self._inventory()
-        if leased or any(d["state"] in {"sending", "unknown"} for d in active):
-            return self._phase("blocked", last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
         policy = self.cycle._policy()
         if policy.get("approval_mode") != "automatic":
             raise AgentError("ARTICLE_AUTOMATIC_POLICY_REQUIRED", 409)
-        for previous in self.cycle._load()["records"]:
+        records = self.cycle._load()["records"]
+        try:
+            delivery_blocked_record = self.reserve.preparation_only_unknown(policy["target_id"], records, cycle=self.cycle)
+        except AgentError as exc:
+            if exc.code != "ARTICLE_RECONCILIATION_REQUIRED":
+                raise
+            return self._phase("blocked", last_error={"code": exc.code})
+        for previous in records:
             if previous["state"] in TERMINAL:
+                continue
+            if delivery_blocked_record and previous["id"] == delivery_blocked_record:
                 continue
             if (previous.get("reserve_contract") == RESERVE_CONTRACT
                     and self.cycle._reserve_other_safe(previous)):
@@ -331,11 +337,15 @@ class ReserveServerCycle(ServerCycle):
         completed = []
         for _ in range(options["batch"]):
             self.state.assert_running()
-            active, leased = self._inventory()
-            if leased or any(d["state"] in {"sending", "unknown"} for d in active):
+            records = self.cycle._load()["records"]
+            try:
+                self.reserve.preparation_only_unknown(policy["target_id"], records, cycle=self.cycle)
+            except AgentError as exc:
+                if exc.code != "ARTICLE_RECONCILIATION_REQUIRED":
+                    raise
                 return self._phase("blocked", refilling=True,
-                    last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})
-            if sum(ready_for_policy(r, policy) for r in self.cycle._load()["records"]) >= options["target"]:
+                    last_error={"code": exc.code})
+            if sum(ready_for_policy(r, policy) for r in records) >= options["target"]:
                 break
             claim = self.reserve.begin_preparation(expected_revision=control["revision"])
             try:

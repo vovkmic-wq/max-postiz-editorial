@@ -847,6 +847,8 @@ class HourlyArticleCycle:
             policy = self._policy_for_article(article)
             source, target = self._source_target(policy)
             article = self._article(article, policy, source, target)
+            delivery_blocked_record = None
+            ledger = None
             if self.reserve_mode:
                 from .article_reserve import ArticleReserveStore
                 if policy.get("approval_mode") != "automatic":
@@ -855,18 +857,17 @@ class HourlyArticleCycle:
                     old = self._record(self._load(), retry_record)
                     reserve_claim = self._reserve_record(old, active=True)
                 ArticleReserveStore(self.core).require_preparation(reserve_claim)
-                # Подготовка не назначает дату и может идти при известной QUEUE.
+                # Подготовка сама не создаёт внешнюю запись и не назначает слот.
                 if not retry_record:
-                    with self.core.db.session() as session:
-                        if (session.scalar(select(Dispatch).where(Dispatch.state.in_({"sending", "unknown"})
-                                | Dispatch.owner.is_not(None) | (Dispatch.lease_until != 0)))
-                                or session.scalar(select(BridgePost).where(BridgePost.mutation_owner.is_not(None)
-                                    | (BridgePost.mutation_until != 0) | BridgePost.mutation_until.is_(None)))):
-                            raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
+                    ledger = self._load()
+                    delivery_blocked_record = ArticleReserveStore(self.core).preparation_only_unknown(
+                        target.id, ledger["records"], cycle=self)
             else:
                 self._clear_outstanding(target.id)
                 self._cadence(policy, now(), check_gap=False)
-            ledger, slot = self._load(), int(now() // 3600)
+            if ledger is None:
+                ledger = self._load()
+            slot = int(now() // 3600)
             original_hash = text_hash(article["original"])
             material_hash = fingerprint(" ".join(article["original"].casefold().split()))
             if retry_record:
@@ -904,6 +905,7 @@ class HourlyArticleCycle:
                                  else "ARTICLE_HUMAN_REVIEW_BACKLOG", 409)
             if any(item["state"] not in {"published", "failed", "cancelled", "rejected", "awaiting_human_review"}
                    and not (item["state"] == "automatic_ready" and item.get("automatic_enrolled"))
+                   and not (delivery_blocked_record and item.get("id") == delivery_blocked_record)
                    and not (self.reserve_mode and self._reserve_other_safe(item))
                    for item in other_records):
                 raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
