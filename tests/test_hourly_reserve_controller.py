@@ -12,11 +12,13 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from max_postiz_agent.article_quality import ArticleQuality
+from max_postiz_agent.adapters import Delivery
 from max_postiz_agent.article_reserve import ArticleReserveStore
 from max_postiz_agent.config import AgentError
 from max_postiz_agent.db import Base, Database, uid
 from max_postiz_agent.hourly_reserve import ReserveServerCycle
-from max_postiz_agent.hub_models import Dispatch, TargetApproval
+from max_postiz_agent.hub_models import Dispatch, RemoteDraft, TargetApproval
+from max_postiz_agent.server_models import PublicationSlot
 from max_postiz_agent.server_state import DatabaseArticleLedger, ServerState
 from test_automatic_policy import Model
 
@@ -121,6 +123,83 @@ def test_unknown_send_keeps_slot_and_does_not_publish_replacement(reserve_contro
         assert dispatch.state == "unknown" and dispatch.attempts == 1
         assert session.query(TargetApproval).count() == 1
     assert len(calls) == len(value.writes) == 1
+
+
+@pytest.mark.parametrize("backend", ["reserve_controller", "postgres_reserve"])
+def test_delivery_unknown_allows_only_local_reserve_preparation(request, backend, monkeypatch):
+    value = request.getfixturevalue(backend)
+    value.controller.prepare_once()
+    value.controller.run_once()
+    first = value.cycle._load()["records"][0]
+    value.stamp[0] = first["due_at"] + 1
+    calls = []
+
+    def uncertain(*args, **kwargs):
+        calls.append(args)
+        return Delivery("unknown")
+
+    monkeypatch.setattr(value.core.publisher, "publish", uncertain)
+    value.core.dispatch_tick()
+    before = copy.deepcopy(value.store.status())
+    posts = copy.deepcopy(value.posts)
+    second = {**value.article, "url": "https://science.example.org/article/second/",
+              "original": value.article["original"] + " The study opens new possibilities."}
+    value.controller.selector = lambda *_args, **kwargs: (
+        copy.deepcopy(second) if len(kwargs["ledger"]["records"]) == 1 else None)
+
+    value.controller.prepare_once()
+
+    records = value.cycle._load()["records"]
+    assert len(records) == 2
+    assert records[0] == first
+    assert records[1]["state"] == "quality_ready"
+    assert not records[1].get("postiz_id") and not records[1].get("dispatch_id")
+    assert value.store.active_preparation() is None
+    assert value.controller.run_once()["phase"] == "blocked"
+    assert value.core.dispatch_tick() == 0
+    assert before == value.store.status()
+    assert value.posts == posts and len(calls) == len(value.writes) == 1
+    with value.core.db.session() as session:
+        dispatch = session.query(Dispatch).one()
+        assert dispatch.state == "unknown" and dispatch.attempts == 1 and dispatch.error is None
+        assert session.query(TargetApproval).count() == 1
+
+
+@pytest.mark.parametrize("damage", ["lease", "snapshot", "draft", "repair", "second_slot"])
+def test_unbound_delivery_unknown_blocks_before_selecting_source(reserve_controller, monkeypatch, damage):
+    value = reserve_controller
+    value.controller.prepare_once()
+    value.controller.run_once()
+    ledger = value.cycle._load()
+    first = ledger["records"][0]
+    value.stamp[0] = first["due_at"] + 1
+
+    def uncertain(*args, **kwargs):
+        raise AgentError("BROWSER_OPERATION_UNCONFIRMED", 503)
+
+    monkeypatch.setattr(value.core.publisher, "publish", uncertain)
+    value.core.dispatch_tick()
+    if damage == "repair":
+        first["automatic_repair_attempts"] = [{"state": "unknown"}]
+        value.cycle._save(ledger)
+    else:
+        with value.core.db.session.begin() as session:
+            dispatch = session.get(Dispatch, first["dispatch_id"])
+            if damage == "lease":
+                dispatch.lease_until = value.stamp[0] + 60
+            elif damage == "snapshot":
+                dispatch.snapshot = {**dispatch.snapshot, "destination": "changed"}
+            elif damage == "draft":
+                session.get(RemoteDraft, first["variant_id"]).state = "unknown"
+            else:
+                session.add(PublicationSlot(target_id="other", active_target="other", record_id=uid(),
+                    slot_at=int(first["due_at"]), due_at=first["due_at"], text_hash="0" * 64,
+                    evidence_hash="1" * 64, binding={}, control_revision=value.state.read()["revision"]))
+    value.controller.selector = lambda *_args, **_kwargs: pytest.fail("not safe to select another source")
+    result = value.controller.prepare_once()
+    assert result["phase"] == "blocked"
+    assert value.store.active_preparation() is None
+    assert len(value.model_calls) == 1
 
 
 def test_changed_evidence_never_creates_remote_draft(reserve_controller):
